@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="按报告期查看公募基金披露的持仓变化、持仓体量、股价区间与基金经理运作说明。">
+  <title>公募持仓跟踪 · Record Lab</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#results">跳到持仓明细</a>
+  <header class="masthead">
+    <div class="topbar wrap">
+      <a class="brand" href="./" aria-label="Record Lab 首页"><span class="brand-symbol" aria-hidden="true">R<span>·</span></span><span>RECORD LAB<small>公开报告观察</small></span></a>
+      <span class="topbar-note"><span class="live-dot" aria-hidden="true"></span>以已披露报告为准</span>
+    </div>
+    <div class="hero wrap">
+      <div><p class="eyebrow">FUND DISCLOSURE EXPLORER</p><h1>公募持仓跟踪<span>从报告，读懂持仓变化。</span></h1><p class="hero-description">一起看基金经理的持仓变化、持仓体量、期间股价区间与报告中的运作说明。</p></div>
+      <div class="hero-actions"><button type="button" id="reload" class="button button-light">↻ 重新载入</button><label for="import-file" class="button button-outline">导入结果 JSON<input id="import-file" class="visually-hidden" type="file" accept=".json,application/json"></label><span>导入文件只在当前浏览器中查看</span></div>
+    </div>
+  </header>
+  <main class="wrap">
+    <section class="observation" aria-label="数据观测状态"><div><span id="source-badge" class="badge">准备载入</span><span id="observation-dates">正在读取公开数据文件…</span></div><p id="load-status" role="status" aria-live="polite">正在载入报告与持仓。</p></section>
+    <section class="stats" aria-label="数据覆盖概览">
+      <div class="stat"><span>已收录报告 / 目录基金份额</span><strong id="stat-funds">—</strong><small id="stat-scope">等待数据</small></div>
+      <div class="stat"><span>有报告公司 / 目录公司</span><strong id="stat-companies">—</strong><small id="stat-company-note">等待完整目录</small></div>
+      <div class="stat"><span>最近持仓报告期</span><strong id="stat-period" class="stat-date">—</strong><small>持仓时点，不是今日持仓</small></div>
+      <div class="stat"><span>可查看价格区间</span><strong id="stat-prices">—</strong><small id="stat-prices-note">已匹配行情的持仓条目</small></div>
+    </section>
+    <section class="method-note" aria-label="计算口径"><span class="note-icon" aria-hidden="true">i</span><p><strong>读数口径</strong> 季报通常披露前十大重仓股；进入 / 离开披露名单不等同于新买入 / 清仓。体量优先展示披露市值，另列「期末净资产 × 持仓占比」估算。期间最低 / 最高价仅作交易区间参考，<strong>真实持有成本未知</strong>。</p><a href="#methodology">查看完整说明 ↗</a></section>
+    <section class="catalog-panel" aria-label="全量公司目录与处理进度">
+      <div class="section-title"><div><p class="eyebrow">COMPANY COVERAGE</p><h2>全部公司，一张覆盖清单</h2></div><span id="catalog-badge" class="badge">目录待生成</span></div>
+      <p class="catalog-description">以公开目录逐家公司遍历。处理进度与已有报告分别显示，尚未处理的公司也保留在清单中。</p>
+      <div class="coverage-topline"><div><strong id="progress-count">等待目录与进度</strong><span id="progress-detail">已有少量报告不代表全量覆盖。</span></div><span id="progress-percent">—</span></div>
+      <progress id="coverage-progress" max="100" value="0" aria-label="全量基金处理进度">0%</progress>
+      <div class="catalog-tools"><label class="search-box" for="company-search"><span aria-hidden="true">⌕</span><input id="company-search" type="search" placeholder="搜索全部公司名称或代码" autocomplete="off"></label><span id="catalog-dates">目录与处理时点尚未提供</span></div>
+      <p id="catalog-status" class="catalog-status" role="status" aria-live="polite">正在读取目录与处理进度…</p>
+      <div id="company-coverage" class="company-coverage"><div class="empty-state compact"><h3>全量目录待生成</h3><p>目录生成后，这里会显示每家公司的基金数量与处理状态。</p></div></div>
+    </section>
+    <section class="filter-panel" aria-label="筛选持仓">
+      <div class="section-title"><div><p class="eyebrow">EXPLORE THE FILINGS</p><h2>找到你关注的经理与持仓</h2></div><button id="reset-filters" class="text-button" type="button">重置筛选</button></div>
+      <div class="search-line"><label class="search-box" for="search"><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="搜索基金代码、名称、公司、经理或股票" autocomplete="off"><kbd aria-hidden="true">/</kbd></label><button id="export-csv" class="button button-primary" type="button" disabled>↓ 导出当前持仓</button></div>
+      <div class="filter-grid">
+        <label>基金公司<select id="filter-company"><option value="">全部公司</option></select></label>
+        <label>基金经理<select id="filter-manager"><option value="">全部经理</option></select></label>
+        <label>持仓报告期<select id="filter-period"><option value="">全部报告期</option></select></label>
+        <label>披露变化<select id="filter-change"><option value="">全部变化</option><option value="increased">持股数增加</option><option value="decreased">持股数减少</option><option value="entered">进入披露名单</option><option value="left">离开披露名单</option><option value="unchanged">持股数未变</option><option value="unknown">无法比较</option></select></label>
+      </div>
+      <p class="filter-tip">支持空格组合搜索；仅浏览已收录数据，输入新代码不会触发在线抓取。</p>
+    </section>
+    <section id="results" aria-label="基金经理与持仓明细" tabindex="-1"><div class="results-title"><h2>经理与持仓明细</h2><span id="result-count">等待数据</span></div><div id="fund-results" aria-live="polite"><div class="empty-state"><span class="empty-icon" aria-hidden="true">≋</span><h3>正在整理报告</h3><p>载入完成后，可按经理展开基金持仓与报告说明。</p></div></div></section>
+    <section class="methodology" id="methodology"><div class="section-title"><div><p class="eyebrow">READING THE DATA</p><h2>把披露事实与估算分开看</h2></div></div><div class="method-grid"><article><span>01 / 报告有时点</span><h3>报告期、公告日、采集日各不同</h3><p>持仓按报告期末观察；基金经理归属可能来自较晚的公开信息。每张基金卡保留这些日期，运作说明也独立标明覆盖期间。</p></article><article><span>02 / 持仓有边界</span><h3>披露名单中的变化</h3><p>只有可比较的持股数量才标记增加或减少。名单进出无法证明完整交易，非相邻报告期的变化也不代表单季买卖。基金份额类别不能直接相加。</p></article><article><span>03 / 价格不是成本</span><h3>用区间价格提供参考</h3><p>股价区间取对应观察窗口中的最高与最低价，保留币种、价格口径与实际行情覆盖日期；缺失价格不补零。公司行动、交易时间和历史仓位都会影响实际成本。</p></article><article><span>04 / 逻辑来自原文</span><h3>保留经理说明与来源</h3><p>运作说明是报告层面的表述，不能自动解释每只股票的变动。优先阅读原报告，并关注说明期与当前持仓期是否一致。</p></article></div><div id="coverage-notes" class="coverage-notes"></div></section>
+  </main>
+  <footer class="wrap footer"><span>RECORD LAB <b> / </b> 公募持仓跟踪</span><span>公开来源 · 明确时点 · 保留缺失</span></footer>
+  <noscript><p class="noscript">请启用 JavaScript 以读取报告数据并使用筛选功能。</p></noscript>
+</body>
+</html>

@@ -1,0 +1,13 @@
+{
+  "name": "record-lab",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Source-linked periodic record comparisons",
+  "engines": {"node": ">=22"},
+  "scripts": {
+    "test": "node --test tests/*.js",
+    "build:data": "node scripts/build-data.js",
+    "check:public": "python3 scripts/publication_guard.py --root .",
+    "serve": "python3 -m http.server 8786 --bind 127.0.0.1 --directory web"
+  }
+}

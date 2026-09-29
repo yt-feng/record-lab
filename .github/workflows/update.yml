@@ -1,0 +1,75 @@
+name: Update records
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 22 * * 0,3'
+concurrency:
+  group: published-records
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Validate source
+        run: |
+          npm test
+          python -m unittest discover -s tests -p 'test_*.py'
+          python scripts/publication_guard.py --root . --history
+      - name: Collect observations
+        timeout-minutes: 32
+        run: python scripts/collect.py --config config/universe.json --output raw/input.json
+      - name: Build comparisons
+        run: node scripts/build-data.js --input raw/input.json --output web/data/latest.json --config config/universe.json
+      - name: Validate publication
+        run: python scripts/publication_guard.py --root .
+      - name: Save validated snapshot
+        run: |
+          git config user.name 'Automation'
+          git config user.email 'automation@users.noreply.github.com'
+          git add web/data/latest.json
+          if ! git diff --staged --quiet; then
+            git commit -m 'Update public observations'
+            git push origin HEAD:main
+          fi
+      - name: Summarize coverage
+        run: node scripts/summarize.js >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: records
+          path: web/data/latest.json
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: web
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish snapshot
+        id: deployment
+        uses: actions/deploy-pages@v4

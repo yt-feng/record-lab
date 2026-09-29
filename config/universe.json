@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "scope": "2026Q2：全量目录生成前的首批验证，全部公司将分批补齐",
+  "funds": [
+    {
+      "code": "005827"
+    },
+    {
+      "code": "161005"
+    },
+    {
+      "code": "519674"
+    },
+    {
+      "code": "163406"
+    },
+    {
+      "code": "001938"
+    },
+    {
+      "code": "166002"
+    },
+    {
+      "code": "001717"
+    },
+    {
+      "code": "519732"
+    },
+    {
+      "code": "320007"
+    },
+    {
+      "code": "003095"
+    },
+    {
+      "code": "000409"
+    },
+    {
+      "code": "000513"
+    }
+  ],
+  "maxWorkers": 2,
+  "historyYears": 2,
+  "maxReportsPerFund": 2,
+  "maxPriceSymbols": 150,
+  "targetPeriodEnd": "2026-06-30",
+  "baselinePeriodEnd": "2026-03-31"
+}
