@@ -23,4 +23,6 @@ npm run serve
 
 Batch collection runs on the hosted runner. Tests use small synthetic fixtures, never fabricated production observations.
 
+Report PDFs are parsed in runner memory. If the repository's Actions secrets include `MINER_U_KEYS`, `MINER_U`, or `MINERU_API_KEY`, the optional MinerU v4 path extracts `full.md` with original page references; without a secret, the bounded pypdf fallback remains available. Raw PDFs and MinerU markdown are temporary runner inputs and are never published under `web/data`.
+
 See [Methodology](docs/methodology.md) and [Publication](docs/publication.md).
