@@ -112,6 +112,9 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         try:
             details = source.report_details(selected)
             report.update({k: details[k] for k in ("navYuan", "narrative")})
+            for key in ("parseMethod", "parseErrorCode", "sourceTextHash", "pageStats", "strategyExcerpts", "strategyThemes"):
+                if key in details:
+                    report[key] = details[key]
             if details.get("portfolioCode"):
                 if details["portfolioCode"] != code and code not in details.get("shareClassCodes", []):
                     errors.append({"code": code, "stage": "report", "errorCode": "REPORT_IDENTITY_MISMATCH"})
@@ -132,6 +135,9 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
                 if quarterly_details.get("narrative"):
                     report["narrative"] = quarterly_details["narrative"]
                     report["narrative"]["reportKind"] = "quarterly"
+                for key in ("parseMethod", "parseErrorCode", "sourceTextHash", "pageStats", "strategyExcerpts", "strategyThemes"):
+                    if key in quarterly_details:
+                        report[key] = quarterly_details[key]
                 if report["navYuan"] is None:
                     report["navYuan"] = quarterly_details["navYuan"]
                     report["navSourceUrl"] = quarterly["sourceUrl"]

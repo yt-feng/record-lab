@@ -511,11 +511,17 @@
       const evidence = fund.selectedReport || {};
       const excerpts = Array.isArray(evidence.strategyExcerpts) ? evidence.strategyExcerpts : [];
       const themes = Array.isArray(evidence.strategyThemes) ? evidence.strategyThemes : [];
-      if (excerpts.length || themes.length) {
+      if (evidence.parseMethod || excerpts.length || themes.length) {
         const strategy = el('section', 'narrative strategy-evidence');
         const strategyTitle = el('div', 'narrative-title');
         strategyTitle.append(el('h4', '', '报告解析出的策略要点'));
         strategy.append(strategyTitle);
+        if (evidence.parseMethod) {
+          const methodLabels = { mineru: 'MinerU', pypdf: 'pypdf', 'pypdf-fallback': 'pypdf 回退' };
+          const method = methodLabels[evidence.parseMethod] || evidence.parseMethod;
+          const suffix = evidence.parseErrorCode ? ` · MinerU 回退码：${evidence.parseErrorCode}` : '';
+          strategy.append(el('p', 'narrative-meta', `PDF 解析方式：${method}${suffix}`));
+        }
         if (themes.length) strategy.append(el('p', 'narrative-meta', `主题：${themes.join(' · ')}`));
         excerpts.forEach(item => {
           const row = el('p', 'narrative-text');

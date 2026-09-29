@@ -88,6 +88,7 @@ jobs:
         timeout-minutes: 34
         env:
           BATCH_CONFIG: ${{ matrix.config }}
+          MINER_U_KEYS: ${{ secrets.MINER_U_KEYS }}
         run: python scripts/collect.py --config ".cache/plan/$BATCH_CONFIG" --output raw/input.json --as-of 2026-09-29
       - name: Build batch
         id: build
