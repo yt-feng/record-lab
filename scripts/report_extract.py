@@ -99,6 +99,8 @@ class MinerUClient:
     def parse(self, pdf_bytes: bytes, filename: str = "report.pdf") -> str:
         if not pdf_bytes:
             raise ExtractionError("MINERU_EMPTY_PDF")
+        if not self._token:
+            raise ExtractionError("MINERU_TOKEN_MISSING")
         data_id = re.sub(r"[^A-Za-z0-9._-]+", "_", filename)[:128] or "report.pdf"
         try:
             response = self.session.post(
