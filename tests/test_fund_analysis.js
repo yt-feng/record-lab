@@ -235,3 +235,20 @@ test('holdings-table and NAV report provenance remain distinct', () => {
   assert.equal(result.selectedReport.holdingsRetrieval, 'structured-table');
   assert.equal(result.narrative.excerptSelection, 'operation-sentences');
 });
+
+test('report parser evidence survives strict normalization with bounded fields', () => {
+  const result = analyzeFund(fund([report({
+    parseMethod: 'mineru',
+    sourceTextHash: 'A'.repeat(64),
+    pageStats: { pageCount: 42, nonEmptyPages: 38, charCount: 10000, markdownBytes: 20000 },
+    strategyExcerpts: [{ text: '本基金依据估值调整组合。'.repeat(30), sourceUrl: 'https://example.org/report.pdf',
+      page: 17, periodStart: '2026-04-01', periodEnd: '2026-06-30' }],
+    strategyThemes: ['调仓/交易', 'unknown'],
+  })]), options());
+  assert.equal(result.selectedReport.parseMethod, 'mineru');
+  assert.equal(result.selectedReport.sourceTextHash, 'a'.repeat(64));
+  assert.equal(result.selectedReport.pageStats.pageCount, 42);
+  assert.equal(result.selectedReport.strategyExcerpts[0].page, 17);
+  assert.equal(result.selectedReport.strategyExcerpts[0].text.length, 260);
+  assert.deepEqual(result.selectedReport.strategyThemes, ['调仓/交易']);
+});
