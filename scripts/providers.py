@@ -449,19 +449,21 @@ class PublicProvider:
             raise DataError("INVALID_FORMAT") from None
 
     def report_details(self, report, max_pages=18):
-        from pypdf import PdfReader
-        logging.getLogger("pypdf").setLevel(logging.CRITICAL)
+        from report_extract import extract_report
+
         data = self.get(report["sourceUrl"], binary=True)
         if not data.startswith(b"%PDF"):
             raise DataError("INVALID_PDF")
         try:
-            reader = PdfReader(io.BytesIO(data))
-            # Strategy/financial indicator pages are near the front; bounded parsing.
-            pages = [p.extract_text() or "" for p in reader.pages[:max(1, min(max_pages, 80))]]
-        except Exception:
-            raise DataError("PDF_PARSE_FAILED") from None
-        result = parse_pdf_pages(pages, report["sourceUrl"], report["periodEnd"], report["kind"])
-        result["noEquitiesEvidence"] = parse_no_equities(pages, report)
+            result = extract_report(data, report["sourceUrl"], report["periodEnd"], report["kind"],
+                                    parse_pages=parse_pdf_pages, filename=report.get("title", "report.pdf"),
+                                    max_pages=max_pages,
+                                    enrich_pages=lambda pages: {"noEquitiesEvidence": parse_no_equities(pages, report)})
+        except Exception as error:
+            code = getattr(error, "code", "PDF_PARSE_FAILED")
+            raise DataError(code if re.fullmatch(r"[A-Z0-9_]+", str(code)) else "PDF_PARSE_FAILED") from None
+        # Preserve the historical field while attaching page-cited MinerU/pypdf
+        # metadata. MinerU markdown is consumed in memory and is never published.
         return result
 
     def price_bars(self, code, market, start, end):
