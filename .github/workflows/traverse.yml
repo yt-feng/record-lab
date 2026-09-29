@@ -41,7 +41,7 @@ jobs:
       - name: Plan bounded batches
         id: plan
         run: |
-          python scripts/traversal.py plan --catalog web/data/catalog.json --progress web/data/progress.json --config config/universe.json --output .cache/plan --shards 4 --batch-size 25
+          python scripts/traversal.py plan --catalog web/data/catalog.json --progress web/data/progress.json --config config/universe.json --output .cache/plan --shards 8 --batch-size 50
           node scripts/workflow-outputs.js .cache/plan >> "$GITHUB_OUTPUT"
       - run: python scripts/publication_guard.py --root . --plan-dir .cache/plan
       - uses: actions/upload-artifact@v4
@@ -62,7 +62,7 @@ jobs:
     if: needs.plan.outputs.has_work == 'true'
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 8
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ubuntu-latest
