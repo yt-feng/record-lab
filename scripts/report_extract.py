@@ -319,7 +319,7 @@ def _details_for_pages(pages: list[str], source_url: str, period_end: str, kind:
 def extract_report(pdf_bytes: bytes, source_url: str, period_end: str, kind: str,
                    *, parse_pages: Callable[[list[str], str, str, str], dict[str, Any]],
                    mineru_client: MinerUClient | None = None, filename: str = "report.pdf",
-                   max_pages: int = 18, env: Mapping[str, str] | None = None,
+                   max_pages: int = 80, env: Mapping[str, str] | None = None,
                    enrich_pages: Callable[[list[str]], Mapping[str, Any]] | None = None) -> dict[str, Any]:
     """Parse a report with MinerU when configured, falling back to pypdf."""
     tokens = mineru_tokens_from_env(env)

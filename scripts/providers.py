@@ -448,7 +448,7 @@ class PublicProvider:
         except (ValueError, TypeError):
             raise DataError("INVALID_FORMAT") from None
 
-    def report_details(self, report, max_pages=18):
+    def report_details(self, report, max_pages=80):
         from report_extract import extract_report
 
         data = self.get(report["sourceUrl"], binary=True)
