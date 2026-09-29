@@ -54,6 +54,13 @@
       if (fund.summary != null && !isRecord(fund.summary)) fail();
       if (fund.interval != null && !isRecord(fund.interval)) fail();
       if (['ok', 'no-equities'].includes(fund.status) && (!isRecord(fund.selectedReport) || !dateOnly(fund.selectedReport.periodEnd))) fail();
+      const reportEvidence = fund.selectedReport;
+      if (reportEvidence?.strategyExcerpts != null && (!Array.isArray(reportEvidence.strategyExcerpts) ||
+        reportEvidence.strategyExcerpts.length > 8 || reportEvidence.strategyExcerpts.some(item => !isRecord(item) ||
+          typeof item.text !== 'string' || item.text.length > 260 || !safeHttpUrl(item.sourceUrl) ||
+          !Number.isInteger(item.page) || item.page < 1))) fail();
+      if (reportEvidence?.strategyThemes != null && (!Array.isArray(reportEvidence.strategyThemes) ||
+        reportEvidence.strategyThemes.some(theme => typeof theme !== 'string' || theme.length > 30))) fail();
       if (fund.status === 'no-equities') {
         const evidence = fund.noEquitiesEvidence || fund.selectedReport?.noEquitiesEvidence;
         if (!isRecord(evidence) || evidence.confirmed !== true || !safeHttpUrl(evidence.sourceUrl) || evidence.periodEnd !== fund.selectedReport.periodEnd || fund.rows.length) fail();
@@ -500,7 +507,28 @@
         const selectionNote = { 'operation-sentences': '按运作相关关键词选取原文句子。', 'section-opening': '摘录运作分析章节开头。' }[fund.narrative.excerptSelection] || '';
         narrative.append(el('p', 'narrative-note', `${selectionNote}${fund.narrative.truncated ? '当前显示短摘录，请前往来源阅读完整内容。' : ''}报告层面的原文摘录；不能据此确定每只证券的买卖动机。`));
       } else narrative.append(el('p', 'narrative-meta', '尚未提取到可核验的经理运作说明，请查看原报告；不自动推断换仓逻辑。'));
-      body.append(narrative); card.append(body); return card;
+      body.append(narrative);
+      const evidence = fund.selectedReport || {};
+      const excerpts = Array.isArray(evidence.strategyExcerpts) ? evidence.strategyExcerpts : [];
+      const themes = Array.isArray(evidence.strategyThemes) ? evidence.strategyThemes : [];
+      if (excerpts.length || themes.length) {
+        const strategy = el('section', 'narrative strategy-evidence');
+        const strategyTitle = el('div', 'narrative-title');
+        strategyTitle.append(el('h4', '', '报告解析出的策略要点'));
+        strategy.append(strategyTitle);
+        if (themes.length) strategy.append(el('p', 'narrative-meta', `主题：${themes.join(' · ')}`));
+        excerpts.forEach(item => {
+          const row = el('p', 'narrative-text');
+          row.append(doc.createTextNode(item.text));
+          if (item.page) row.append(doc.createTextNode(`（第 ${item.page} 页）`));
+          const source = el('span', 'cell-sub');
+          if (addLink(source, '原文来源 ↗', item.sourceUrl)) row.append(doc.createTextNode(' '), source);
+          strategy.append(row);
+        });
+        strategy.append(el('p', 'narrative-note', '以上为报告原文摘录与规则主题归类；不把报告层面的观点自动解释为单只证券的交易动机。'));
+        body.append(strategy);
+      }
+      card.append(body); return card;
     }
 
     function updatePagination() {
