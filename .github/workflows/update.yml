@@ -47,6 +47,8 @@ jobs:
         continue-on-error: true
         env:
           MINER_U_KEYS: ${{ secrets.MINER_U_KEYS }}
+          MINER_U: ${{ secrets.MINER_U }}
+          MINERU_API_KEY: ${{ secrets.MINERU_API_KEY }}
         run: python scripts/collect.py --config config/universe.json --output raw/input.json --as-of 2026-09-29
       - name: Build comparisons
         if: always()

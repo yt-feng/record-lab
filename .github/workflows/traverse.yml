@@ -89,6 +89,8 @@ jobs:
         env:
           BATCH_CONFIG: ${{ matrix.config }}
           MINER_U_KEYS: ${{ secrets.MINER_U_KEYS }}
+          MINER_U: ${{ secrets.MINER_U }}
+          MINERU_API_KEY: ${{ secrets.MINERU_API_KEY }}
         run: python scripts/collect.py --config ".cache/plan/$BATCH_CONFIG" --output raw/input.json --as-of 2026-09-29
       - name: Build batch
         id: build
