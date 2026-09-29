@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import time
@@ -289,6 +290,7 @@ def _pypdf_pages(pdf_bytes: bytes, max_pages: int) -> list[str]:
     try:
         from pypdf import PdfReader
 
+        logging.getLogger("pypdf").setLevel(logging.CRITICAL)
         reader = PdfReader(io.BytesIO(pdf_bytes))
         return [page.extract_text() or "" for page in reader.pages[:max(1, min(max_pages, 80))]]
     except Exception:
