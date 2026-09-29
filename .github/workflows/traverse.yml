@@ -1,0 +1,197 @@
+name: Traverse records
+on:
+  workflow_dispatch:
+    inputs:
+      continue_chain:
+        description: Continue remaining batches automatically
+        type: boolean
+        default: true
+  schedule:
+    - cron: '23 22 * * 0,3'
+concurrency:
+  group: published-records
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      has_work: ${{ steps.plan.outputs.has_work }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Validate source
+        run: |
+          npm test
+          python -m unittest discover -s tests -p 'test_*.py'
+          python scripts/publication_guard.py --root .
+      - name: Discover public directory
+        run: python scripts/discover.py --output web/data/catalog.json --state raw/catalog-state.json --as-of 2026-09-29 --allow-partial --max-companies 30
+      - name: Plan bounded batches
+        id: plan
+        run: |
+          python scripts/traversal.py plan --catalog web/data/catalog.json --progress web/data/progress.json --config config/universe.json --output .cache/plan --shards 4 --batch-size 25
+          node scripts/workflow-outputs.js .cache/plan >> "$GITHUB_OUTPUT"
+      - run: python scripts/publication_guard.py --root . --plan-dir .cache/plan
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: .cache/plan/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: directory
+          path: web/data/catalog.json
+          if-no-files-found: error
+          retention-days: 2
+  batch:
+    needs: plan
+    if: needs.plan.outputs.has_work == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 42
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: .cache/plan
+      - name: Collect batch
+        id: collect
+        continue-on-error: true
+        timeout-minutes: 34
+        env:
+          BATCH_CONFIG: ${{ matrix.config }}
+        run: python scripts/collect.py --config ".cache/plan/$BATCH_CONFIG" --output raw/input.json --as-of 2026-09-29
+      - name: Build batch
+        id: build
+        if: always()
+        continue-on-error: true
+        env:
+          BATCH_CONFIG: ${{ matrix.config }}
+        run: |
+          test -f raw/input.json
+          node scripts/build-data.js --input raw/input.json --output web/data/part.json --config ".cache/plan/$BATCH_CONFIG"
+      - name: Record completion state
+        if: always()
+        env:
+          BATCH_CONFIG: ${{ matrix.config }}
+        run: python scripts/traversal.py status --config ".cache/plan/$BATCH_CONFIG" --snapshot web/data/part.json --output web/data/status.json
+      - name: Validate batch publication
+        if: always()
+        id: publication
+        run: python scripts/publication_guard.py --root .
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.publication.outcome == 'success'
+        with:
+          name: part-${{ matrix.id }}
+          path: |
+            web/data/part.json
+            web/data/status.json
+          if-no-files-found: error
+          retention-days: 2
+  publish:
+    needs: [plan, batch]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    permissions:
+      contents: write
+      pages: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: directory
+          path: web/data
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: .cache/plan
+      - uses: actions/download-artifact@v4
+        if: needs.plan.outputs.has_work == 'true'
+        continue-on-error: true
+        with:
+          pattern: part-*
+          path: .cache/parts
+      - name: Complete bounded attempt records
+        run: python scripts/complete-status.py
+      - name: Merge source-linked results
+        run: |
+          node scripts/merge-parts.js --parts .cache/parts --data web/data --catalog web/data/catalog.json --config config/universe.json
+          python scripts/traversal.py merge --parts .cache/parts --catalog web/data/catalog.json --progress web/data/progress.json --config config/universe.json
+          python scripts/publication_guard.py --root . --history
+      - name: Persist observations and checkpoint
+        run: |
+          git pull --ff-only origin main
+          git config user.name 'Automation'
+          git config user.email 'automation@users.noreply.github.com'
+          git add web/data
+          if ! git diff --staged --quiet; then
+            git commit -m 'Update public observations and coverage'
+            git push origin HEAD:main
+          fi
+      - run: node scripts/summarize.js >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: web
+      - name: Continue unfinished traversal
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CONTINUE_CHAIN: ${{ github.event_name == 'schedule' || inputs.continue_chain }}
+        run: |
+          if [ "$CONTINUE_CHAIN" = 'true' ] && [ "$(node -p 'JSON.parse(require("fs").readFileSync("web/data/progress.json")).continueRun')" = 'true' ]; then
+            gh workflow run traverse.yml --ref main -f continue_chain=true
+          fi
+  deploy:
+    needs: publish
+    if: needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

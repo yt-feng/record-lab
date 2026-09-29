@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 import requests
 from bs4 import BeautifulSoup
 
+HOLDINGS_TOPLINE = 100  # Verified API value; 10000 silently falls back to ten rows.
+
 
 class DataError(Exception):
     def __init__(self, code: str):
@@ -433,7 +435,7 @@ class PublicProvider:
 
     def holdings(self, code, year):
         text = self.get("https://fundf10.eastmoney.com/FundArchivesDatas.aspx",
-                        params={"type": "jjcc", "code": code, "topline": "10000", "year": str(year), "month": "", "rt": str(time.time())},
+                        params={"type": "jjcc", "code": code, "topline": str(HOLDINGS_TOPLINE), "year": str(year), "month": "", "rt": str(time.time())},
                         referer=f"https://fundf10.eastmoney.com/ccmx_{code}.html")
         return parse_holdings_html(text)
 

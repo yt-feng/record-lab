@@ -42,7 +42,9 @@
   "maxWorkers": 2,
   "historyYears": 2,
   "maxReportsPerFund": 2,
-  "maxPriceSymbols": 150,
+  "maxPriceSymbols": 1200,
+  "maxPriceSeconds": 900,
+  "maxBatchSeconds": 1500,
   "targetPeriodEnd": "2026-06-30",
   "baselinePeriodEnd": "2026-03-31",
   "asOf": "2026-09-29"

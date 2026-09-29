@@ -17,7 +17,7 @@
       <span class="topbar-note"><span class="live-dot" aria-hidden="true"></span>以已披露报告为准</span>
     </div>
     <div class="hero wrap">
-      <div><p class="eyebrow">FUND DISCLOSURE EXPLORER</p><h1>公募持仓跟踪<span>从报告，读懂持仓变化。</span></h1><p class="hero-description">一起看基金经理的持仓变化、持仓体量、期间股价区间与报告中的运作说明。</p></div>
+      <div><p class="eyebrow">2026 Q2 · FUND DISCLOSURE EXPLORER</p><h1>公募持仓跟踪<span>2026 年二季度</span></h1><p class="hero-description">报告期 2026-06-30，对比 2026-03-31。按公司逐家查看，全部公募公司分批补齐。</p></div>
       <div class="hero-actions"><button type="button" id="reload" class="button button-light">↻ 重新载入</button><label for="import-file" class="button button-outline">导入结果 JSON<input id="import-file" class="visually-hidden" type="file" accept=".json,application/json"></label><span>导入文件只在当前浏览器中查看</span></div>
     </div>
   </header>
@@ -48,7 +48,8 @@
         <label>持仓报告期<select id="filter-period"><option value="">全部报告期</option></select></label>
         <label>披露变化<select id="filter-change"><option value="">全部变化</option><option value="increased">持股数增加</option><option value="decreased">持股数减少</option><option value="entered">进入披露名单</option><option value="left">离开披露名单</option><option value="unchanged">持股数未变</option><option value="unknown">无法比较</option></select></label>
       </div>
-      <p class="filter-tip">支持空格组合搜索；仅浏览已收录数据，输入新代码不会触发在线抓取。</p>
+      <p class="filter-tip">按公司逐家查看；搜索与导出仅作用于当前公司已载入页。上方公司清单可搜索全部已发现公司。</p>
+      <div id="company-navigation" class="company-navigation" hidden><span id="company-page-status"></span><div><button id="company-prev" type="button" class="text-button">← 上一页</button><button id="company-next" type="button" class="text-button">下一页 →</button></div></div>
     </section>
     <section id="results" aria-label="基金经理与持仓明细" tabindex="-1"><div class="results-title"><h2>经理与持仓明细</h2><span id="result-count">等待数据</span></div><div id="fund-results" aria-live="polite"><div class="empty-state"><span class="empty-icon" aria-hidden="true">≋</span><h3>正在整理报告</h3><p>载入完成后，可按经理展开基金持仓与报告说明。</p></div></div></section>
     <section class="methodology" id="methodology"><div class="section-title"><div><p class="eyebrow">READING THE DATA</p><h2>把披露事实与估算分开看</h2></div></div><div class="method-grid"><article><span>01 / 报告有时点</span><h3>报告期、公告日、采集日各不同</h3><p>持仓按报告期末观察；基金经理归属可能来自较晚的公开信息。每张基金卡保留这些日期，运作说明也独立标明覆盖期间。</p></article><article><span>02 / 持仓有边界</span><h3>披露名单中的变化</h3><p>只有可比较的持股数量才标记增加或减少。名单进出无法证明完整交易，非相邻报告期的变化也不代表单季买卖。基金份额类别不能直接相加。</p></article><article><span>03 / 价格不是成本</span><h3>用区间价格提供参考</h3><p>股价区间取对应观察窗口中的最高与最低价，保留币种、价格口径与实际行情覆盖日期；缺失价格不补零。公司行动、交易时间和历史仓位都会影响实际成本。</p></article><article><span>04 / 逻辑来自原文</span><h3>保留经理说明与来源</h3><p>运作说明是报告层面的表述，不能自动解释每只股票的变动。优先阅读原报告，并关注说明期与当前持仓期是否一致。</p></article></div><div id="coverage-notes" class="coverage-notes"></div></section>

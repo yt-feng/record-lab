@@ -19,6 +19,9 @@
   const nullableText = value => value === null || typeof value === 'string';
   const countValue = value => Number.isInteger(value) && value >= 0;
   const MAX_DATA_BYTES = 80 * 1024 * 1024;
+  function safeCompanyPath(path) { return typeof path === 'string' && /^\.\/data\/companies\/[A-Za-z0-9_-]+\.json$/.test(path) ? path : null; }
+  function companyPages(manifest, code) { return (manifest?.companyFiles || []).filter(file => file.companyCode === code).slice().sort((a, b) => (a.partIndex || 1) - (b.partIndex || 1)); }
+  function catalogComplete(catalog) { return Boolean(catalog && catalog.coverage.complete !== false && catalog.coverage.directoryComplete !== false && !['bootstrap', 'partial-directory', 'limited-probe', 'unavailable'].includes(catalog.coverage.status)); }
 
   function safeHttpUrl(value) {
     if (typeof value !== 'string' || /[\u0000-\u001f\u007f]/.test(value)) return null;
@@ -38,16 +41,23 @@
       !Number.isInteger(data.coverage.companyCount) || data.coverage.companyCount < 0 ||
       typeof data.coverage.scope !== 'string' || !Array.isArray(data.coverage.limitations) ||
       data.coverage.limitations.some(item => typeof item !== 'string')) fail();
+    if (data.companyFiles != null && (!Array.isArray(data.companyFiles) || data.companyFiles.some(file => !isRecord(file) ||
+      typeof file.companyCode !== 'string' || typeof file.companyName !== 'string' || !safeCompanyPath(file.path) ||
+      !countValue(file.fundCount) || (file.partIndex != null && (!countValue(file.partIndex) || file.partIndex < 1))))) fail();
     for (const fund of data.funds) {
       if (!isRecord(fund) || typeof fund.code !== 'string' || !/^\d{6}$/.test(fund.code) || !nullableText(fund.name) ||
         !nullableText(fund.company) || !Array.isArray(fund.managers) ||
-        !['ok', 'unavailable'].includes(fund.status) || !Array.isArray(fund.rows) || fund.rows.length > 20000) fail();
+        !['ok', 'unavailable', 'no-equities'].includes(fund.status) || !Array.isArray(fund.rows) || fund.rows.length > 20000) fail();
       if (fund.managers.some(manager => typeof manager !== 'string' && (!isRecord(manager) || typeof manager.name !== 'string'))) fail();
       if (fund.reportManagers != null && (!Array.isArray(fund.reportManagers) || fund.reportManagers.some(manager => typeof manager !== 'string' && (!isRecord(manager) || typeof manager.name !== 'string')))) fail();
       if (fund.shareClassCodes != null && (!Array.isArray(fund.shareClassCodes) || fund.shareClassCodes.some(code => typeof code !== 'string'))) fail();
       if (fund.summary != null && !isRecord(fund.summary)) fail();
       if (fund.interval != null && !isRecord(fund.interval)) fail();
-      if (fund.status === 'ok' && (!isRecord(fund.selectedReport) || !dateOnly(fund.selectedReport.periodEnd))) fail();
+      if (['ok', 'no-equities'].includes(fund.status) && (!isRecord(fund.selectedReport) || !dateOnly(fund.selectedReport.periodEnd))) fail();
+      if (fund.status === 'no-equities') {
+        const evidence = fund.noEquitiesEvidence || fund.selectedReport?.noEquitiesEvidence;
+        if (!isRecord(evidence) || evidence.confirmed !== true || !safeHttpUrl(evidence.sourceUrl) || evidence.periodEnd !== fund.selectedReport.periodEnd || fund.rows.length) fail();
+      }
       if (fund.previousReport && (!isRecord(fund.previousReport) || !dateOnly(fund.previousReport.periodEnd))) fail();
       if (fund.narrative && (!isRecord(fund.narrative) || !nullableText(fund.narrative.text))) fail();
       if (fund.warnings && (!Array.isArray(fund.warnings) || fund.warnings.some(item => typeof item !== 'string'))) fail();
@@ -77,13 +87,13 @@
     const codes = new Set();
     for (const company of data.companies) {
       if (!isRecord(company) || typeof company.code !== 'string' || !company.code || typeof company.name !== 'string' ||
-        !countValue(company.fundCount) || codes.has(company.code)) fail();
+        !(company.fundCount === null || countValue(company.fundCount)) || codes.has(company.code)) fail();
       codes.add(company.code);
     }
     const fundCodes = new Set();
     for (const fund of data.funds) {
       if (!isRecord(fund) || typeof fund.code !== 'string' || !/^\d{6}$/.test(fund.code) || typeof fund.name !== 'string' ||
-        typeof fund.companyCode !== 'string' || typeof fund.companyName !== 'string' || !codes.has(fund.companyCode) || fundCodes.has(fund.code)) fail();
+        !nullableText(fund.companyCode) || !nullableText(fund.companyName) || (fund.companyCode !== null && !codes.has(fund.companyCode)) || fundCodes.has(fund.code)) fail();
       fundCodes.add(fund.code);
     }
     if (!countValue(data.coverage.companyCount) || !countValue(data.coverage.fundCount)) fail();
@@ -98,12 +108,12 @@
     const companies = new Set();
     for (const company of data.companies) {
       if (!isRecord(company) || typeof company.code !== 'string' || typeof company.name !== 'string' ||
-        ['totalFunds', 'processedFunds', 'withHoldings', 'withoutEquities', 'failed', 'pending'].some(key => !countValue(company[key])) || companies.has(company.code)) fail();
+        !(company.totalFunds === null || countValue(company.totalFunds)) || ['processedFunds', 'withHoldings', 'withoutEquities', 'failed', 'pending'].some(key => !countValue(company[key])) || companies.has(company.code)) fail();
       companies.add(company.code);
     }
     const funds = new Set();
     for (const fund of data.funds) {
-      if (!isRecord(fund) || typeof fund.code !== 'string' || typeof fund.companyCode !== 'string' ||
+      if (!isRecord(fund) || typeof fund.code !== 'string' || !nullableText(fund.companyCode) ||
         !['complete', 'no-equities', 'failed', 'pending'].includes(fund.status) || funds.has(fund.code)) fail();
       funds.add(fund.code);
     }
@@ -119,14 +129,15 @@
   }
   function coverageOverview(catalog, progress, data) {
     const index = catalogIndex(catalog);
-    const available = (data?.funds || []).filter(fund => fund.status === 'ok');
+    const available = (data?.funds || []).filter(fund => ['ok', 'no-equities'].includes(fund.status));
     const codes = new Set(available.flatMap(fund => [fund.code, ...(fund.shareClassCodes || [])]));
     const companies = new Set(available.map(fund => companyCodeFor(fund, index) || fund.company).filter(Boolean));
-    const catalogFunds = catalog ? catalog.funds.length : progress?.totalFunds ?? null;
-    const catalogCompanies = catalog ? catalog.companies.length : progress?.totalCompanies ?? null;
-    const coveredFunds = catalog ? [...codes].filter(code => index.funds.has(code)).length : new Set(available.map(fund => fund.code)).size;
+    const directoryComplete = catalogComplete(catalog);
+    const catalogFunds = directoryComplete ? catalog.coverage.fundCount : null;
+    const catalogCompanies = directoryComplete ? catalog.coverage.companyCount : null;
+    const coveredFunds = data?.companyFiles ? data.coverage.catalogAvailableFundCount ?? data.coverage.fundCount : catalog ? [...codes].filter(code => index.funds.has(code)).length : new Set(available.map(fund => fund.code)).size;
     const processed = progress?.processedFunds ?? null;
-    return { coveredFunds, coveredCompanies: companies.size, totalFunds: catalogFunds, totalCompanies: catalogCompanies,
+    return { coveredFunds, coveredCompanies: data?.companyFiles ? data.coverage.companyCount : companies.size, totalFunds: catalogFunds, totalCompanies: catalogCompanies,
       processedFunds: processed, pendingFunds: progress?.pendingFunds ?? null,
       percent: processed !== null && progress.totalFunds > 0 ? Math.min(100, processed / progress.totalFunds * 100) : null };
   }
@@ -136,7 +147,7 @@
     return (catalog?.companies || progress?.companies || []).filter(company =>
       tokens.every(token => `${company.code} ${company.name}`.toLocaleLowerCase().includes(token))).map(company => {
       const entry = progressMap.get(company.code);
-      return { ...company, totalFunds: company.fundCount ?? company.totalFunds,
+      return { ...company, totalFunds: company.fundCount ?? company.totalFunds ?? null,
         processedFunds: entry?.processedFunds ?? null, withHoldings: entry?.withHoldings ?? null,
         withoutEquities: entry?.withoutEquities ?? null, failed: entry?.failed ?? null, pending: entry?.pending ?? null,
         lastAttemptAt: entry?.lastAttemptAt || null };
@@ -250,7 +261,7 @@
   function mount(doc, win) {
     if (!doc.getElementById('fund-results')) return;
     const $ = id => doc.getElementById(id);
-    const state = { data: null, catalog: null, progress: null, directoryRequest: 0, directoryFailures: [], mode: 'remote', failed: false, filtered: [], limit: 30, request: 0 };
+    const state = { data: null, manifest: null, companyCode: '', pageIndex: 0, companyRequest: 0, loadingCompany: false, catalog: null, progress: null, directoryRequest: 0, directoryFailures: [], mode: 'remote', failed: false, filtered: [], limit: 30, request: 0 };
     const inputs = { query: $('search'), company: $('filter-company'), manager: $('filter-manager'), period: $('filter-period'), change: $('filter-change') };
 
     function el(tag, className, text) {
@@ -272,7 +283,7 @@
       box.append(el('h3', '', title), el('p', '', description)); return box;
     }
     function updateObservation(message) {
-      const observation = observationState(state.data, state.mode, state.failed);
+      const observation = observationState(state.manifest || state.data, state.mode, state.failed);
       $('source-badge').textContent = observation.badge;
       $('source-badge').className = observation.className;
       $('observation-dates').textContent = observation.dates;
@@ -290,9 +301,10 @@
     function updateCompanyOptions() {
       const previous = inputs.company.value;
       inputs.company.replaceChildren();
-      const entries = [['', state.catalog ? '全部目录公司' : '全部已收录公司']];
+      const entries = [['', state.manifest ? '选择公司，逐家查看' : state.catalog ? '全部目录公司' : '全部已收录公司']];
       const index = catalogIndex(state.catalog);
       for (const company of state.catalog?.companies || state.progress?.companies || []) entries.push([`code:${company.code}`, company.name]);
+      for (const file of state.manifest?.companyFiles || []) if (!entries.some(([value]) => value === `code:${file.companyCode}`)) entries.push([`code:${file.companyCode}`, file.companyName]);
       const extra = new Set((state.data?.funds || []).filter(fund => !companyCodeFor(fund, index)).map(fund => fund.company).filter(Boolean));
       for (const company of [...extra].sort((a, b) => a.localeCompare(b, 'zh-CN'))) entries.push([company, company]);
       for (const [value, label] of entries) { const option = el('option', '', label); option.value = value; inputs.company.append(option); }
@@ -300,18 +312,25 @@
       else if (previous) inputs.company.value = entries.find(([, label]) => label === previous)?.[0] || '';
     }
     function updateStatistics() {
-      const overview = coverageOverview(state.catalog, state.progress, state.data);
+      const overview = coverageOverview(state.catalog, state.progress, state.manifest || state.data);
       $('stat-funds').textContent = `${formatNumber(overview.coveredFunds, 0)} / ${overview.totalFunds === null ? '—' : formatNumber(overview.totalFunds, 0)}`;
       $('stat-companies').textContent = `${formatNumber(overview.coveredCompanies, 0)} / ${overview.totalCompanies === null ? '—' : formatNumber(overview.totalCompanies, 0)}`;
-      $('stat-scope').textContent = state.catalog ? '目录按份额计数；同组合持仓不重复合计' : '全量目录未载入，分母尚未确认';
-      $('stat-company-note').textContent = state.catalog ? '全目录公司均可查询处理状态' : '目录待生成，已有报告不代表全量';
+      $('stat-scope').textContent = overview.totalFunds !== null ? '目录按份额计数；同组合持仓不重复合计' : '全量目录生成中，分母尚未确认';
+      $('stat-company-note').textContent = overview.totalCompanies !== null ? '目录公司均可查询处理状态' : '全量目录生成中，已有报告不代表全量';
+      const global = state.manifest?.coverage;
+      if (global) {
+        $('stat-period').textContent = state.manifest.targetPeriodEnd || global.targetPeriodEnd || global.latestPeriod || '2026-06-30';
+        $('stat-prices').textContent = `${formatNumber(global.priceAvailable || 0, 0)} / ${formatNumber(global.holdingCount || 0, 0)}`;
+        $('stat-prices-note').textContent = '全局已有行情 / 持仓条目；缺失保留';
+      }
     }
     function renderDirectory() {
       updateCompanyOptions(); updateStatistics();
       const overview = coverageOverview(state.catalog, state.progress, state.data);
-      $('catalog-badge').textContent = state.catalog ? `${state.catalog.companies.length} 家目录公司` : '目录待生成';
-      $('catalog-badge').className = `badge ${state.catalog ? 'success' : 'warning'}`;
-      $('progress-count').textContent = state.progress ? `已处理 ${formatNumber(state.progress.processedFunds, 0)} / ${formatNumber(state.progress.totalFunds, 0)} 只基金份额` : '处理进度待生成';
+      const incomplete = !catalogComplete(state.catalog);
+      $('catalog-badge').textContent = incomplete ? `全量目录生成中${state.catalog ? ` · 已发现 ${state.catalog.companies.length} 家` : ''}` : `${state.catalog.companies.length} 家目录公司`;
+      $('catalog-badge').className = `badge ${incomplete ? 'warning' : 'success'}`;
+      $('progress-count').textContent = state.progress ? `${incomplete ? '当前已发现目录' : ''}已处理 ${formatNumber(state.progress.processedFunds, 0)} / ${formatNumber(state.progress.totalFunds, 0)} 只基金份额` : '处理进度待生成';
       $('progress-detail').textContent = state.progress ? `${state.progress.completedCompanies} 家公司处理完成 · ${formatNumber(state.progress.pendingFunds, 0)} 只待处理` : '已有报告与遍历完成是两项独立计数。';
       $('progress-percent').textContent = overview.percent === null ? '—' : `${formatNumber(overview.percent, 1)}%`;
       $('coverage-progress').value = overview.percent || 0;
@@ -336,7 +355,7 @@
         const identity = el('td'); const button = el('button', 'company-button', company.name); button.type = 'button';
         button.addEventListener('click', () => {
           inputs.company.value = `code:${company.code}`; inputs.query.value = ''; inputs.manager.value = ''; inputs.change.value = ''; inputs.period.value = 'latest';
-          state.limit = 30; renderResults(); renderDirectory(); $('results').scrollIntoView({ behavior: 'auto', block: 'start' });
+          state.limit = 30; if (state.manifest) loadCompany(company.code, 0); else renderResults(); renderDirectory(); $('results').scrollIntoView({ behavior: 'auto', block: 'start' });
         });
         identity.append(button, el('span', 'company-code', company.code));
         if (company.lastAttemptAt) identity.append(el('small', '', `最近处理 ${company.lastAttemptAt}`));
@@ -383,9 +402,11 @@
       const current = latestFunds(funds);
       const rows = current.flatMap(fund => fund.rows.filter(row => row.current));
       updateStatistics();
-      $('stat-period').textContent = current.map(reportPeriod).filter(Boolean).sort().at(-1) || '暂无报告';
-      $('stat-prices').textContent = `${rows.filter(row => priceDescription(row.priceRange).observed).length} / ${rows.length}`;
-      $('stat-prices-note').textContent = '本期披露条目 · 行情覆盖未核验完整性';
+      if (!state.manifest) {
+        $('stat-period').textContent = state.data.targetPeriodEnd || current.map(reportPeriod).filter(Boolean).sort().at(-1) || '暂无报告';
+        $('stat-prices').textContent = `${rows.filter(row => priceDescription(row.priceRange).observed).length} / ${rows.length}`;
+        $('stat-prices-note').textContent = '本期披露条目 · 行情覆盖未核验完整性';
+      }
       const notes = $('coverage-notes'); notes.replaceChildren();
       const scope = el('p'); scope.append(el('strong', '', '覆盖范围：'), doc.createTextNode(state.data.coverage.scope)); notes.append(scope);
       for (const limitation of state.data.coverage.limitations) notes.append(el('p', '', limitation));
@@ -410,7 +431,7 @@
       addCell(tr, holdingValue(row.current, 'shares'), `上期 ${holdingValue(row.previous, 'shares')}`, 'number');
       addCell(tr, holdingValue(row.current, 'weightPct', '%'), `上期 ${holdingValue(row.previous, 'weightPct', '%')} · ${signed(row.change.weightDeltaPp, ' pp')}`, 'number');
       addCell(tr, formatMoney(row.position.disclosedYuan), '本期报告披露 · 人民币', 'number');
-      addCell(tr, formatMoney(row.position.estimatedYuan), '期末净资产 × 披露占比', 'number');
+      addCell(tr, formatMoney(row.position.estimatedYuan), row.position.estimateNote || '期末净资产 × 披露占比', 'number');
       const price = priceDescription(row.priceRange);
       const priceCell = el('td'); priceCell.append(el('span', price.observed ? 'price-value' : 'missing', price.value),
         el('span', 'cell-sub', `窗口 ${row.priceRange.rangeStart || '未提供'} → ${row.priceRange.rangeEnd || '未提供'}`), el('span', 'cell-sub', price.note));
@@ -426,6 +447,7 @@
       const heading = el('div');
       const title = el('div', 'fund-summary-title'); title.append(el('h3', '', fund.name || '名称未提供'), el('span', 'fund-code', fund.code));
       if (fund.status === 'unavailable') title.append(el('span', 'badge warning', '报告暂缺'));
+      if (fund.status === 'no-equities') title.append(el('span', 'badge success', '报告确认期末未持股'));
       if (fund.dataStatus === 'cached') title.append(el('span', 'badge warning', '保留的有效记录'));
       heading.append(title);
       const description = el('div', 'fund-summary-description');
@@ -456,7 +478,11 @@
       if (fund.dataStatus === 'cached') warnings.unshift('本轮未取得完整更新，继续保留这只基金之前的有效记录；观测截止与采集时间见上方。');
       if (fund.interval?.adjacent === false) warnings.unshift('比较报告期不相邻；持仓差异不能视为单季交易。');
       if (warnings.length) { const alerts = el('div', 'fund-alerts'); warnings.forEach(message => alerts.append(el('p', '', message))); body.append(alerts); }
-      if (!fund.visibleRows.length) body.append(emptyState('暂无可展示持仓', '这只基金尚无可用的持仓披露明细；报告与经理信息仅按已提供字段展示。', true));
+      if (fund.status === 'no-equities') {
+        const evidence = fund.noEquitiesEvidence || fund.selectedReport?.noEquitiesEvidence;
+        const note = emptyState('报告确认本期期末未持有股票', evidence?.text || '按报告证据记录本期期末无股票持仓，不按基金类型推断。', true);
+        addLink(note, '无股票持仓披露来源 ↗', evidence?.sourceUrl || fund.selectedReport?.sourceUrl); body.append(note);
+      } else if (!fund.visibleRows.length) body.append(emptyState('暂无可展示持仓', '这只基金尚无可用的持仓披露明细；报告与经理信息仅按已提供字段展示。', true));
       else {
         const scroll = el('div', 'table-scroll'); scroll.tabIndex = 0; scroll.setAttribute('role', 'region'); scroll.setAttribute('aria-label', `${fund.name}持仓表，可横向滚动`);
         const table = el('table', 'holdings-table'); const thead = el('thead'); const head = el('tr');
@@ -477,10 +503,54 @@
       body.append(narrative); card.append(body); return card;
     }
 
+    function updatePagination() {
+      const pages = companyPages(state.manifest, state.companyCode);
+      $('company-navigation').hidden = !state.manifest;
+      $('company-page-status').textContent = pages.length ? `${pages[0].companyName} · 第 ${state.pageIndex + 1} / ${pages.length} 页 · 公司共 ${pages[0].companyFundCount ?? pages.reduce((sum, page) => sum + page.fundCount, 0)} 份记录${state.loadingCompany ? ' · 正在载入' : ''}` : '这家公司尚无可载入记录，处理状态保留在上方目录中';
+      $('company-prev').disabled = state.loadingCompany || state.pageIndex <= 0;
+      $('company-next').disabled = state.loadingCompany || state.pageIndex + 1 >= pages.length;
+    }
+    async function loadCompany(code, pageIndex = 0) {
+      const request = ++state.companyRequest;
+      const samePage = state.companyCode === code && state.pageIndex === pageIndex;
+      const pages = companyPages(state.manifest, code);
+      state.companyCode = code; state.pageIndex = pageIndex; state.loadingCompany = Boolean(pages[pageIndex]);
+      if (!samePage || !pages[pageIndex]) state.data = null;
+      inputs.company.value = `code:${code}`;
+      updatePagination(); renderResults();
+      if (!pages[pageIndex]) return;
+      const controller = new win.AbortController(); const timer = win.setTimeout(() => controller.abort(), 20000);
+      try {
+        const response = await win.fetch(safeCompanyPath(pages[pageIndex].path), { cache: 'no-store', credentials: 'omit', signal: controller.signal });
+        if (!response.ok) throw new Error('COMPANY_LOAD_FAILED');
+        const raw = await response.text(); if (raw.length > MAX_DATA_BYTES) throw new Error('INVALID_DATASET');
+        const data = validateDataset(JSON.parse(raw));
+        if (request !== state.companyRequest) return;
+        state.data = { ...data, funds: data.funds.map(fund => ({ ...fund, companyCode: code })) };
+        state.loadingCompany = false; state.failed = false;
+        updateDataset(); updatePagination();
+        updateObservation(`按公司逐家查看：${pages[pageIndex].companyName}，本页 ${data.funds.length} 份记录；搜索与导出限当前页。`);
+      } catch (_) {
+        if (request !== state.companyRequest) return;
+        state.loadingCompany = false; state.failed = true;
+        updateObservation(`该公司本页未能载入${state.data ? '；保留本页原有数据与原始日期。' : '；未显示其他公司的记录。'}`);
+        renderResults(); updatePagination();
+      } finally { win.clearTimeout(timer); }
+    }
     function renderResults() {
-      if (!state.data) return;
+      if (state.loadingCompany) {
+        $('fund-results').replaceChildren(emptyState('正在载入所选公司的当前页', '每次只载入一页记录；其他公司继续保留在覆盖目录中。'));
+        $('export-csv').disabled = true; $('result-count').textContent = '正在载入'; return;
+      }
+      if (!state.data) {
+        if (state.manifest) {
+          $('fund-results').replaceChildren(emptyState(state.failed ? '这家公司本页暂未载入' : '所选公司尚无已收录记录', '可在上方目录查看待处理、无股票持仓与报告未取得数量；不会改为显示其他公司。'));
+          $('result-count').textContent = '当前公司 0 份已载入记录'; $('export-csv').disabled = true;
+        }
+        return;
+      }
       const filters = Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key, input.value]));
-      state.filtered = filterFunds(state.data.funds, filters);
+      state.filtered = filterFunds(state.data.funds, filters, state.catalog);
       const rowCount = state.filtered.reduce((sum, fund) => sum + fund.visibleRows.length, 0);
       $('result-count').textContent = `${new Set(state.filtered.map(fund => fund.code)).size} 只基金 · ${state.filtered.length} 份记录 · ${rowCount} 条持仓`;
       $('export-csv').disabled = rowCount === 0;
@@ -513,6 +583,7 @@
 
     async function reload() {
       const request = ++state.request;
+      loadDirectory();
       const controller = new win.AbortController();
       const timer = win.setTimeout(() => controller.abort(), 20000);
       $('reload').disabled = true;
@@ -521,12 +592,19 @@
         const response = await win.fetch('./data/latest.json', { cache: 'no-store', signal: controller.signal, credentials: 'omit' });
         if (!response.ok) throw new Error(response.status === 404 ? 'NOT_GENERATED' : 'LOAD_FAILED');
         const raw = await response.text();
-        if (raw.length > 15 * 1024 * 1024) throw new Error('INVALID_DATASET');
+        if (raw.length > MAX_DATA_BYTES) throw new Error('INVALID_DATASET');
         const data = validateDataset(JSON.parse(raw));
         if (request !== state.request) return;
-        if (state.data?.funds.length && !data.funds.length) throw new Error('EMPTY_REPLACEMENT');
-        state.data = data; state.failed = false; state.mode = 'remote';
-        updateDataset(); updateObservation(`已载入 ${new Set(data.funds.map(fund => fund.code)).size} 只基金；重新载入只读取最新已生成结果。`);
+        if (state.data?.funds.length && !data.funds.length && !data.companyFiles?.length) throw new Error('EMPTY_REPLACEMENT');
+        state.failed = false; state.mode = 'remote';
+        if (data.companyFiles?.length) {
+          state.manifest = data; updateCompanyOptions(); updateStatistics();
+          const code = inputs.company.value.startsWith('code:') ? inputs.company.value.slice(5) : data.companyFiles[0].companyCode;
+          await loadCompany(code, 0);
+        } else {
+          state.manifest = null; state.data = data; updateDataset(); updatePagination();
+          updateObservation(`已载入 ${new Set(data.funds.map(fund => fund.code)).size} 只基金；重新载入只读取最新已生成结果。`);
+        }
       } catch (error) {
         if (request !== state.request) return;
         state.failed = true;
@@ -540,17 +618,24 @@
     }
 
     $('reload').addEventListener('click', reload);
-    for (const [key, input] of Object.entries(inputs)) input.addEventListener(key === 'query' ? 'input' : 'change', () => { state.limit = 30; renderResults(); });
-    $('reset-filters').addEventListener('click', () => { Object.entries(inputs).forEach(([key, input]) => { input.value = key === 'period' ? 'latest' : ''; }); state.limit = 30; renderResults(); });
+    for (const [key, input] of Object.entries(inputs)) input.addEventListener(key === 'query' ? 'input' : 'change', () => {
+      state.limit = 30;
+      if (key === 'company' && state.manifest) { inputs.query.value = ''; inputs.manager.value = ''; inputs.change.value = ''; loadCompany(input.value.replace(/^code:/, ''), 0); }
+      else renderResults();
+    });
+    $('company-search').addEventListener('input', renderDirectory);
+    $('company-prev').addEventListener('click', () => loadCompany(state.companyCode, state.pageIndex - 1));
+    $('company-next').addEventListener('click', () => loadCompany(state.companyCode, state.pageIndex + 1));
+    $('reset-filters').addEventListener('click', () => { Object.entries(inputs).forEach(([key, input]) => { if (key !== 'company' || !state.manifest) input.value = key === 'period' ? 'latest' : ''; }); state.limit = 30; renderResults(); });
     $('import-file').addEventListener('change', async event => {
       const file = event.target.files[0]; if (!file) return;
       const request = ++state.request;
       try {
-        if (file.size > 15 * 1024 * 1024) throw new Error('INVALID_DATASET');
+        if (file.size > MAX_DATA_BYTES) throw new Error('INVALID_DATASET');
         const data = validateDataset(JSON.parse(await file.text()));
         if (request !== state.request) return;
         if (state.data?.funds.length && !data.funds.length) throw new Error('EMPTY_REPLACEMENT');
-        state.data = data; state.mode = 'imported'; state.failed = false; updateDataset();
+        state.companyRequest++; state.manifest = null; state.loadingCompany = false; state.data = data; state.mode = 'imported'; state.failed = false; updateDataset(); updatePagination();
         updateObservation('正在查看本地导入结果；文件不会上传，原始报告期与采集日期保持不变。');
       } catch (_) {
         if (request !== state.request) return;
@@ -572,6 +657,6 @@
     reload();
   }
 
-  return { validateDataset, safeHttpUrl, managerNames, managerAttributionLabel, reportPeriod, changeGroup, latestFunds, filterFunds,
+  return { validateDataset, validateCatalog, validateProgress, catalogComplete, safeCompanyPath, companyPages, catalogIndex, companyCoverage, coverageOverview, safeHttpUrl, managerNames, managerAttributionLabel, reportPeriod, changeGroup, latestFunds, filterFunds,
     formatNumber, formatMoney, signed, holdingValue, priceDescription, csvCell, exportCsv, observationState, mount };
 });

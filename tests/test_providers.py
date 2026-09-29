@@ -15,6 +15,20 @@ from collect import collect_fund, collect
 
 
 class ParserTests(unittest.TestCase):
+    def test_holdings_uses_verified_limit_not_silently_downgraded_large_value(self):
+        class ServerFixture(PublicProvider):
+            def __init__(self):
+                self.requested_limit = None
+            def get(self, url, **kwargs):
+                self.requested_limit = kwargs["params"]["topline"]
+                count = 100 if self.requested_limit == "100" else 10
+                rows = ''.join(f'<tr><td>{600000+i}</td><td>示例股票</td><td>0.01%</td><td>1</td><td>2</td></tr>' for i in range(count))
+                return '<div class="box"><h4>2026年2季度股票投资明细</h4><table><thead><tr><th>股票代码</th><th>股票名称</th><th>占净值比例</th><th>持股数（万股）</th><th>持仓市值（万元）</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+        provider = ServerFixture()
+        holdings = provider.holdings("005827", 2026)
+        self.assertEqual(provider.requested_limit, "100")
+        self.assertEqual(len(holdings["2026-06-30"]), 100)
+
     def test_report_dates_require_real_publication_and_reject_future(self):
         data = {"Data": [
             {"TITLE": "示例基金2026年第2季度报告", "PUBLISHDATEDESC": "2026-07-21", "ART_CODE": "AN202607211234567890"},
@@ -211,6 +225,36 @@ class CheckpointTests(unittest.TestCase):
         fund, errors = collect_fund({"code": "000001"}, "2026-09-29", provider=NeverRequest(), deadline=time.monotonic() - 1)
         self.assertEqual(fund["reports"], [])
         self.assertEqual(errors[0]["errorCode"], "BATCH_DEADLINE_REACHED")
+
+    def test_q2_prices_do_not_require_q1_holdings(self):
+        calls = []
+        class Prices:
+            def price_bars(self, code, market, start, end):
+                calls.append((code, start, end))
+                return {"rows": [{"date": start, "low": 1, "high": 2, "close": 1.5}]}
+        def current_only(item, *args, **kwargs):
+            return {"code": item["code"], "reports": [{"periodEnd": "2026-06-30", "narrative": None,
+                                                       "holdings": [{"market": "CN", "stockCode": "600519"}]}]}, []
+        config = {"funds": [{"code": "000001", "priceTargets": [{"stockCode": "600519", "market": "CN"}]}],
+                  "targetPeriodEnd": "2026-06-30", "baselinePeriodEnd": "2026-03-31"}
+        with patch("collect.collect_fund", current_only), patch("collect.PublicProvider", Prices):
+            result = collect(config, "2026-09-29")
+        self.assertEqual(calls, [("600519", "2026-04-01", "2026-06-30")])
+        self.assertEqual(result["coverage"]["comparable"], 0)
+        self.assertEqual(result["coverage"]["priceSymbolsFetched"], 1)
+        self.assertEqual(len(result["funds"][0]["reports"]), 1)
+
+    def test_requested_price_count_can_exceed_old_300_cap(self):
+        class Prices:
+            def price_bars(self, code, market, start, end):
+                return {"rows": [{"date": start, "low": 1, "high": 2, "close": 1.5}]}
+        def portfolio(item, *args, **kwargs):
+            return {"code": item["code"], "reports": [{"periodEnd": "2026-06-30", "narrative": None,
+                                                       "holdings": [{"market": "CN", "stockCode": str(600000 + n)} for n in range(350)]}]}, []
+        config = {"funds": [{"code": "000001"}], "targetPeriodEnd": "2026-06-30", "maxPriceSymbols": 350}
+        with patch("collect.collect_fund", portfolio), patch("collect.PublicProvider", Prices):
+            result = collect(config, "2026-09-29")
+        self.assertEqual(result["coverage"]["priceSymbolsFetched"], 350)
 
 
 if __name__ == "__main__":

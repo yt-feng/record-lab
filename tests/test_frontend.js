@@ -152,3 +152,68 @@ test('failed reload preserves the snapshot and imported provenance labels', () =
   assert.match(ui.observationState({ ...data, sourceMode: 'cached' }, 'remote', false).badge, /保留的有效数据/);
   assert.equal(ui.observationState(null, 'remote', true).badge, '尚无可用数据');
 });
+
+function fixtureCatalog(complete = true) {
+  return { schemaVersion: 1, asOf: '2026-09-29', retrievedAt: '2026-09-29T01:00:00Z',
+    companies: [{ code: 'c1', name: '甲公司全称', fundCount: 2 }, { code: 'c2', name: '乙公司', fundCount: null }],
+    funds: [{ code: '000001', name: '甲基金', companyCode: 'c1', companyName: '甲公司全称', type: '混合' },
+      { code: '000002', name: '甲基金另一份额', companyCode: 'c1', companyName: '甲公司全称', type: '混合' }],
+    coverage: { companyCount: 2, fundCount: 2, complete, status: complete ? 'complete' : 'bootstrap' } };
+}
+
+test('catalog preserves unprocessed companies and unknown directory totals', () => {
+  const catalog = ui.validateCatalog(fixtureCatalog(false));
+  const companies = ui.companyCoverage(catalog, null);
+  assert.equal(companies.length, 2);
+  assert.equal(companies[1].totalFunds, null);
+  assert.equal(companies[0].processedFunds, null);
+  assert.equal(ui.companyCoverage(catalog, null, '乙公司')[0].code, 'c2');
+  const overview = ui.coverageOverview(catalog, null, fixtureData());
+  assert.equal(overview.totalFunds, null);
+  assert.equal(overview.totalCompanies, null);
+  assert.equal(overview.percent, null);
+  const partial = fixtureCatalog(); partial.coverage = { ...partial.coverage, status: 'partial-directory', directoryComplete: false };
+  partial.funds.push({ code: '999999', name: '归属待核验基金', companyCode: null, companyName: null });
+  assert.equal(ui.validateCatalog(partial), partial);
+  assert.equal(ui.catalogComplete(partial), false);
+});
+
+test('company-code mapping supports differing company labels without falling back to another company', () => {
+  assert.equal(ui.filterFunds([fixtureFund()], { company: 'code:c1' }, fixtureCatalog()).length, 1);
+  assert.equal(ui.filterFunds([fixtureFund()], { company: 'code:c2' }, fixtureCatalog()).length, 0);
+  assert.equal(ui.filterFunds([fixtureFund()], { query: '甲公司全称' }, fixtureCatalog()).length, 1);
+});
+
+test('manifest accepts multiple pages per company and sorts pages without loading others', () => {
+  const manifest = fixtureData([]);
+  manifest.companyFiles = [
+    { companyCode: 'c1', companyName: '甲公司', path: './data/companies/c1-part2.json', partIndex: 2, partCount: 2, fundCount: 5 },
+    { companyCode: 'c2', companyName: '乙公司', path: './data/companies/c2.json', fundCount: 1 },
+    { companyCode: 'c1', companyName: '甲公司', path: './data/companies/c1-part1.json', partIndex: 1, partCount: 2, fundCount: 100 }
+  ];
+  assert.equal(ui.validateDataset(manifest), manifest);
+  assert.deepEqual(ui.companyPages(manifest, 'c1').map(page => page.partIndex), [1, 2]);
+  assert.deepEqual(ui.companyPages(manifest, 'pending-company'), []);
+  for (const path of ['https://example.org/data.json', '//example.org/data.json', './data/companies/../latest.json', './data/companies/c1.json?x=1', './data/companies/%2e%2e.json', './data/other.json']) assert.equal(ui.safeCompanyPath(path), null);
+  assert.equal(ui.safeCompanyPath('./data/companies/c1-part2.json'), './data/companies/c1-part2.json');
+  manifest.companyFiles[0].path = '../private.json';
+  assert.throws(() => ui.validateDataset(manifest), /INVALID_DATASET/);
+});
+
+test('progress validates success counts while incomplete company directories remain unknown', () => {
+  const progress = { schemaVersion: 1, updatedAt: '2026-09-29T01:00:00Z', totalCompanies: 2, totalFunds: 2,
+    processedFunds: 1, completedCompanies: 0, pendingFunds: 1, funds: [{ code: '000001', companyCode: 'c1', status: 'complete' }, { code: '000002', companyCode: null, status: 'pending' }],
+    companies: [{ code: 'c1', name: '甲公司', totalFunds: null, processedFunds: 1, withHoldings: 1, withoutEquities: 0, failed: 0, pending: 1 }] };
+  assert.equal(ui.validateProgress(progress), progress);
+  assert.equal(ui.coverageOverview(fixtureCatalog(), progress, fixtureData()).percent, 50);
+  assert.equal(ui.companyCoverage(null, progress)[0].totalFunds, null);
+  assert.throws(() => ui.validateProgress({ ...progress, processedFunds: 3 }), /INVALID_PROGRESS/);
+});
+
+test('no-equities records require report evidence and remain available without fabricated rows', () => {
+  const fund = fixtureFund({ status: 'no-equities', rows: [], noEquitiesEvidence: { confirmed: true, sourceUrl: 'https://example.org/report.pdf', periodEnd: '2026-06-30', text: '本期末未持有股票。' } });
+  assert.equal(ui.validateDataset(fixtureData([fund])).funds[0].status, 'no-equities');
+  assert.equal(ui.filterFunds([fund], { query: '甲基金' }).length, 1);
+  assert.equal(ui.coverageOverview(fixtureCatalog(), null, fixtureData([fund])).coveredFunds, 2);
+  assert.throws(() => ui.validateDataset(fixtureData([{ ...fund, noEquitiesEvidence: { confirmed: false } }])), /INVALID_DATASET/);
+});

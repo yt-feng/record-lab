@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 import time
 
-from providers import DataError, PublicProvider
+from providers import DataError, PublicProvider, HOLDINGS_TOPLINE
 
 
 def safe_error(code, stage, error):
@@ -101,8 +101,8 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         report["fundCode"] = code
         report["holdingsSourceUrl"] = f"https://fundf10.eastmoney.com/ccmx_{code}.html"
         report["holdingsRetrieval"] = "eastmoney-fundarchives-year-table"
-        report["holdingsRequestedLimit"] = 10000
-        report["holdingsPossiblyTruncated"] = len(snapshots[period]) >= 10000
+        report["holdingsRequestedLimit"] = HOLDINGS_TOPLINE
+        report["holdingsPossiblyTruncated"] = len(snapshots[period]) >= HOLDINGS_TOPLINE
         if selected.get("sourceFundCode"):
             report["sourceFundCode"] = selected["sourceFundCode"]
         report.update({"coverage": "top10" if len(snapshots[period]) <= 10 else "unknown",
@@ -184,17 +184,25 @@ def collect(config, as_of, checkpoint=None):
     fund_price_keys = []
     for fund in funds:
         reports = sorted(fund["reports"], key=lambda r: r["periodEnd"], reverse=True)
-        if len(reports) < 2:
+        target_period = config.get("targetPeriodEnd")
+        current = next((r for r in reports if not target_period or r["periodEnd"] == target_period), None)
+        if current is None:
             continue
-        start = (dt.date.fromisoformat(reports[1]["periodEnd"]) + dt.timedelta(days=1)).isoformat()
-        end = reports[0]["periodEnd"]
+        baseline_period = config.get("baselinePeriodEnd")
+        baseline = next((r for r in reports if r["periodEnd"] < current["periodEnd"] and (not baseline_period or r["periodEnd"] == baseline_period)), None)
+        end = current["periodEnd"]
+        if target_period or baseline is None:
+            date = dt.date.fromisoformat(end)
+            start = dt.date(date.year, ((date.month - 1) // 3) * 3 + 1, 1).isoformat()
+        else:
+            start = (dt.date.fromisoformat(baseline["periodEnd"]) + dt.timedelta(days=1)).isoformat()
         input_item = item_by_code[fund["code"]]
         targets = None
         if "priceTargets" in input_item:
             targets = {(str(x.get("market")), str(x.get("stockCode"))) for x in input_item["priceTargets"] if isinstance(x, dict)}
         # Current holdings lead; prior-only disclosures follow. Explicit enrichment
         # targets must still occur in one of the two verified report tables.
-        candidates = reports[0]["holdings"] + reports[1]["holdings"]
+        candidates = current["holdings"] + (baseline["holdings"] if baseline else [])
         fund_keys = []
         for holding in candidates:
             if targets is not None and (holding["market"], holding["stockCode"]) not in targets:
@@ -217,7 +225,7 @@ def collect(config, as_of, checkpoint=None):
             if rank < len(keys) and keys[rank] not in seen:
                 seen.add(keys[rank])
                 price_order.append(keys[rank])
-    selected_prices = [(key, requested_prices[key]) for key in price_order[:min(300, max(0, int(config.get("maxPriceSymbols", 150))))]]
+    selected_prices = [(key, requested_prices[key]) for key in price_order[:min(2000, max(0, int(config.get("maxPriceSymbols", 150))))]]
     price_deadline = min(deadline, time.monotonic() + min(900, max(1, float(config.get("maxPriceSeconds", 600)))))
     snapshot("prices")
     def price(item):

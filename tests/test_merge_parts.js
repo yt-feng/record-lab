@@ -7,7 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { buildSnapshot } = require('../scripts/build-data');
-const { mergeSnapshots } = require('../scripts/merge-parts');
+const { mergeSnapshots, splitCompanyFunds } = require('../scripts/merge-parts');
 
 const now = '2026-09-29T12:00:00Z';
 const config = { targetPeriodEnd: '2026-06-30', baselinePeriodEnd: '2026-03-31' };
@@ -41,6 +41,45 @@ test('publishes company envelopes and a small manifest with catalog coverage', (
   assert.deepEqual(result.manifest.companyFiles[0].managers, ['合成经理']);
   assert.equal(result.companySnapshots.co1.funds[0].company, '测试公司甲');
   assert.equal(result.manifest.companyCoverage[0].status, 'partial');
+});
+
+test('company pages have bounded fund counts, stable ordering, and company totals', () => {
+  const codes = Array.from({ length: 101 }, (_, index) => String(index + 100000));
+  const directory = { companies: [{ code: 'co1', name: '合成公司', fundCount: codes.length }],
+    funds: codes.map(code => ({ code, companyCode: 'co1', companyName: '合成公司' })) };
+  const result = merge({ catalog: directory, snapshots: [snapshot(codes)] });
+  assert.equal(result.manifest.companyFiles.length, 2);
+  assert.deepEqual(result.manifest.companyFiles.map(item => item.fundCount), [100, 1]);
+  assert.equal(result.manifest.companyFiles[0].path, './data/companies/co1-part1.json');
+  assert.equal(result.manifest.companyFiles[1].partIndex, 2);
+  assert.equal(result.manifest.companyFiles[1].partCount, 2);
+  assert.equal(result.manifest.companyFiles[1].companyFundCount, 101);
+  assert.equal(result.manifest.coverage.companyCount, 1);
+  assert.ok(Object.values(result.companySnapshots).every(item => Buffer.byteLength(JSON.stringify(item)) < 8_000_000));
+  const replay = merge({ catalog: directory, previousManifest: result.manifest, previousCompanies: result.companySnapshots });
+  assert.equal(replay.changed, false);
+});
+
+test('byte bounds split before the fund limit and never emit an oversized singleton', () => {
+  const funds = [{ code: '000001', text: '中'.repeat(1000) }, { code: '000002', text: '中'.repeat(1000) }];
+  const envelope = page => ({ funds: page });
+  assert.deepEqual(splitCompanyFunds(funds, envelope, { maxBytes: 5000, maxFunds: 100 }).map(page => page.length), [1, 1]);
+  assert.throws(() => splitCompanyFunds(funds, envelope, { maxBytes: 2000, maxFunds: 100 }), /COMPANY_FUND_TOO_LARGE/);
+});
+
+test('rejected shrinking reports cannot replace the final price coverage receipt', () => {
+  const oldReport = report('000001');
+  oldReport.holdings.push({ ...oldReport.holdings[0], stockCode: '600002' });
+  const first = merge({ snapshots: [snapshot(['000001'], { overrides: { reports: [oldReport] },
+    retrievedAt: '2026-09-29T09:00:00Z' })] });
+  const prices = { 'CN:600001': { currency: 'CNY', priceBasis: 'unadjusted', sourceUrl: 'https://example.org/prices',
+    rows: [{ date: '2026-04-10', low: 8, high: 12 }] } };
+  const second = merge({ snapshots: [snapshot(['000001'], { barsByStock: prices })],
+    previousCompanies: first.companySnapshots, previousManifest: first.manifest });
+  assert.equal(second.changed, false);
+  assert.equal(second.receipt.funds[0].priceCoverage.holdingCount, 2);
+  assert.equal(second.receipt.funds[0].priceCoverage.priceAvailable, 0);
+  assert.equal(second.receipt.funds[0].reportEvidence.observedAt, '2026-09-29T09:00:00Z');
 });
 
 test('missing or failed parts preserve old observations and do not refresh the manifest timestamp', () => {
@@ -173,13 +212,26 @@ test('CLI merges snapshot files atomically and leaves bytes unchanged on a later
     const catalogFile = path.join(data, 'catalog.json');
     const configFile = path.join(temporary, 'config.json');
     fs.writeFileSync(catalogFile, JSON.stringify(catalog));
-    fs.writeFileSync(configFile, JSON.stringify(config));
+    fs.writeFileSync(configFile, JSON.stringify({ ...config, funds: [{ code: '000001', companyCode: 'co1' }] }));
     const args = [path.join(__dirname, '..', 'scripts', 'merge-parts.js'), '--parts', parts, '--data', data,
       '--catalog', catalogFile, '--config', configFile];
     const first = spawnSync(process.execPath, args, { encoding: 'utf8' });
     assert.equal(first.status, 0);
     const before = fs.readFileSync(path.join(data, 'latest.json'), 'utf8');
     const companyBefore = fs.readFileSync(path.join(data, 'companies', 'co1.json'), 'utf8');
+    const receipt = JSON.parse(fs.readFileSync(path.join(parts, 'merge-receipt.json'), 'utf8'));
+    assert.equal(receipt.funds[0].priceCoverage.holdingCount, 1);
+    const traversal = path.join(__dirname, '..', 'scripts', 'traversal.py');
+    const status = spawnSync('python3', [traversal, 'status', '--config', configFile,
+      '--snapshot', path.join(parts, 'part0', 'snapshot.json'), '--output', path.join(parts, 'part0', 'status.json')],
+    { encoding: 'utf8', env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } });
+    assert.equal(status.status, 0);
+    const progressFile = path.join(data, 'progress.json');
+    const progress = spawnSync('python3', [traversal, 'merge', '--config', configFile, '--parts', parts,
+      '--catalog', catalogFile, '--progress', progressFile],
+    { encoding: 'utf8', env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } });
+    assert.equal(progress.status, 0);
+    assert.equal(JSON.parse(fs.readFileSync(progressFile, 'utf8')).processedFunds, 1);
     fs.rmSync(path.join(parts, 'part0', 'snapshot.json'));
     const second = spawnSync(process.execPath, args, { encoding: 'utf8' });
     assert.equal(second.status, 0);
