@@ -44,5 +44,6 @@
   "maxReportsPerFund": 2,
   "maxPriceSymbols": 150,
   "targetPeriodEnd": "2026-06-30",
-  "baselinePeriodEnd": "2026-03-31"
+  "baselinePeriodEnd": "2026-03-31",
+  "asOf": "2026-09-29"
 }

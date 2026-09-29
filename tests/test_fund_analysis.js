@@ -116,6 +116,10 @@ test('position uses same-report NAV and disclosed value takes precedence with di
     assert.equal(estimatePosition(holding({ marketValueYuan: null }), report({ navYuan })).valueYuan, null);
   }
   assert.equal(estimatePosition(holding({ marketValueYuan: null, weightPct: null }), report()).valueYuan, null);
+  const rounded = estimatePosition(holding({ marketValueYuan: 50, weightPct: 0 }), report());
+  assert.equal(rounded.estimatedYuan, 0);
+  assert.equal(rounded.valueYuan, 50);
+  assert.match(rounded.estimateNote, /四舍五入/);
 });
 
 test('unadjusted prices are bounded inclusively and missing days stay unverified', () => {

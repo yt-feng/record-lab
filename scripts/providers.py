@@ -10,6 +10,7 @@ import math
 import re
 import time
 from urllib.parse import urlencode, urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -19,6 +20,106 @@ class DataError(Exception):
     def __init__(self, code: str):
         super().__init__(code)
         self.code = code
+
+
+def stock_identifiers(code, market):
+    """Venue-specific candidates; every provider must confirm the returned identity."""
+    code = str(code)
+    if market == "HK" and re.fullmatch(r"\d{4,5}", code):
+        code = code.zfill(5)
+        return code, "116." + code, f"{int(code):04d}.HK", "hk" + code, "HKD", "HK"
+    if market not in ("CN", "BJ") or not re.fullmatch(r"\d{6}", code):
+        raise DataError("UNSUPPORTED_MARKET")
+    if code.startswith("6"):
+        return code, "1." + code, code + ".SS", "sh" + code, "CNY", "SH"
+    if code.startswith(("0", "3")):
+        return code, "0." + code, code + ".SZ", "sz" + code, "CNY", "SZ"
+    if market == "BJ" or code.startswith(("4", "8", "92")):
+        # Candidate only: Yahoo must explicitly confirm Beijing exchange metadata.
+        return code, "0." + code, code + ".BJ", "bj" + code, "CNY", "BJ"
+    raise DataError("UNSUPPORTED_MARKET")
+
+
+def checked_price_rows(values, start, end):
+    rows = {}
+    for value in values:
+        date = iso_date(value.get("date"))
+        low, high, close = (number(value.get(key)) for key in ("low", "high", "close"))
+        if date and start <= date <= end and all(x is not None and x > 0 for x in (low, high, close)) and low <= close <= high:
+            rows[date] = {"date": date, "low": low, "high": high, "close": close}
+    if not rows:
+        raise DataError("NO_PRICE_DATA")
+    return [rows[date] for date in sorted(rows)]
+
+
+def parse_eastmoney_prices(payload, code, start, end):
+    data = payload.get("data")
+    if not isinstance(data, dict) or str(data.get("code", "")) != code:
+        raise DataError("PRICE_IDENTITY_MISMATCH")
+    values = data.get("klines")
+    if not isinstance(values, list):
+        raise DataError("INVALID_PRICE_FORMAT")
+    rows = []
+    for value in values:
+        cells = value.split(",")
+        if len(cells) >= 5:
+            rows.append({"date": cells[0], "close": cells[2], "high": cells[3], "low": cells[4]})
+    return checked_price_rows(rows, start, end)
+
+
+def parse_yahoo_prices(payload, symbol, currency, venue, start, end):
+    result = payload.get("chart", {}).get("result")
+    if not isinstance(result, list) or len(result) != 1:
+        raise DataError("INVALID_PRICE_FORMAT")
+    result = result[0]
+    meta = result.get("meta", {})
+    if meta.get("symbol") != symbol:
+        raise DataError("PRICE_IDENTITY_MISMATCH")
+    if meta.get("currency") != currency:
+        raise DataError("PRICE_CURRENCY_MISMATCH")
+    expected_exchanges = {"SH": {"SHH"}, "SZ": {"SHZ"}, "HK": {"HKG"}}
+    if venue in expected_exchanges and meta.get("exchangeName") not in expected_exchanges[venue]:
+        raise DataError("PRICE_EXCHANGE_MISMATCH")
+    if venue == "BJ" and "beijing" not in str(meta.get("fullExchangeName", "")).lower():
+        raise DataError("PRICE_EXCHANGE_MISMATCH")
+    # Yahoo's quote arrays are not dividend-adjusted, but past quotes can be
+    # split-adjusted. Request split events through retrieval day and decline this
+    # source when any are present, leaving raw Tencent/Eastmoney as alternatives.
+    if result.get("events", {}).get("splits"):
+        raise DataError("PRICE_CORPORATE_ACTION_UNRESOLVED")
+    indicators = result.get("indicators", {})
+    quote = indicators.get("quote")
+    timestamps = result.get("timestamp")
+    if not isinstance(quote, list) or len(quote) != 1 or not isinstance(timestamps, list):
+        raise DataError("INVALID_PRICE_FORMAT")
+    quote = quote[0]
+    if any(not isinstance(quote.get(k), list) or len(quote[k]) != len(timestamps) for k in ("low", "high", "close")):
+        raise DataError("INVALID_PRICE_FORMAT")
+    timezone = ZoneInfo("Asia/Hong_Kong" if venue == "HK" else "Asia/Shanghai")
+    rows = []
+    for index, timestamp in enumerate(timestamps):
+        if not isinstance(timestamp, (int, float)):
+            continue
+        date = dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc).astimezone(timezone).date().isoformat()
+        rows.append({"date": date, "low": quote["low"][index], "high": quote["high"][index], "close": quote["close"][index]})
+    # Never read indicators.adjclose or apply an automatic adjustment.
+    return checked_price_rows(rows, start, end)
+
+
+def parse_tencent_prices(payload, symbol, code, start, end):
+    data = payload.get("data", {}).get(symbol)
+    if not isinstance(data, dict):
+        raise DataError("PRICE_IDENTITY_MISMATCH")
+    quote = data.get("qt", {}).get(symbol)
+    if not isinstance(quote, list) or len(quote) < 3 or str(quote[2]).zfill(len(code)) != code:
+        raise DataError("PRICE_IDENTITY_MISMATCH")
+    values = data.get("day")
+    if not isinstance(values, list):
+        if "qfqday" in data or "hfqday" in data:
+            raise DataError("ADJUSTED_PRICE_REJECTED")
+        raise DataError("INVALID_PRICE_FORMAT")
+    rows = [{"date": row[0], "close": row[2], "high": row[3], "low": row[4]} for row in values if isinstance(row, list) and len(row) >= 5]
+    return checked_price_rows(rows, start, end)
 
 
 def number(value):
@@ -131,7 +232,8 @@ def parse_holdings_html(text):
                              "currency": "HKD" if market == "HK" else "CNY", "shares": shares * shares_factor if shares is not None else None,
                              "weightPct": weight, "marketValueYuan": value * value_factor if value is not None else None})
         if holdings:
-            # Topline=100 may truncate an interim/annual list, so it never proves full coverage.
+            # Even a large requested topline does not prove the upstream omitted
+            # nothing, so an interim/annual table never automatically means full.
             result[period] = holdings
     if not result:
         raise DataError("NO_HOLDINGS")
@@ -282,14 +384,17 @@ class PublicProvider:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
 
-    def get(self, url, *, params=None, referer=None, binary=False):
+    def get(self, url, *, params=None, referer=None, binary=False, timeout_seconds=None, attempts_override=None):
         if urlparse(url).scheme != "https":
             raise DataError("INVALID_URL")
         headers = {"Referer": referer, "X-Requested-With": "XMLHttpRequest"} if referer else {}
-        for attempt in range(self.attempts):
+        request_timeout = max(0.5, min(float(timeout_seconds), 30)) if timeout_seconds is not None else self.timeout
+        attempts = min(self.attempts, max(1, attempts_override)) if attempts_override is not None else self.attempts
+        connect_timeout = min(3, request_timeout) if timeout_seconds is not None else 8
+        for attempt in range(attempts):
             try:
                 started = time.monotonic()
-                response = self.session.get(url, params=params, headers=headers, timeout=(8, self.timeout), stream=True)
+                response = self.session.get(url, params=params, headers=headers, timeout=(connect_timeout, request_timeout), stream=True)
                 if response.status_code in (403, 404):
                     raise DataError("HTTP_REJECTED")
                 response.raise_for_status()
@@ -299,7 +404,7 @@ class PublicProvider:
                         size += len(chunk)
                         if size > 16 * 1024 * 1024:
                             raise DataError("RESPONSE_TOO_LARGE")
-                        if time.monotonic() - started > self.timeout + 8:
+                        if time.monotonic() - started > request_timeout + connect_timeout:
                             raise DataError("TIMEOUT")
                         chunks.append(chunk)
                 finally:
@@ -319,7 +424,7 @@ class PublicProvider:
                 error = "HTTP_ERROR"
             except requests.exceptions.RequestException:
                 error = "NETWORK_ERROR"
-            if attempt + 1 < self.attempts:
+            if attempt + 1 < attempts:
                 time.sleep(0.4 * (attempt + 1))
         raise DataError(error)
 
@@ -328,7 +433,7 @@ class PublicProvider:
 
     def holdings(self, code, year):
         text = self.get("https://fundf10.eastmoney.com/FundArchivesDatas.aspx",
-                        params={"type": "jjcc", "code": code, "topline": "100", "year": str(year), "month": "", "rt": str(time.time())},
+                        params={"type": "jjcc", "code": code, "topline": "10000", "year": str(year), "month": "", "rt": str(time.time())},
                         referer=f"https://fundf10.eastmoney.com/ccmx_{code}.html")
         return parse_holdings_html(text)
 
@@ -358,32 +463,43 @@ class PublicProvider:
         return result
 
     def price_bars(self, code, market, start, end):
-        if market == "HK":
-            secid = "116." + code.zfill(5)
-        elif code.startswith(("6", "9")):
-            secid = "1." + code
-        elif code.startswith(("0", "3")):
-            secid = "0." + code
-        else:
-            raise DataError("UNSUPPORTED_MARKET")
+        if iso_date(start) != start or iso_date(end) != end or start > end:
+            raise DataError("INVALID_PRICE_RANGE")
+        code, secid, yahoo_symbol, tencent_symbol, currency, venue = stock_identifiers(code, market)
         params = {"secid": secid, "klt": 101, "fqt": 0, "beg": start.replace("-", ""), "end": end.replace("-", ""),
                   "fields1": "f1,f2,f3,f4,f5,f6", "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"}
-        base = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-        try:
-            payload = json.loads(self.get(base, params=params))
-            values = payload["data"]["klines"]
-        except (ValueError, TypeError, KeyError):
-            raise DataError("INVALID_PRICE_FORMAT") from None
-        rows = []
-        for value in values:
-            cells = value.split(",")
-            if len(cells) < 5:
-                continue
-            date = iso_date(cells[0])
-            close, high, low = map(number, (cells[2], cells[3], cells[4]))
-            if date and start <= date <= end and all(v is not None and v > 0 for v in (close, high, low)) and low <= close <= high:
-                rows.append({"date": date, "low": low, "high": high, "close": close})
-        if not rows:
-            raise DataError("NO_PRICE_DATA")
-        return {"currency": "HKD" if market == "HK" else "CNY", "priceBasis": "unadjusted", "market": market, "stockCode": code,
-                "sourceUrl": base + "?" + urlencode(params), "rows": rows}
+        start_time = dt.datetime.combine(dt.date.fromisoformat(start), dt.time.min, tzinfo=dt.timezone.utc)
+        retrieval_day = dt.datetime.now(dt.timezone.utc).date()
+        events_end = max(dt.date.fromisoformat(end), retrieval_day) + dt.timedelta(days=1)
+        yahoo_params = {"period1": int(start_time.timestamp()),
+                        "period2": int(dt.datetime.combine(events_end, dt.time.min, tzinfo=dt.timezone.utc).timestamp()),
+                        "interval": "1d", "events": "splits", "includeAdjustedClose": "false"}
+        sources = [
+            ("eastmoney", "https://push2his.eastmoney.com/api/qt/stock/kline/get", params,
+             lambda data: parse_eastmoney_prices(data, code, start, end)),
+            ("yahoo", "https://query1.finance.yahoo.com/v8/finance/chart/" + yahoo_symbol, yahoo_params,
+             lambda data: parse_yahoo_prices(data, yahoo_symbol, currency, venue, start, end)),
+            ("tencent", "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+             {"param": f"{tencent_symbol},day,{start},{end},1000,"},
+             lambda data: parse_tencent_prices(data, tencent_symbol, code, start, end)),
+        ]
+        deadline = time.monotonic() + 24
+        failures = []
+        for provider_name, base, query, parse in sources:
+            remaining = deadline - time.monotonic()
+            if remaining <= 1:
+                failures.append({"provider": provider_name, "errorCode": "TIMEOUT"})
+                break
+            try:
+                payload = json.loads(self.get(base, params=query, timeout_seconds=min(4, remaining / 2), attempts_override=1))
+                rows = parse(payload)
+                return {"currency": currency, "priceBasis": "unadjusted", "market": market, "stockCode": code,
+                        "provider": provider_name, "sourceUrl": base + "?" + urlencode(query), "rows": rows,
+                        "providerErrors": failures}
+            except DataError as error:
+                failures.append({"provider": provider_name, "errorCode": error.code})
+            except (ValueError, TypeError, KeyError, IndexError, OverflowError, AttributeError):
+                failures.append({"provider": provider_name, "errorCode": "INVALID_PRICE_FORMAT"})
+        error = DataError("PRICE_SOURCES_UNAVAILABLE")
+        error.provider_errors = failures
+        raise error

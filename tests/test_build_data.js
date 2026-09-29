@@ -142,6 +142,17 @@ test('unknown error messages and raw metadata never enter published errors', () 
   assert.equal(new SafeBuildError('unknown').message, 'BUILD_FAILED');
 });
 
+test('known collector transport and target-report errors retain their safe original categories', () => {
+  const known = ['TIMEOUT', 'NETWORK_ERROR', 'HTTP_ERROR', 'TARGET_REPORT_UNAVAILABLE', 'BATCH_REQUIRES_ACTIONS'];
+  const result = build(raw(undefined, { errors: known.map(errorCode => ({ code: '000001',
+    stage: errorCode === 'TARGET_REPORT_UNAVAILABLE' ? 'target-report' : 'no-equities-report', errorCode,
+    message: 'unpublished diagnostic body' })) }));
+  assert.deepEqual(result.errors.map(issue => issue.errorCode), known);
+  assert.equal(result.errors[3].stage, 'target-report');
+  assert.equal(result.errors[0].stage, 'no-equities-report');
+  assert.equal(JSON.stringify(result.errors).includes('unpublished diagnostic body'), false);
+});
+
 test('builder retains report and current-manager attribution sources', () => {
   const item = fund('000001', { metadataSourceUrl: 'https://example.org/profile', managersAsOf: '2026-09-29',
     managerScope: 'current-profile', managers: [{ name: '测试经理' }], reports: [report({

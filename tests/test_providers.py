@@ -1,12 +1,17 @@
 """Synthetic parser fixtures; never market-data seeds."""
 import json
+import datetime as dt
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from providers import DataError, js_literal, parse_announcements, parse_holdings_html, parse_pdf_pages, report_period
-from collect import collect_fund
+from providers import (DataError, PublicProvider, js_literal, parse_announcements, parse_holdings_html,
+                       parse_pdf_pages, parse_no_equities, report_period, parse_eastmoney_prices,
+                       parse_yahoo_prices, parse_tencent_prices, stock_identifiers)
+from collect import collect_fund, collect
 
 
 class ParserTests(unittest.TestCase):
@@ -75,6 +80,14 @@ class ParserTests(unittest.TestCase):
         data = {"Data": [{"FCODE": "000002", "TITLE": "示例基金2026年第2季度报告", "PUBLISHDATEDESC": "2026-07-21", "ART_CODE": "AN202607211234567890"}]}
         self.assertEqual(parse_announcements(data, "2026-09-29", "000001"), [])
 
+    def test_no_equities_requires_whole_stock_statement(self):
+        report = {"sourceUrl": "https://example.org/report.pdf", "periodEnd": "2026-06-30", "publishedAt": "2026-07-21", "kind": "quarterly", "title": "示例季度报告"}
+        self.assertIsNone(parse_no_equities(["本基金本报告期末未持有流通受限股票。本基金本报告期末未投资股票期权。"], report))
+        evidence = parse_no_equities(["目录", "本基金本报告期末未持有股票。"], report)
+        self.assertTrue(evidence["confirmed"])
+        self.assertEqual(evidence["page"], 2)
+        self.assertEqual(evidence["kind"], "quarterly")
+
     def test_failed_source_preserves_missing_and_sanitized_errors(self):
         class FailedProvider:
             def overview(self, code):
@@ -85,6 +98,119 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(fund["reports"], [])
         self.assertEqual(errors[0]["errorCode"], "PARSE_FAILED")
         self.assertNotIn("secret", json.dumps(errors))
+
+    def test_fixed_target_does_not_substitute_previous_quarter(self):
+        class PreviousOnly:
+            def overview(self, code):
+                return {"name": "示例", "company": "机构", "managers": []}
+            def announcements(self, code, as_of):
+                return [{"title": "示例2026年第1季度报告", "periodEnd": "2026-03-31", "publishedAt": "2026-04-22", "kind": "quarterly", "sourceUrl": "https://example.org/report.pdf"}]
+            def holdings(self, code, year):
+                return {"2026-03-31": [{"stockCode": "600001"}]}
+        fund, errors = collect_fund({"code": "000001"}, "2026-09-29", provider=PreviousOnly(),
+                                    target_period="2026-06-30", baseline_period="2026-03-31")
+        self.assertEqual(fund["reports"], [])
+        self.assertIn("TARGET_REPORT_UNAVAILABLE", [error["errorCode"] for error in errors])
+
+
+def yahoo_fixture(symbol="600519.SS", currency="CNY", exchange="SHH"):
+    dates = ["2026-03-31", "2026-04-01", "2026-06-30", "2026-07-01"]
+    timestamps = [int(dt.datetime.fromisoformat(date).replace(tzinfo=dt.timezone.utc).timestamp()) for date in dates]
+    return {"chart": {"result": [{"meta": {"symbol": symbol, "currency": currency, "exchangeName": exchange},
+                                  "timestamp": timestamps, "indicators": {"quote": [{"low": [9]*4, "high": [12]*4, "close": [10]*4}],
+                                                                          "adjclose": [{"adjclose": [1]*4}]}}]}}
+
+
+class PriceTests(unittest.TestCase):
+    def test_yahoo_raw_quote_ignores_adjusted_and_out_of_window_rows(self):
+        rows = parse_yahoo_prices(yahoo_fixture(), "600519.SS", "CNY", "SH", "2026-04-01", "2026-06-30")
+        self.assertEqual([row["date"] for row in rows], ["2026-04-01", "2026-06-30"])
+        self.assertEqual(rows[0]["close"], 10)
+
+    def test_yahoo_rejects_wrong_identity_currency_exchange_and_splits(self):
+        for fixture in [yahoo_fixture(symbol="000001.SZ"), yahoo_fixture(currency="USD"), yahoo_fixture(exchange="NMS")]:
+            with self.assertRaises(DataError):
+                parse_yahoo_prices(fixture, "600519.SS", "CNY", "SH", "2026-04-01", "2026-06-30")
+        fixture = yahoo_fixture()
+        fixture["chart"]["result"][0]["events"] = {"splits": {"1": {"numerator": 2, "denominator": 1}}}
+        with self.assertRaises(DataError) as error:
+            parse_yahoo_prices(fixture, "600519.SS", "CNY", "SH", "2026-04-01", "2026-06-30")
+        self.assertEqual(error.exception.code, "PRICE_CORPORATE_ACTION_UNRESOLVED")
+
+    def test_eastmoney_rejects_cross_security_payload(self):
+        with self.assertRaises(DataError):
+            parse_eastmoney_prices({"data": {"code": "600000", "klines": ["2026-04-01,10,10,12,9"]}}, "600519", "2026-04-01", "2026-06-30")
+
+    def test_tencent_only_raw_day_and_verified_security(self):
+        raw = {"data": {"hk00700": {"qt": {"hk00700": ["100", "示例", "00700"]}, "day": [["2026-04-01", "10", "11", "12", "9"]], "qfqday": [["2026-04-01", "1", "1", "2", "0.5"]]}}}
+        rows = parse_tencent_prices(raw, "hk00700", "00700", "2026-04-01", "2026-06-30")
+        self.assertEqual(rows[0]["close"], 11)
+        del raw["data"]["hk00700"]["day"]
+        with self.assertRaises(DataError) as error:
+            parse_tencent_prices(raw, "hk00700", "00700", "2026-04-01", "2026-06-30")
+        self.assertEqual(error.exception.code, "ADJUSTED_PRICE_REJECTED")
+        self.assertEqual(stock_identifiers("00700", "HK")[2], "0700.HK")
+
+    def test_fallback_and_per_source_single_attempt(self):
+        class FixtureProvider(PublicProvider):
+            def __init__(self):
+                self.calls = []
+            def get(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                if "eastmoney" in url:
+                    raise DataError("TIMEOUT")
+                return json.dumps(yahoo_fixture())
+        provider = FixtureProvider()
+        result = provider.price_bars("600519", "CN", "2026-04-01", "2026-06-30")
+        self.assertEqual(result["provider"], "yahoo")
+        self.assertEqual(result["priceBasis"], "unadjusted")
+        self.assertEqual(result["currency"], "CNY")
+        self.assertEqual(len(provider.calls), 2)
+        self.assertTrue(all(call[1]["attempts_override"] == 1 for call in provider.calls))
+        self.assertTrue(all(call[1]["timeout_seconds"] <= 4 for call in provider.calls))
+        self.assertEqual(result["providerErrors"], [{"provider": "eastmoney", "errorCode": "TIMEOUT"}])
+
+
+class CheckpointTests(unittest.TestCase):
+    @staticmethod
+    def fake_fund(item, *args, **kwargs):
+        base = int(item["code"][-1])
+        holdings = [{"market": "CN", "stockCode": f"600{base}{rank:02d}"} for rank in range(3)]
+        return {"code": item["code"], "reports": [{"periodEnd": "2026-06-30", "holdings": holdings, "narrative": None},
+                                                  {"periodEnd": "2026-03-31", "holdings": [], "narrative": None}]}, []
+
+    def test_checkpoint_before_prices_and_round_robin_top_holdings(self):
+        calls, saved = [], []
+        class Prices:
+            def price_bars(self, code, market, start, end):
+                calls.append(code)
+                return {"rows": [{"date": start, "low": 1, "high": 2, "close": 1.5}]}
+        config = {"funds": [{"code": "000001"}, {"code": "000002"}], "maxPriceSymbols": 2}
+        with patch("collect.collect_fund", self.fake_fund), patch("collect.PublicProvider", Prices):
+            result = collect(config, "2026-09-29", checkpoint=lambda p: saved.append(json.loads(json.dumps(p))))
+        self.assertEqual(set(calls), {"600100", "600200"})
+        self.assertTrue(any(p["coverage"]["collectionStage"] == "prices" and len(p["funds"]) == 2 and not p["barsByStock"] for p in saved))
+        self.assertTrue(any(len(p["funds"]) == 1 for p in saved))
+        self.assertEqual(result["coverage"]["priceSymbolsFetched"], 2)
+
+    def test_enrichment_requests_only_missing_disclosed_targets(self):
+        calls = []
+        class Prices:
+            def price_bars(self, code, market, start, end):
+                calls.append(code)
+                return {"rows": []}
+        config = {"funds": [{"code": "000001", "priceTargets": [{"stockCode": "600102", "market": "CN"}]}]}
+        with patch("collect.collect_fund", self.fake_fund), patch("collect.PublicProvider", Prices):
+            collect(config, "2026-09-29")
+        self.assertEqual(calls, ["600102"])
+
+    def test_expired_fund_budget_does_not_start_requests(self):
+        class NeverRequest:
+            def overview(self, code):
+                raise AssertionError("must not request")
+        fund, errors = collect_fund({"code": "000001"}, "2026-09-29", provider=NeverRequest(), deadline=time.monotonic() - 1)
+        self.assertEqual(fund["reports"], [])
+        self.assertEqual(errors[0]["errorCode"], "BATCH_DEADLINE_REACHED")
 
 
 if __name__ == "__main__":

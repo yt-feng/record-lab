@@ -79,13 +79,35 @@ def scan(root, history=False):
     return count, findings
 
 
+def scan_plan(root):
+    """Plan artifacts are public too, even in an ignored staging directory."""
+    findings, count = [], 0
+    if root.is_symlink() or not root.is_dir():
+        return 0, ['invalid_plan_directory']
+    for file in root.rglob('*'):
+        if file.is_symlink() or not file.is_file() or file.parent != root:
+            findings.append('unexpected_plan_file'); continue
+        if not re.fullmatch(r'(?:batch-\d+|matrix|meta)\.json', file.name):
+            findings.append('unexpected_plan_file'); continue
+        count += 1
+        findings.extend(inspect_content(file.read_bytes()))
+    if not (root / 'matrix.json').is_file() or not (root / 'meta.json').is_file():
+        findings.append('missing_plan_metadata')
+    return count, findings
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', default='.')
     parser.add_argument('--history', action='store_true')
+    parser.add_argument('--plan-dir')
     args = parser.parse_args()
     try:
         count, findings = scan(Path(args.root).resolve(), args.history)
+        if args.plan_dir:
+            extra_count, extra_findings = scan_plan(Path(args.plan_dir))
+            count += extra_count
+            findings.extend(extra_findings)
     except Exception:
         print('publication_check_failed: scan_error')
         return 1

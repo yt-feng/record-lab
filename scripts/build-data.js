@@ -12,6 +12,9 @@ const BUILD_CODES = new Set([
   'EMPTY_HOLDINGS', 'NO_VALID_REPORTS', 'FUND_NOT_COLLECTED', 'OLDER_REPORT',
   'HOLDING_COVERAGE_REGRESSION', 'REPORT_COVERAGE_REGRESSION', 'INVALID_PRICE_SOURCE',
   'PRICE_IDENTITY_MISMATCH', 'NO_VALID_FRESH_FUNDS', 'COLLECTION_FAILED', 'BUILD_FAILED',
+  'PRICE_CURRENCY_MISMATCH', 'PRICE_EXCHANGE_MISMATCH', 'PRICE_CORPORATE_ACTION_UNRESOLVED',
+  'ADJUSTED_PRICE_REJECTED', 'INVALID_PRICE_RANGE', 'PRICE_SOURCES_UNAVAILABLE',
+  'BATCH_DEADLINE_REACHED', 'PRICE_BUDGET_REACHED',
   'INVALID_ARGUMENTS', 'INPUT_READ_FAILED', 'OUTPUT_WRITE_FAILED',
   'NO_REPORTS', 'INVALID_FORMAT', 'TRUNCATED_RESPONSE', 'NO_HOLDINGS', 'INVALID_URL',
   'HTTP_REJECTED', 'RESPONSE_TOO_LARGE', 'EMPTY_RESPONSE', 'TLS_FAILED', 'INVALID_PDF',
@@ -20,9 +23,10 @@ const BUILD_CODES = new Set([
   'INVALID_CATALOG', 'NOT_IN_CURRENT_BATCH', 'PORTFOLIO_IDENTITY_CONFLICT',
   'INVALID_NO_EQUITIES_EVIDENCE', 'CONTRADICTORY_NO_EQUITIES',
   'TARGET_REPORT_MISSING',
+  'TIMEOUT', 'NETWORK_ERROR', 'HTTP_ERROR', 'TARGET_REPORT_UNAVAILABLE', 'BATCH_REQUIRES_ACTIONS',
 ]);
 const STAGES = new Set(['metadata', 'announcements', 'holdings', 'report', 'nav', 'narrative',
-  'join', 'prices', 'build', 'collection']);
+  'join', 'prices', 'build', 'collection', 'target-report', 'no-equities-report']);
 const fundCode = value => typeof value === 'string' && /^\d{6}$/.test(value);
 const clone = value => JSON.parse(JSON.stringify(value));
 
@@ -36,7 +40,7 @@ class SafeBuildError extends Error {
 }
 
 function safeError(error, stage = 'build', code = null) {
-  const errorCode = typeof error === 'string' ? error : error && (error.code || error.errorCode);
+  const errorCode = typeof error === 'string' ? error : error && (error.errorCode || error.code);
   return { code: fundCode(code) ? code : null, stage: STAGES.has(stage) ? stage : 'build',
     errorCode: BUILD_CODES.has(errorCode) ? errorCode : 'BUILD_FAILED' };
 }
@@ -199,6 +203,7 @@ function catalogDetails(catalog) {
   const companies = Array.isArray(catalog.companies) ? catalog.companies.map(company => ({
     id: typeof company.id === 'string' ? company.id : company.companyId || company.companyCode || company.code || null,
     name: company.name || company.companyName || company.company || null,
+    directoryStatus: ['complete', 'failed', 'pending'].includes(company.directoryStatus) ? company.directoryStatus : null,
     declaredFundCount: Number.isInteger(company.fundCount) && company.fundCount >= 0 ? company.fundCount : null,
     funds: Array.isArray(company.funds) ? company.funds : [],
   })) : [];
@@ -215,7 +220,7 @@ function catalogDetails(catalog) {
     for (const item of funds) {
       const id = item.companyId || item.company;
       if (id && !companies.some(company => (company.id || company.name) === id)) {
-        companies.push({ id: item.companyId, name: item.company, declaredFundCount: null, funds: [] });
+        companies.push({ id: item.companyId, name: item.company, declaredFundCount: null, directoryStatus: null, funds: [] });
       }
     }
   }
@@ -303,11 +308,13 @@ function companyCoverageFor(catalog, funds) {
         (matches.length ? matches : [fund.code]).forEach(code => availableCodes.add(code));
       }
     }
-    const expected = company.declaredFundCount !== null ? Math.max(company.declaredFundCount, catalogCodes.size) : catalogCodes.size;
-    const missing = Math.max(0, expected - availableCodes.size);
+    const expected = company.declaredFundCount !== null ? Math.max(company.declaredFundCount, catalogCodes.size)
+      : ['pending', 'failed'].includes(company.directoryStatus) ? null : catalogCodes.size;
+    const missing = expected === null ? null : Math.max(0, expected - availableCodes.size);
     return { id: company.id, name: company.name, catalogFundCount: expected,
+      directoryStatus: company.directoryStatus, mappedFundCount: catalogCodes.size,
       availableFundCount: availableCodes.size, availablePortfolioCount, missingFundCount: missing,
-      status: !availableCodes.size ? 'unavailable' : missing ? 'partial' : 'available' };
+      status: expected === null ? 'directory-incomplete' : !availableCodes.size ? 'unavailable' : missing ? 'partial' : 'available' };
   });
 }
 
@@ -372,6 +379,9 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
       if (item.noEquitiesEvidence === undefined || item.noEquitiesEvidence === null) continue;
       if (!isValidNoEq(item.noEquitiesEvidence, { asOf: raw.asOf, code })) {
         addError('INVALID_NO_EQUITIES_EVIDENCE', code); continue;
+      }
+      if ([...reports.values()].some(report => report.periodEnd === item.noEquitiesEvidence.periodEnd && report.holdings.length)) {
+        addError('CONTRADICTORY_NO_EQUITIES', code); continue;
       }
       const normalized = cleanReport(noEquitiesReport(item.noEquitiesEvidence, code), code, raw.asOf, addError);
       if (normalized) reports.set(reportKey(normalized), normalized);
@@ -548,4 +558,4 @@ function main(argv = process.argv.slice(2)) {
 
 if (require.main === module) process.exitCode = main();
 
-module.exports = { buildSnapshot, isValidNoEq, main, publicUrl, safeError, SafeBuildError };
+module.exports = { buildSnapshot, catalogDetails, deduplicatePortfolios, isValidNoEq, main, publicUrl, safeError, SafeBuildError };
