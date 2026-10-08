@@ -45,6 +45,25 @@ class PublicationTests(unittest.TestCase):
                 original = [category for category, pattern in guard.PATTERNS.items() if pattern.search(value)]
                 self.assertEqual(guard.inspect_content(value.encode()), original)
 
+    def test_only_exact_public_github_committer_pair_is_classified_as_service(self):
+        def metadata(message=b'Public merge', author=b'Automation <automation@users.noreply.github.com>',
+                     name=b'GitHub', email=b'noreply'+b'@github.com'):
+            return b'\0'.join([message, author, name, email])+b'\n'
+        self.assertEqual(guard.inspect_commit_metadata(metadata()), [])
+        private = ('person'+'@'+'private-domain.test').encode()
+        for value in [metadata(name=b'Other'), metadata(email=b'noreply'+b'@github.com.example.test'),
+                      metadata(email=private), metadata(author=b'Person <'+private+b'>'),
+                      metadata(message=private), metadata(author=b'GitHub <noreply'+b'@github.com>'),
+                      metadata(message=b'noreply'+b'@github.com')]:
+            self.assertIn('personal_email', guard.inspect_commit_metadata(value))
+        # The public service exception is contextual; file rules do not change.
+        self.assertIn('personal_email', guard.inspect_content(b'noreply'+b'@github.com'))
+        self.assertIn('credential', guard.inspect_commit_metadata(metadata(message=('gh'+'p_'+'x'*32).encode())))
+        with mock.patch.object(guard, 'MAX_CONTENT_BYTES', 10):
+            self.assertEqual(guard.inspect_commit_metadata(metadata()), ['unsupported_content'])
+        with self.assertRaises(RuntimeError):
+            guard.inspect_commit_metadata(b'malformed')
+
     def test_public_plan_artifact_scanning(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -93,6 +112,17 @@ class HistoryPublicationTests(unittest.TestCase):
         self.commit_file('README.md', 'Public fixture', 'Message '+('sk-'+'x'*32))
         findings = guard.scan_history(self.root)
         self.assertGreaterEqual(findings.count('credential'), 2)
+
+    def test_real_github_service_committer_keeps_other_metadata_gates(self):
+        self.commit_file('README.md', 'Public fixture')
+        service = 'noreply'+'@github.com'
+        self.git('-c', 'user.name=GitHub', '-c', 'user.email='+service, 'commit', '--allow-empty',
+                 '--author', 'Automation <automation@users.noreply.github.com>', '-m', 'Public merge')
+        self.assertEqual(guard.scan_history(self.root), [])
+        self.git('-c', 'user.name=GitHub', '-c', 'user.email='+service, 'commit', '--allow-empty',
+                 '--author', 'Automation <automation@users.noreply.github.com>', '-m',
+                 'Message '+('person'+'@'+'private-domain.test'))
+        self.assertIn('personal_email', guard.scan_history(self.root))
 
     def test_identity_in_historical_author_still_fails(self):
         self.git('config', 'user.email', 'person'+'@'+'private-domain.test')
