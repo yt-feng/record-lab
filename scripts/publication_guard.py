@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager
 import re
 import subprocess
+import time
 from pathlib import Path
 
 ROOT_FILES = {'README.md', 'package.json', 'package-lock.json', 'requirements.txt', '.gitignore'}
@@ -78,8 +79,10 @@ def history_blobs(root):
                 remaining -= len(chunk)
         if process.stdout.read(1) != b'\n':
             raise RuntimeError('Invalid history blob delimiter')
+        read.bytes_read += size
         return data
 
+    read.bytes_read = 0
     try:
         yield read
         process.stdin.close()
@@ -91,15 +94,19 @@ def history_blobs(root):
         process.stdin.close(); process.stdout.close()
 
 
-def scan_history(root):
+def scan_history(root, stats=None):
     findings = []
     seen_blobs = set()
+    started = time.monotonic()
+    commit_count = entry_count = 0
     with history_blobs(root) as read_blob:
         for commit in git(root, 'rev-list', '--all').decode().splitlines():
+            commit_count += 1
             findings.extend(inspect_content(git(root, 'show', '-s', '--format=%B%n%an <%ae>%n%cn <%ce>', commit)))
             for entry in git(root, 'ls-tree', '-rz', commit).split(b'\0'):
                 if not entry:
                     continue
+                entry_count += 1
                 metadata, name = entry.split(b'\t', 1)
                 mode, kind, oid = metadata.split()
                 # Every path/mode is checked in every reachable tree, even if
@@ -110,10 +117,13 @@ def scan_history(root):
                     seen_blobs.add(oid)
                     raw = read_blob(oid)
                     findings.extend(['unsupported_content'] if raw is None else inspect_content(raw))
+    if stats is not None:
+        stats.update(commits=commit_count, tree_entries=entry_count, unique_blobs=len(seen_blobs),
+                     bytes=read_blob.bytes_read, elapsed_seconds=round(time.monotonic()-started, 3))
     return findings
 
 
-def scan(root, history=False):
+def scan(root, history=False, history_stats=None):
     findings = []
     count = 0
     for file in root.rglob('*'):
@@ -133,7 +143,7 @@ def scan(root, history=False):
             if name and not allowed_path(name):
                 findings.append('unexpected_tracked_file')
     if history:
-        findings.extend(scan_history(root))
+        findings.extend(scan_history(root, history_stats))
     return count, findings
 
 
@@ -160,8 +170,9 @@ def main():
     parser.add_argument('--history', action='store_true')
     parser.add_argument('--plan-dir')
     args = parser.parse_args()
+    history_stats = {}
     try:
-        count, findings = scan(Path(args.root).resolve(), args.history)
+        count, findings = scan(Path(args.root).resolve(), args.history, history_stats)
         if args.plan_dir:
             extra_count, extra_findings = scan_plan(Path(args.plan_dir))
             count += extra_count
@@ -169,6 +180,8 @@ def main():
     except Exception:
         print('publication_check_failed: scan_error')
         return 1
+    if args.history:
+        print('history_scan_complete: ' + ' '.join(f'{key}={value}' for key, value in history_stats.items()))
     if findings:
         print('publication_check_failed: ' + ','.join(sorted(set(findings))))
         return 1

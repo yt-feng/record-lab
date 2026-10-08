@@ -59,9 +59,13 @@ class HistoryPublicationTests(unittest.TestCase):
         self.commit_file('web/data/latest.json', content)
         for index in range(12):
             self.commit_file('README.md', 'Public change '+str(index))
+        stats = {}
         with mock.patch.object(guard, 'inspect_content', wraps=guard.inspect_content) as inspect:
-            self.assertEqual(guard.scan_history(self.root), [])
+            self.assertEqual(guard.scan_history(self.root, stats), [])
         self.assertEqual(sum(call.args[0] == content.encode() for call in inspect.call_args_list), 1)
+        self.assertEqual((stats['commits'], stats['tree_entries'], stats['unique_blobs']), (13, 25, 13))
+        self.assertEqual(stats['bytes'], len(content.encode()) + sum(len(('Public change '+str(i)).encode()) for i in range(12)))
+        self.assertGreaterEqual(stats['elapsed_seconds'], 0)
 
     def test_removed_credentials_and_commit_metadata_still_fail(self):
         token = 'gh'+'p_'+'z'*32
