@@ -25,6 +25,26 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(guard.inspect_content(b'abc\0def'), ['unsupported_content'])
         self.assertEqual(guard.inspect_content('基金报告：https://example.com/report.pdf'.encode()), [])
 
+    def test_literal_prefilters_preserve_original_regex_matches(self):
+        values = [
+            *('gh'+kind+'_'+'x'*32 for kind in 'pousr'),
+            'github_'+'pat_'+'x'*40, 'sk-'+'x'*32, 'AK'+'IA'+'X'*16,
+            *('-----BEGIN '+kind+'PRIVATE KEY-----' for kind in ('', 'RSA ', 'EC ', 'OPENSSH ')),
+            '/Us'+'ers/person/project/', 'C:'+'\\Us'+'ers\\person\\project',
+            '/ho'+'me/person/project/', '/ho'+'me/runner/project/',
+            'https://example.com?to'+'ken='+'x'*20,
+            'https://example.com?lang=en&KE'+'Y='+'x'*20,
+            'https'+':/'+'/'+'person'+':'+'x'*20+'@example.com',
+            'person'+'@'+'private-domain.test',
+            "APİ_KEY = '"+'x'*20, "api_Key = '"+'x'*20,
+            "ſecret_key = '"+'x'*20, "PASSWORD = '"+'x'*20,
+            '基金报告：https://example.com/report.pdf', 'A'*10000,
+        ]
+        for value in values:
+            with self.subTest(value=value[:20]):
+                original = [category for category, pattern in guard.PATTERNS.items() if pattern.search(value)]
+                self.assertEqual(guard.inspect_content(value.encode()), original)
+
     def test_public_plan_artifact_scanning(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

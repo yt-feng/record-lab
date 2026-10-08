@@ -19,6 +19,15 @@ PATTERNS = {
     'url_credential': re.compile(r'(?i)(?:[?&](?:token|key|secret|password|signature|authorization)=)[^&\s"<>]{8,}|https?://[^/\s:@]+:[^/\s@]+@'),
     'personal_email': re.compile(r'\b[A-Za-z0-9._%+-]+@(?!(?:users\.noreply\.github\.com|example\.(?:com|test|invalid))\b)[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'),
 }
+# These are necessary literal characters/prefixes of the original regexes,
+# not replacement detectors. In particular, keep the Unicode IGNORECASE
+# credential-assignment expression unfiltered.
+REQUIRED_LITERALS = {
+    'credential': ('ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_', 'github_pat_', 'sk-', 'AKIA', '-----BEGIN '),
+    'machine_path': ('/Users/', '\\Users\\', '/home/'),
+    'url_credential': ('?', '&', '@'),
+    'personal_email': ('@',),
+}
 
 
 def allowed_path(name):
@@ -41,7 +50,9 @@ def inspect_content(data):
         value = data.decode('utf-8')
     except UnicodeDecodeError:
         return ['unsupported_encoding']
-    return [category for category, pattern in PATTERNS.items() if pattern.search(value)]
+    return [category for category, pattern in PATTERNS.items()
+            if (category not in REQUIRED_LITERALS or any(marker in value for marker in REQUIRED_LITERALS[category]))
+            and pattern.search(value)]
 
 
 def git(root, *args):
@@ -94,10 +105,11 @@ def history_blobs(root):
         process.stdin.close(); process.stdout.close()
 
 
-def scan_history(root, stats=None):
+def scan_history(root, stats=None, progress=None):
     findings = []
     seen_blobs = set()
     started = time.monotonic()
+    last_progress = started
     commit_count = entry_count = 0
     with history_blobs(root) as read_blob:
         for commit in git(root, 'rev-list', '--all').decode().splitlines():
@@ -117,13 +129,19 @@ def scan_history(root, stats=None):
                     seen_blobs.add(oid)
                     raw = read_blob(oid)
                     findings.extend(['unsupported_content'] if raw is None else inspect_content(raw))
+                    now = time.monotonic()
+                    if progress is not None and now-last_progress >= 30:
+                        progress(f'history_scan_progress: commits={commit_count} tree_entries={entry_count} '
+                                 f'unique_blobs={len(seen_blobs)} bytes={read_blob.bytes_read} '
+                                 f'elapsed_seconds={round(now-started, 3)}', flush=True)
+                        last_progress = now
     if stats is not None:
         stats.update(commits=commit_count, tree_entries=entry_count, unique_blobs=len(seen_blobs),
                      bytes=read_blob.bytes_read, elapsed_seconds=round(time.monotonic()-started, 3))
     return findings
 
 
-def scan(root, history=False, history_stats=None):
+def scan(root, history=False, history_stats=None, history_progress=None):
     findings = []
     count = 0
     for file in root.rglob('*'):
@@ -143,7 +161,7 @@ def scan(root, history=False, history_stats=None):
             if name and not allowed_path(name):
                 findings.append('unexpected_tracked_file')
     if history:
-        findings.extend(scan_history(root, history_stats))
+        findings.extend(scan_history(root, history_stats, history_progress))
     return count, findings
 
 
@@ -172,7 +190,7 @@ def main():
     args = parser.parse_args()
     history_stats = {}
     try:
-        count, findings = scan(Path(args.root).resolve(), args.history, history_stats)
+        count, findings = scan(Path(args.root).resolve(), args.history, history_stats, print)
         if args.plan_dir:
             extra_count, extra_findings = scan_plan(Path(args.plan_dir))
             count += extra_count
