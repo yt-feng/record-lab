@@ -156,10 +156,22 @@ jobs:
       - name: Complete bounded attempt records
         run: python scripts/complete-status.py
       - name: Merge source-linked results
+        id: history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLICATION_CACHE_OUTPUT: ${{ runner.temp }}/publication-history.json
         run: |
           node scripts/merge-parts.js --parts .cache/parts --data web/data --catalog web/data/catalog.json --config config/universe.json
           python scripts/traversal.py merge --parts .cache/parts --catalog web/data/catalog.json --progress web/data/progress.json --config config/universe.json
           python scripts/publication_guard.py --root . --history
+      - name: Save verified publication history
+        if: success() && github.ref == 'refs/heads/main' && steps.history.outputs.cache_artifact_name != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.history.outputs.cache_artifact_name }}
+          path: ${{ runner.temp }}/publication-history.json
+          if-no-files-found: error
+          retention-days: 14
       - name: Persist observations and checkpoint
         run: |
           git pull --ff-only origin main
