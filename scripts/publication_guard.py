@@ -55,6 +55,27 @@ def inspect_content(data):
             and pattern.search(value)]
 
 
+def inspect_commit_metadata(data):
+    """Classify the exact public GitHub committer identity without email exceptions elsewhere."""
+    if not data.endswith(b'\n'):
+        raise RuntimeError('Invalid commit metadata response')
+    fields = data[:-1].split(b'\0')
+    if len(fields) != 4:
+        raise RuntimeError('Invalid commit metadata fields')
+    message, author, committer_name, committer_email = fields
+    original = message+b'\n'+author+b'\n'+committer_name+b' <'+committer_email+b'>\n'
+    findings = inspect_content(original)
+    # GitHub's signed merge commits use this public service address. It is not
+    # a personal identity. Keep the original bytes for every other detector and
+    # retain the email finding if any author/message/other field also matches.
+    if (committer_name == b'GitHub' and committer_email == b'noreply'+b'@github.com'
+            and 'personal_email' in findings):
+        other_fields = message+b'\n'+author+b'\n'+committer_name+b' <>\n'
+        if not PATTERNS['personal_email'].search(other_fields.decode('utf-8')):
+            findings.remove('personal_email')
+    return findings
+
+
 def git(root, *args):
     return subprocess.check_output(['git', '-C', str(root), *args], stderr=subprocess.DEVNULL)
 
@@ -114,7 +135,8 @@ def scan_history(root, stats=None, progress=None, cached_blobs=frozenset(), veri
     with history_blobs(root) as read_blob:
         for commit in git(root, 'rev-list', '--all').decode().splitlines():
             commit_count += 1
-            findings.extend(inspect_content(git(root, 'show', '-s', '--format=%B%n%an <%ae>%n%cn <%ce>', commit)))
+            findings.extend(inspect_commit_metadata(git(root, 'show', '-s',
+                '--format=%B%x00%an <%ae>%x00%cn%x00%ce', commit)))
             for entry in git(root, 'ls-tree', '-rz', commit).split(b'\0'):
                 if not entry:
                     continue
