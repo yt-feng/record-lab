@@ -105,12 +105,12 @@ def history_blobs(root):
         process.stdin.close(); process.stdout.close()
 
 
-def scan_history(root, stats=None, progress=None):
+def scan_history(root, stats=None, progress=None, cached_blobs=frozenset(), verified_blobs=None):
     findings = []
     seen_blobs = set()
     started = time.monotonic()
     last_progress = started
-    commit_count = entry_count = 0
+    commit_count = entry_count = cached_count = 0
     with history_blobs(root) as read_blob:
         for commit in git(root, 'rev-list', '--all').decode().splitlines():
             commit_count += 1
@@ -127,21 +127,28 @@ def scan_history(root, stats=None, progress=None):
                     findings.append('unexpected_history_file')
                 elif kind == b'blob' and oid not in seen_blobs:
                     seen_blobs.add(oid)
-                    raw = read_blob(oid)
-                    findings.extend(['unsupported_content'] if raw is None else inspect_content(raw))
+                    if oid in cached_blobs:
+                        cached_count += 1
+                    else:
+                        raw = read_blob(oid)
+                        findings.extend(['unsupported_content'] if raw is None else inspect_content(raw))
                     now = time.monotonic()
                     if progress is not None and now-last_progress >= 30:
                         progress(f'history_scan_progress: commits={commit_count} tree_entries={entry_count} '
-                                 f'unique_blobs={len(seen_blobs)} bytes={read_blob.bytes_read} '
+                                 f'unique_blobs={len(seen_blobs)} cached_blobs={cached_count} '
+                                 f'fresh_blobs={len(seen_blobs)-cached_count} bytes={read_blob.bytes_read} '
                                  f'elapsed_seconds={round(now-started, 3)}', flush=True)
                         last_progress = now
     if stats is not None:
         stats.update(commits=commit_count, tree_entries=entry_count, unique_blobs=len(seen_blobs),
+                     cached_blobs=cached_count, fresh_blobs=len(seen_blobs)-cached_count,
                      bytes=read_blob.bytes_read, elapsed_seconds=round(time.monotonic()-started, 3))
+    if verified_blobs is not None and not findings:
+        verified_blobs.update(seen_blobs)
     return findings
 
 
-def scan(root, history=False, history_stats=None, history_progress=None):
+def scan(root, history=False, history_stats=None, history_progress=None, cached_blobs=frozenset(), verified_blobs=None):
     findings = []
     count = 0
     for file in root.rglob('*'):
@@ -161,7 +168,7 @@ def scan(root, history=False, history_stats=None, history_progress=None):
             if name and not allowed_path(name):
                 findings.append('unexpected_tracked_file')
     if history:
-        findings.extend(scan_history(root, history_stats, history_progress))
+        findings.extend(scan_history(root, history_stats, history_progress, cached_blobs, verified_blobs))
     return count, findings
 
 
@@ -188,9 +195,15 @@ def main():
     parser.add_argument('--history', action='store_true')
     parser.add_argument('--plan-dir')
     args = parser.parse_args()
+    from publication_cache import load_verified, write_proof
+    root = Path(args.root).resolve()
     history_stats = {}
+    verified_blobs = set()
+    cached_blobs = load_verified(root) if args.history else frozenset()
+    if args.history:
+        print(f'history_cache_verified: blobs={len(cached_blobs)}')
     try:
-        count, findings = scan(Path(args.root).resolve(), args.history, history_stats, print)
+        count, findings = scan(root, args.history, history_stats, print, cached_blobs, verified_blobs)
         if args.plan_dir:
             extra_count, extra_findings = scan_plan(Path(args.plan_dir))
             count += extra_count
@@ -203,6 +216,8 @@ def main():
     if findings:
         print('publication_check_failed: ' + ','.join(sorted(set(findings))))
         return 1
+    if args.history:
+        print(f'history_cache_written: {write_proof(root, verified_blobs)}')
     print(f'publication_check_passed: files={count}')
     return 0
 

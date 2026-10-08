@@ -4,16 +4,21 @@ on:
     branches: [main]
     paths-ignore: ['web/data/**']
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
+  actions: read
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    # Allow a measured full-history cold seed when no valid proof exists.
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # Validate publishable commits, not GitHub's synthetic PR merge identity.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
@@ -24,4 +29,17 @@ jobs:
       - run: python -m pip install --disable-pip-version-check -r requirements.txt
       - run: npm test
       - run: python -m unittest discover -s tests -p 'test_*.py'
-      - run: python scripts/publication_guard.py --root . --history
+      - name: Validate publication history
+        id: history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLICATION_CACHE_OUTPUT: ${{ runner.temp }}/publication-history.json
+        run: python scripts/publication_guard.py --root . --history
+      - name: Save verified publication history
+        if: success() && github.ref == 'refs/heads/main' && steps.history.outputs.cache_artifact_name != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.history.outputs.cache_artifact_name }}
+          path: ${{ runner.temp }}/publication-history.json
+          if-no-files-found: error
+          retention-days: 14
