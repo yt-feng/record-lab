@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fail closed on unexpected public files or credential-shaped content."""
 import argparse
+from contextlib import contextmanager
 import re
 import subprocess
 from pathlib import Path
@@ -9,6 +10,7 @@ ROOT_FILES = {'README.md', 'package.json', 'package-lock.json', 'requirements.tx
 ROOT_DIRS = {'lib', 'web', 'scripts', 'tests', 'config', 'docs', '.github'}
 IGNORE_DIRS = {'.git', '.venv', 'node_modules', '__pycache__', '.pytest_cache', 'raw', '.cache', '.local'}
 EXTENSIONS = {'.md', '.json', '.js', '.css', '.html', '.py', '.txt', '.yml', '.yaml'}
+MAX_CONTENT_BYTES = 25_000_000
 PATTERNS = {
     'credential': re.compile(r'(?:gh[pousr]_[A-Za-z0-9]{25,}|github_pat_[A-Za-z0-9_]{35,}|sk-[A-Za-z0-9_-]{24,}|AKIA[A-Z0-9]{16}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)'),
     'credential_assignment': re.compile(r'''(?i)(?:api[_-]?key|access[_-]?token|secret[_-]?key|password|authorization|cookie)\s*[=:]\s*["'](?:Bearer\s+)?[A-Za-z0-9_/.+=-]{16,}'''),
@@ -32,7 +34,7 @@ def allowed_path(name):
 
 
 def inspect_content(data):
-    if len(data) > 25_000_000 or b'\0' in data:
+    if len(data) > MAX_CONTENT_BYTES or b'\0' in data:
         return ['unsupported_content']
     try:
         value = data.decode('utf-8')
@@ -43,6 +45,72 @@ def inspect_content(data):
 
 def git(root, *args):
     return subprocess.check_output(['git', '-C', str(root), *args], stderr=subprocess.DEVNULL)
+
+
+@contextmanager
+def history_blobs(root):
+    """Read immutable objects through one process, with a bounded per-blob buffer."""
+    process = subprocess.Popen(['git', '-C', str(root), 'cat-file', '--batch'],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL)
+
+    def read(oid):
+        process.stdin.write(oid+b'\n'); process.stdin.flush()
+        header = process.stdout.readline().split()
+        if len(header) != 3 or header[0] != oid or header[1] != b'blob':
+            raise RuntimeError('Invalid history blob response')
+        size = int(header[2])
+        if size < 0:
+            raise RuntimeError('Invalid history blob size')
+        if size <= MAX_CONTENT_BYTES:
+            data = process.stdout.read(size)
+            if len(data) != size:
+                raise RuntimeError('Truncated history blob')
+        else:
+            # Oversized content still fails publication; drain it without
+            # allocating an unbounded buffer or corrupting the next response.
+            data = None
+            remaining = size
+            while remaining:
+                chunk = process.stdout.read(min(remaining, 1024*1024))
+                if not chunk:
+                    raise RuntimeError('Truncated history blob')
+                remaining -= len(chunk)
+        if process.stdout.read(1) != b'\n':
+            raise RuntimeError('Invalid history blob delimiter')
+        return data
+
+    try:
+        yield read
+        process.stdin.close()
+        if process.wait(timeout=30) != 0:
+            raise RuntimeError('History blob reader failed')
+    finally:
+        if process.poll() is None:
+            process.kill(); process.wait()
+        process.stdin.close(); process.stdout.close()
+
+
+def scan_history(root):
+    findings = []
+    seen_blobs = set()
+    with history_blobs(root) as read_blob:
+        for commit in git(root, 'rev-list', '--all').decode().splitlines():
+            findings.extend(inspect_content(git(root, 'show', '-s', '--format=%B%n%an <%ae>%n%cn <%ce>', commit)))
+            for entry in git(root, 'ls-tree', '-rz', commit).split(b'\0'):
+                if not entry:
+                    continue
+                metadata, name = entry.split(b'\t', 1)
+                mode, kind, oid = metadata.split()
+                # Every path/mode is checked in every reachable tree, even if
+                # the same bytes were previously allowed at another path.
+                if mode in (b'120000', b'160000') or not allowed_path(name.decode()):
+                    findings.append('unexpected_history_file')
+                elif kind == b'blob' and oid not in seen_blobs:
+                    seen_blobs.add(oid)
+                    raw = read_blob(oid)
+                    findings.extend(['unsupported_content'] if raw is None else inspect_content(raw))
+    return findings
 
 
 def scan(root, history=False):
@@ -65,17 +133,7 @@ def scan(root, history=False):
             if name and not allowed_path(name):
                 findings.append('unexpected_tracked_file')
     if history:
-        for commit in git(root, 'rev-list', '--all').decode().splitlines():
-            findings.extend(inspect_content(git(root, 'show', '-s', '--format=%B%n%an <%ae>%n%cn <%ce>', commit)))
-            for entry in git(root, 'ls-tree', '-rz', commit).split(b'\0'):
-                if not entry:
-                    continue
-                metadata, name = entry.split(b'\t', 1)
-                mode, kind, oid = metadata.split()
-                if mode in (b'120000', b'160000') or not allowed_path(name.decode()):
-                    findings.append('unexpected_history_file')
-                elif kind == b'blob':
-                    findings.extend(inspect_content(git(root, 'cat-file', 'blob', oid.decode())))
+        findings.extend(scan_history(root))
     return count, findings
 
 
