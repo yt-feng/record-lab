@@ -1,0 +1,39 @@
+name: Verify official fund universe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: verify-official-fund-universe
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/verify_universe.py
+            /scripts/publication_guard.py
+            /scripts/publication_cache.py
+            /tests/test_verify_universe.py
+            /.github/workflows/verify-universe.yml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test bounded XLSX inspection without network
+        run: python -m unittest discover -s tests -p 'test_verify_universe.py'
+      - name: Inspect the fixed official June index
+        run: python scripts/verify_universe.py
+      - name: Retain compact guarded verification only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: official-universe-verification
+          path: .cache/universe-verification/result.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
