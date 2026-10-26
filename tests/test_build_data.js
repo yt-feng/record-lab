@@ -74,6 +74,45 @@ test('all collection failures throw even when an old complete snapshot exists', 
   assert.equal(JSON.stringify(previous), oldBytes);
 });
 
+const deferredFund = code => fund(code, { reports: [], collectionAttempt: {
+  status: 'deferred-budget', attempted: false, errorCode: 'BATCH_DEADLINE_REACHED' } });
+
+test('explicit unstarted budget receipts survive mixed and entirely deferred batches', () => {
+  const result = build(raw([fund(), deferredFund('000002')]), { config });
+  assert.equal(result.coverage.failedFundCount, 0);
+  assert.equal(result.coverage.deferredFundCount, 1);
+  assert.deepEqual(result.batchResults[1], { code: '000002', status: 'deferred-budget', attempted: false,
+    errorCode: 'BATCH_DEADLINE_REACHED' });
+  assert.ok(!result.errors.some(item => item.code === '000002' && item.errorCode === 'NO_VALID_REPORTS'));
+  const empty = build(raw([deferredFund('000001')]));
+  assert.deepEqual(empty.funds, []);
+  assert.equal(empty.coverage.batchFreshFundCount, 0);
+  assert.equal(empty.coverage.failedFundCount, 0);
+  assert.equal(empty.batchResults[0].attempted, false);
+});
+
+test('source attempts and missing legacy records still consume failures beside deferred products', () => {
+  const result = build(raw([fund('000001', { reports: [], collectionAttempt: { attempted: true } }), deferredFund('000002')],
+    { errors: [{ code: '000001', stage: 'budget', errorCode: 'BATCH_DEADLINE_REACHED' }] }),
+  { config: { funds: [{ code: '000001' }, { code: '000002' }, { code: '000003' }] } });
+  assert.equal(result.coverage.failedFundCount, 2);
+  assert.deepEqual(result.batchResults.map(item => [item.code, item.status, item.attempted]),
+    [['000001', 'failed', true], ['000002', 'deferred-budget', false], ['000003', 'failed', true]]);
+  const conflict = build(raw([fund(), deferredFund('000002')],
+    { errors: [{ code: '000002', stage: 'metadata', errorCode: 'TIMEOUT' }] }), { config });
+  assert.equal(conflict.batchResults[1].status, 'failed');
+  assert.equal(conflict.batchResults[1].attempted, true);
+});
+
+test('deferred receipts retain previous observations without refreshing their dates', () => {
+  const previous = build(raw([fund()], { retrievedAt: '2026-09-28T10:00:00Z', asOf: '2026-09-28' }));
+  const result = build(raw([deferredFund('000001')]), { previous });
+  assert.equal(result.funds[0].retrievedAt, previous.funds[0].retrievedAt);
+  assert.equal(result.funds[0].dataStatus, 'cached');
+  assert.equal(result.coverage.batchFreshFundCount, 0);
+  assert.equal(result.coverage.failedFundCount, 0);
+});
+
 test('same-date shrinking holdings or weaker report coverage keeps the complete prior fund', () => {
   const oldFund = fund('000001', { reports: [report({ coverage: 'full', holdings: [holding(), holding('600002')] })] });
   const previous = build(raw([oldFund, fund('000002')]), { config });

@@ -335,3 +335,47 @@ test('empty awaiting quarter accepts no observation dates without inventing a ti
     assert.throws(() => ui.validateDataset(data), /INVALID_DATASET/);
   }
 });
+
+test('budget deferrals remain distinct from failed attempts and expose the next scheduled check', () => {
+  const progress = { schemaVersion: 1, updatedAt: '2026-10-26T01:00:00Z', totalCompanies: 1, totalFunds: 2,
+    processedFunds: 0, completedCompanies: 0, pendingFunds: 1, failedFunds: 1, deferredFunds: 1,
+    nextRetryAt: '2026-10-27T00:30:00Z', directoryNextRetryAt: null, continueRun: false, completionStatus: 'incomplete-exhausted',
+    companies: [{ code: 'c1', name: '甲公司', totalFunds: 2, processedFunds: 0, withHoldings: 0, withoutEquities: 0, failed: 1, pending: 1, deferredFunds: 1 }],
+    funds: [{ code: '000001', companyCode: 'c1', status: 'pending', attempts: 0, deferredUntil: '2026-10-27T00:30:00Z', lastDeferredAt: '2026-10-26T01:00:00Z' },
+      { code: '000002', companyCode: 'c1', status: 'failed', attempts: 2 }] };
+  assert.equal(ui.validateProgress(progress), progress);
+  assert.equal(progress.funds[0].attempts, 0);
+  assert.equal(progress.failedFunds, 1);
+  assert.equal(ui.companyCoverage(null, progress)[0].deferredFunds, 1);
+  const retry = ui.retryState(progress);
+  assert.equal(retry.label, '本轮结束，等待复查');
+  assert.match(retry.detail, /不早于.*08:30.*北京时间/);
+  assert.doesNotMatch(retry.label, /已齐|已完成/);
+  assert.equal(ui.retryState({ ...progress, nextRetryAt: null }).label, '仍有缺项，需继续处理');
+  assert.equal(ui.retryState({ ...progress, continueRun: true, completionStatus: 'incomplete-running' }).label, '仍在补采');
+  for (const mutation of [d => { d.deferredFunds = 3; }, d => { d.nextRetryAt = '2026-02-30T00:00:00Z'; },
+    d => { d.funds[0].deferredUntil = 'tomorrow'; }, d => { d.companies[0].deferredFunds = -1; },
+    d => { d.funds[0].status = 'deferred-budget'; }]) {
+    const invalid = structuredClone(progress); mutation(invalid);
+    assert.throws(() => ui.validateProgress(invalid), /INVALID_PROGRESS/);
+  }
+});
+
+test('retained company ownership keeps its original verification date during a fresh directory refresh', () => {
+  const catalog = fixtureCatalog(); catalog.asOf = '2026-10-26'; catalog.retrievedAt = '2026-10-26T01:00:00Z';
+  catalog.companies[0].directoryStatus = 'stale'; catalog.companies[0].directoryAsOf = '2026-09-29';
+  catalog.coverage.staleCompanyCount = 1; catalog.coverage.retainedHistoricFundCount = 1;
+  assert.equal(ui.validateCatalog(catalog), catalog);
+  assert.equal(ui.catalogComplete(catalog), false);
+  assert.deepEqual(ui.catalogFreshness(catalog), { staleCompanyCount: 1, retainedHistoricFundCount: 1 });
+  const company = ui.companyCoverage(catalog, null)[0];
+  const label = ui.companyDirectoryLabel(company, catalog.asOf);
+  assert.match(label, /沿用缓存归属.*2026-09-29.*本轮刷新未成功/);
+  assert.doesNotMatch(label, /2026-10-26/);
+  for (const mutate of [d => { delete d.companies[0].directoryAsOf; },
+    d => { d.companies[0].directoryAsOf = '2026-10-27'; }, d => { d.coverage.staleCompanyCount = 0; },
+    d => { d.coverage.retainedHistoricFundCount = 3; }]) {
+    const invalid = structuredClone(catalog); mutate(invalid);
+    assert.throws(() => ui.validateCatalog(invalid), /INVALID_CATALOG/);
+  }
+});

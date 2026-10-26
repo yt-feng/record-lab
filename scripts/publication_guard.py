@@ -12,6 +12,7 @@ ROOT_DIRS = {'lib', 'web', 'scripts', 'tests', 'config', 'docs', '.github'}
 IGNORE_DIRS = {'.git', '.venv', 'node_modules', '__pycache__', '.pytest_cache', 'raw', '.cache', '.local'}
 EXTENSIONS = {'.md', '.json', '.js', '.css', '.html', '.py', '.txt', '.yml', '.yaml'}
 MAX_CONTENT_BYTES = 25_000_000
+MAX_PROGRESS_BYTES = 96_000_000
 PATTERNS = {
     'credential': re.compile(r'(?:gh[pousr]_[A-Za-z0-9]{25,}|github_pat_[A-Za-z0-9_]{35,}|sk-[A-Za-z0-9_-]{24,}|AKIA[A-Z0-9]{16}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)'),
     'credential_assignment': re.compile(r'''(?i)(?:api[_-]?key|access[_-]?token|secret[_-]?key|password|authorization|cookie)\s*[=:]\s*["'](?:Bearer\s+)?[A-Za-z0-9_/.+=-]{16,}'''),
@@ -43,8 +44,12 @@ def allowed_path(name):
     return p.parts[0] in ROOT_DIRS and p.suffix in EXTENSIONS
 
 
-def inspect_content(data):
-    if len(data) > MAX_CONTENT_BYTES or b'\0' in data:
+def content_limit(name):
+    return MAX_PROGRESS_BYTES if re.fullmatch(r'web/data/(?:periods/\d{4}Q[1-4]/)?progress\.json', str(name)) else MAX_CONTENT_BYTES
+
+
+def inspect_content(data, max_bytes=None):
+    if len(data) > (MAX_CONTENT_BYTES if max_bytes is None else max_bytes) or b'\0' in data:
         return ['unsupported_content']
     try:
         value = data.decode('utf-8')
@@ -81,7 +86,7 @@ def git(root, *args):
 
 
 @contextmanager
-def history_blobs(root):
+def history_blobs(root, max_bytes=None):
     """Read immutable objects through one process, with a bounded per-blob buffer."""
     process = subprocess.Popen(['git', '-C', str(root), 'cat-file', '--batch'],
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -95,7 +100,7 @@ def history_blobs(root):
         size = int(header[2])
         if size < 0:
             raise RuntimeError('Invalid history blob size')
-        if size <= MAX_CONTENT_BYTES:
+        if size <= (MAX_CONTENT_BYTES if max_bytes is None else max_bytes):
             data = process.stdout.read(size)
             if len(data) != size:
                 raise RuntimeError('Truncated history blob')
@@ -132,28 +137,30 @@ def scan_history(root, stats=None, progress=None, cached_blobs=frozenset(), veri
     started = time.monotonic()
     last_progress = started
     commit_count = entry_count = cached_count = 0
-    with history_blobs(root) as read_blob:
+    with history_blobs(root, max_bytes=MAX_PROGRESS_BYTES) as read_blob:
         for commit in git(root, 'rev-list', '--all').decode().splitlines():
             commit_count += 1
             findings.extend(inspect_commit_metadata(git(root, 'show', '-s',
                 '--format=%B%x00%an <%ae>%x00%cn%x00%ce', commit)))
-            for entry in git(root, 'ls-tree', '-rz', commit).split(b'\0'):
+            for entry in git(root, 'ls-tree', '-rlz', commit).split(b'\0'):
                 if not entry:
                     continue
                 entry_count += 1
                 metadata, name = entry.split(b'\t', 1)
-                mode, kind, oid = metadata.split()
+                mode, kind, oid, size = metadata.split()
                 # Every path/mode is checked in every reachable tree, even if
                 # the same bytes were previously allowed at another path.
                 if mode in (b'120000', b'160000') or not allowed_path(name.decode()):
                     findings.append('unexpected_history_file')
+                elif kind == b'blob' and int(size) > content_limit(name.decode()):
+                    findings.append('unsupported_content')
                 elif kind == b'blob' and oid not in seen_blobs:
                     seen_blobs.add(oid)
                     if oid in cached_blobs:
                         cached_count += 1
                     else:
                         raw = read_blob(oid)
-                        findings.extend(['unsupported_content'] if raw is None else inspect_content(raw))
+                        findings.extend(['unsupported_content'] if raw is None else inspect_content(raw, MAX_PROGRESS_BYTES))
                     now = time.monotonic()
                     if progress is not None and now-last_progress >= 30:
                         progress(f'history_scan_progress: commits={commit_count} tree_entries={entry_count} '
@@ -184,7 +191,7 @@ def scan(root, history=False, history_stats=None, history_progress=None, cached_
         count += 1
         if not allowed_path(relative.as_posix()):
             findings.append('unexpected_file'); continue
-        findings.extend(inspect_content(file.read_bytes()))
+        findings.extend(inspect_content(file.read_bytes(), content_limit(relative.as_posix())))
     if (root / '.git').exists():
         for name in git(root, 'ls-files', '-z').decode().split('\0'):
             if name and not allowed_path(name):

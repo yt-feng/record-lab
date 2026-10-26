@@ -43,6 +43,24 @@ test('publishes company envelopes and a small manifest with catalog coverage', (
   assert.equal(result.manifest.companyCoverage[0].status, 'partial');
 });
 
+test('budget-only parts preserve unstarted receipts without replacing previous public observations', () => {
+  const first = merge({ snapshots: [snapshot()] });
+  const deferred = buildSnapshot({ asOf: '2026-09-29', retrievedAt: '2026-09-29T11:00:00Z', errors: [],
+    funds: [{ code: '000001', reports: [], collectionAttempt: { status: 'deferred-budget', attempted: false,
+      errorCode: 'BATCH_DEADLINE_REACHED' } }] }, { now, config: { ...config, funds: [{ code: '000001' }] } });
+  const second = merge({ snapshots: [deferred], previousManifest: first.manifest, previousCompanies: first.companySnapshots });
+  assert.equal(second.changed, false);
+  assert.deepEqual(second.manifest, first.manifest);
+  assert.deepEqual(second.receipt.funds, [{ code: '000001', companyCode: 'co1', status: 'deferred-budget',
+    attempted: false, errorCode: 'BATCH_DEADLINE_REACHED' }]);
+  const noPrevious = merge({ snapshots: [deferred] });
+  assert.deepEqual(noPrevious.receipt.funds, second.receipt.funds);
+  assert.equal(noPrevious.manifest.coverage.fundCount, 0);
+  const attempted = merge({ snapshots: [deferred, snapshot()] });
+  assert.equal(attempted.receipt.funds[0].status, 'complete');
+  assert.equal(attempted.receipt.funds[0].attempted, true);
+});
+
 test('company pages have bounded fund counts, stable ordering, and company totals', () => {
   const codes = Array.from({ length: 101 }, (_, index) => String(index + 100000));
   const directory = { companies: [{ code: 'co1', name: '合成公司', fundCount: codes.length }],

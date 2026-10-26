@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from providers import DataError
-from discover import parse_companies, parse_funds, parse_company_funds, build_catalog, select_pending, catalog_attempt, restore_company_records
+from discover import parse_companies, parse_funds, parse_company_funds, build_catalog, select_pending, catalog_attempt, restore_company_records, retain_known_catalog
 
 
 COMPANY = {"id": "80000001", "code": "80000001", "name": "示例机构", "sourceUrl": "https://example.org/company.html"}
@@ -19,6 +19,52 @@ def html_table(rows, total=None):
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_partial_refresh_keeps_new_codes_and_dates_cached_company_evidence(self):
+        other = {**COMPANY, 'code': '80000002', 'id': '80000002', 'name': '第二机构'}
+        companies = [COMPANY, other]
+        master = {str(i).zfill(6): {'code': str(i).zfill(6), 'name': '示例', 'type': '混合型'} for i in (1, 2)}
+        def mapping(company, code):
+            return {'funds': [{**master[code], 'companyCode': company['code'], 'companyId': company['code']}], 'validation': {}}
+        old = build_catalog(companies, master, {COMPANY['code']: mapping(COMPANY, '000001'),
+            other['code']: mapping(other, '000002')}, '2026-09-29', {c['code'] for c in companies})
+        current_master = {**master, '000003': {'code': '000003', 'name': '新基金', 'type': '混合型'}}
+        fresh = build_catalog(companies, current_master, {other['code']: mapping(other, '000002')},
+            '2026-10-26', {c['code'] for c in companies}, errors=[{'code': COMPANY['code']}])
+        result = retain_known_catalog(fresh, old)
+        self.assertEqual(result['fundCount'], 3)
+        self.assertFalse(result['coverage']['directoryComplete'])
+        self.assertEqual(result['coverage']['companyPagesFetched'], 1)
+        self.assertEqual(result['coverage']['staleCompanyCount'], 1)
+        self.assertEqual(result['companies'][0]['directoryStatus'], 'stale')
+        self.assertEqual(result['companies'][0]['directoryAsOf'], '2026-09-29')
+        self.assertEqual(result['companies'][1]['directoryAsOf'], '2026-10-26')
+        saved = result['funds'][0]
+        self.assertEqual(saved['companyCode'], COMPANY['code'])
+        self.assertEqual(saved['mappingAsOf'], '2026-09-29')
+        self.assertEqual(result['funds'][2]['mappingStatus'], 'unmapped')
+        # A current full company refresh clears stale evidence; genuine source
+        # collapse still fails rather than replacing a validated directory.
+        full = build_catalog(companies, current_master, {COMPANY['code']: mapping(COMPANY, '000001'),
+            other['code']: mapping(other, '000002')}, '2026-10-27', {c['code'] for c in companies})
+        self.assertTrue(retain_known_catalog(full, result)['coverage']['directoryComplete'])
+        broken = build_catalog(companies, {}, {}, '2026-10-27', {c['code'] for c in companies})
+        with self.assertRaises(DataError): retain_known_catalog(broken, result)
+
+    def test_historic_product_does_not_invalidate_same_day_company_resume(self):
+        old = build_catalog([COMPANY], {'000001': {'code': '000001', 'name': '旧产品', 'type': '混合型'}},
+            {COMPANY['code']: {'funds': [{'code': '000001', 'name': '旧产品', 'type': '混合型',
+                'companyCode': COMPANY['code']}], 'validation': {}}}, '2026-09-29', {COMPANY['code']})
+        # The deployed legacy catalog predates per-company listing dates.
+        old['funds'][0].pop('companyListingAsOf')
+        current = {'000002': {'code': '000002', 'name': '新产品', 'type': '混合型'}}
+        fresh = build_catalog([COMPANY], current,
+            {COMPANY['code']: {'funds': [{**current['000002'], 'companyCode': COMPANY['code']}], 'validation': {}}},
+            '2026-10-26', {COMPANY['code']})
+        result = retain_known_catalog(fresh, old)
+        self.assertEqual(result['fundCount'], 2)
+        self.assertEqual(result['coverage']['retainedHistoricFundCount'], 1)
+        self.assertEqual([f['code'] for f in restore_company_records(result, result['companies'][0])], ['000002'])
+
     def test_whole_static_arrays_and_no_name_based_canonicalization(self):
         companies = parse_companies('var gs={op:[["80000001","示例机构"]]};')
         self.assertEqual(len(companies), 1)

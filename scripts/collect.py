@@ -22,7 +22,6 @@ def safe_error(code, stage, error):
 
 def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, target_period=None, baseline_period=None, deadline=None):
     code = item["code"]
-    source = provider or PublicProvider()
     errors = []
     fund = {"code": code, "name": item.get("name", code), "company": item.get("companyName") or item.get("company") or "",
             "managers": [], "shareClassCodes": [code], "reports": []}
@@ -37,7 +36,12 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
             return True
         return False
     if expired():
+        fund["collectionAttempt"] = {"attempted": False, "status": "deferred-budget", "errorCode": "BATCH_DEADLINE_REACHED"}
         return fund, errors
+    # Only products that reach their first source request consume an attempt.
+    # A later deadline cannot erase an actual source attempt or its failure.
+    fund["collectionAttempt"] = {"attempted": True}
+    source = provider or PublicProvider()
     overview = {}
     try:
         overview = source.overview(code)
@@ -211,6 +215,8 @@ def collect(config, as_of, checkpoint=None):
         payload = {"asOf": as_of, "targetPeriodEnd": config.get("targetPeriodEnd"), "baselinePeriodEnd": config.get("baselinePeriodEnd"),
                    "retrievedAt": dt.datetime.now(dt.timezone.utc).isoformat(), "funds": funds, "barsByStock": bars, "errors": errors,
                    "coverage": {"requested": len(items), "completedFundRequests": len(funds),
+                                "attemptedFundRequests": sum(f.get("collectionAttempt", {}).get("attempted") is not False for f in funds),
+                                "deferredFundRequests": sum(f.get("collectionAttempt", {}).get("attempted") is False for f in funds),
                                 "withHoldings": sum(bool(f["reports"]) for f in funds), "comparable": comparable,
                                 "withNarrative": sum(any(r["narrative"] for r in f["reports"]) for f in funds),
                                 "noEquities": no_equities, "priceSymbolsRequested": len(requested_prices),

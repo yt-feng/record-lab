@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import threading
+import time
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
@@ -216,6 +217,9 @@ def restore_company_records(catalog, company):
     code = company.get("code") or company.get("id")
     result = []
     for fund in catalog.get("funds", []):
+        listing_date = fund.get('companyListingAsOf')
+        if company.get('directoryAsOf') and listing_date and listing_date != company['directoryAsOf']:
+            continue
         owner = fund.get("companyCode") or fund.get("companyId")
         if owner == code or code in fund.get("companyCandidateCodes", []):
             result.append({**fund, "companyCode": code, "companyId": code,
@@ -245,7 +249,8 @@ def build_catalog(companies, master_funds, mappings, as_of, index_codes, errors=
             code = item["code"]
             owners.setdefault(code, []).append(company["code"])
             previous = all_funds.get(code, {})
-            all_funds[code] = {**item, **{k: previous[k] for k in ("name", "type", "catalogSourceUrl") if k in previous}}
+            all_funds[code] = {**item, 'companyListingAsOf': as_of,
+                               **{k: previous[k] for k in ("name", "type", "catalogSourceUrl") if k in previous}}
     conflicts = {code for code, values in owners.items() if len(set(values)) > 1}
     for code, item in all_funds.items():
         if code not in owners or code in conflicts:
@@ -271,6 +276,55 @@ def build_catalog(companies, master_funds, mappings, as_of, index_codes, errors=
                          "extraCompanyFundCount": len(set(all_funds) - set(master_funds)),
                          "typesIncluded": sorted({f["type"] for f in all_funds.values()}),
                          "shareClassesMerged": False}}
+
+
+def retain_known_catalog(fresh, previous):
+    """Keep source-confirmed historic codes while explicitly dating stale owners.
+
+    A failed company page must not discard a fresh master list or successful
+    company pages. This does not turn a partial refresh into a complete one.
+    """
+    if not previous:
+        for company in fresh['companies']:
+            if company['directoryStatus'] == 'complete': company['directoryAsOf'] = fresh['asOf']
+        return fresh
+    if (fresh['companyCount'] < previous.get('companyCount', 0) * .95
+            or fresh['coverage']['upstreamFundRows'] < previous.get('coverage', {}).get('upstreamFundRows', 0) * .95):
+        raise DataError('DIRECTORY_REGRESSION')
+    old_companies = {str(c.get('code') or c.get('id')): c for c in previous.get('companies', [])}
+    stale = set()
+    for company in fresh['companies']:
+        code = company['code']
+        if company['directoryStatus'] == 'complete':
+            company['directoryAsOf'] = fresh['asOf']
+            continue
+        old = old_companies.get(code, {})
+        if old.get('directoryStatus') in {'complete', 'stale'}:
+            stale.add(code)
+            company.update({'directoryStatus': 'stale', 'directoryAsOf': old.get('directoryAsOf') or previous.get('asOf'),
+                            'fundCount': old.get('fundCount'), 'validation': old.get('validation', {})})
+    fresh_codes = {f['code'] for f in fresh['funds']}
+    funds = {f['code']: dict(f) for f in previous.get('funds', [])}
+    for item in funds.values():
+        owner = item.get('companyCode') or item.get('companyId')
+        if owner and not item.get('companyListingAsOf'):
+            item['companyListingAsOf'] = (item.get('mappingAsOf') or old_companies.get(owner, {}).get('directoryAsOf')
+                                         or previous.get('asOf'))
+    for item in fresh['funds']:
+        old = funds.get(item['code'], {})
+        owner = old.get('companyCode') or old.get('companyId')
+        if owner in stale and not item.get('companyCode') and item.get('mappingStatus') != 'conflicting-owners':
+            item = {**old, **{k: item[k] for k in ('name', 'type', 'catalogSourceUrl') if k in item},
+                    'mappingStatus': 'source-confirmed-cached',
+                    'mappingAsOf': old.get('mappingAsOf') or previous.get('asOf')}
+        funds[item['code']] = item
+    fresh['funds'] = sorted(funds.values(), key=lambda f: f['code'])
+    fresh['fundCount'] = len(funds)
+    unmapped = sum(not f.get('companyCode') for f in funds.values())
+    fresh['coverage'].update({'fundCount': len(funds), 'mappedCount': len(funds)-unmapped,
+                             'unmappedCount': unmapped, 'staleCompanyCount': len(stale),
+                             'retainedHistoricFundCount': len(set(funds)-fresh_codes)})
+    return fresh
 
 
 def main():
@@ -326,15 +380,20 @@ def main():
                     state["attempts"][code] = saved
     pending = select_pending(companies, state["mappings"], state["attempts"], args.max_companies)
     checkpoint_lock = threading.Lock()
-    def save_progress():
+    last_checkpoint = [0.0]
+    def save_progress(force=False):
+        if not force and time.monotonic() - last_checkpoint[0] < 20:
+            return
+        last_checkpoint[0] = time.monotonic()
         atomic_json(state_path, state)
         result = build_catalog(companies, master, state["mappings"], args.as_of, index_codes, state["errors"], state["attempts"])
         result["coverage"]["scope"] = "all-directory-companies" if complete_scope else "limited-probe"
         if not complete_scope:
             result["coverage"]["status"] = "limited-probe"
-        if previous_catalog and previous_catalog.get("coverage", {}).get("status") == "complete-directory":
-            if result["coverage"]["status"] != "complete-directory" or result["companyCount"] < previous_catalog.get("companyCount", 0) * 0.95 or result["fundCount"] < previous_catalog.get("fundCount", 0) * 0.95:
-                return
+        if complete_scope:
+            result = retain_known_catalog(result, previous_catalog)
+        elif previous_catalog:
+            return
         atomic_json(args.output, result)
     def get_company(company):
         code = company["code"]
@@ -365,20 +424,18 @@ def main():
                 save_progress()
             count = len(state["mappings"])
             if count % 20 == 0:
-                print(json.dumps({"status": "discovering", "companyCount": len(companies), "completedCount": count, "errorCount": len(state["errors"])}))
+                print(json.dumps({"status": "discovering", "companyCount": len(companies), "completedCount": count, "errorCount": len(state["errors"])}), flush=True)
+    save_progress(force=True)
     if len(state["mappings"]) != len(companies) and not args.allow_partial:
         raise DataError("INCOMPLETE_COMPANY_CATALOG")
     result = build_catalog(companies, master, state["mappings"], args.as_of, index_codes, state["errors"], state["attempts"])
     result["coverage"]["scope"] = "all-directory-companies" if complete_scope else "limited-probe"
     if not complete_scope:
         result["coverage"]["status"] = "limited-probe"
-    old_path = Path(args.output)
-    if old_path.exists():
-        old = json.loads(old_path.read_text(encoding="utf-8"))
-        old_coverage = old.get("coverage", {})
-        if old_coverage.get("status") == "complete-directory":
-            if not complete_scope or result["coverage"]["status"] != "complete-directory" or result["companyCount"] < old.get("companyCount", 0) * 0.95 or result["fundCount"] < old.get("fundCount", 0) * 0.95:
-                raise DataError("DIRECTORY_REGRESSION")
+    if complete_scope:
+        result = retain_known_catalog(result, previous_catalog)
+    elif previous_catalog:
+        raise DataError('DIRECTORY_REGRESSION')
     atomic_json(args.output, result)
     print(json.dumps({"status": result["coverage"]["status"], "companyCount": result["companyCount"],
                       "fundCount": result["fundCount"], "unmappedCount": result["coverage"]["unmappedCount"]}))

@@ -21,7 +21,17 @@
   const MAX_DATA_BYTES = 80 * 1024 * 1024;
   function safeCompanyPath(path) { return typeof path === 'string' && /^\.\/data\/companies\/[A-Za-z0-9_-]+\.json(?:\.gz)?$/.test(path) ? path : null; }
   function companyPages(manifest, code) { return (manifest?.companyFiles || []).filter(file => file.companyCode === code).slice().sort((a, b) => (a.partIndex || 1) - (b.partIndex || 1)); }
-  function catalogComplete(catalog) { return Boolean(catalog && catalog.coverage.complete !== false && catalog.coverage.directoryComplete !== false && !['bootstrap', 'partial-directory', 'limited-probe', 'unavailable'].includes(catalog.coverage.status)); }
+  function catalogComplete(catalog) { return Boolean(catalog && catalog.coverage.complete !== false && catalog.coverage.directoryComplete !== false &&
+    !catalog.companies?.some(company => company.directoryStatus === 'stale') && !['bootstrap', 'partial-directory', 'limited-probe', 'unavailable'].includes(catalog.coverage.status)); }
+  function companyDirectoryLabel(company, catalogAsOf) {
+    if (company.directoryStatus === 'stale') return `沿用缓存归属 · 核验截至 ${company.directoryAsOf || '日期未提供'} · 本轮刷新未成功`;
+    if (company.directoryStatus === 'complete') return `归属核验截至 ${company.directoryAsOf || catalogAsOf || '日期未提供'}`;
+    return '机构归属本轮尚未核验';
+  }
+  function catalogFreshness(catalog) {
+    return { staleCompanyCount: catalog?.companies?.filter(company => company.directoryStatus === 'stale').length || 0,
+      retainedHistoricFundCount: catalog?.coverage?.retainedHistoricFundCount ?? 0 };
+  }
   const LEGACY_PERIOD = { id: '2026Q2', label: '2026Q2', path: './data/', targetPeriodEnd: '2026-06-30', baselinePeriodEnd: '2026-03-31' };
   function quarterDates(id) {
     const match = typeof id === 'string' && /^(20\d{2})Q([1-4])$/.exec(id);
@@ -91,7 +101,22 @@
     if (!research || research.enabled !== true) return null;
     const notApplicableFunds = countValue(progress.notApplicableFunds) ? progress.notApplicableFunds : 0;
     return { ...research, totalFunds: progress.totalFunds, applicableFunds: progress.totalFunds - notApplicableFunds,
-      notApplicableFunds, completionStatus: progress.completionStatus || 'incomplete-running' };
+      notApplicableFunds, completionStatus: progress.completionStatus || 'incomplete-running',
+      nextRetryAt: progress.nextRetryAt || null, continueRun: progress.continueRun };
+  }
+  function formatRetryAt(value) {
+    if (!validTimestamp(value)) return '时间待核验';
+    return new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(value)) + '（北京时间）';
+  }
+  function retryState(progress) {
+    if (!progress) return { label: '研究完整度待核验', detail: '' };
+    if (progress.completionStatus === 'complete') return { label: '适用产品研究字段已齐', detail: '' };
+    const scheduled = validTimestamp(progress.nextRetryAt);
+    const detail = scheduled ? `后续复查不早于 ${formatRetryAt(progress.nextRetryAt)}，具体执行以任务运行记录为准。` : '';
+    if (scheduled && (progress.continueRun === false || progress.completionStatus === 'incomplete-exhausted')) return { label: '本轮结束，等待复查', detail };
+    if (progress.completionStatus === 'incomplete-exhausted') return { label: '仍有缺项，需继续处理', detail };
+    return { label: '仍在补采', detail };
   }
   function fundQuality(progress, fund) {
     const direct = progress?.funds?.find(item => item.code === fund.code);
@@ -179,6 +204,8 @@
     for (const company of data.companies) {
       if (!isRecord(company) || typeof company.code !== 'string' || !company.code || typeof company.name !== 'string' ||
         !(company.fundCount === null || countValue(company.fundCount)) || codes.has(company.code)) fail();
+      if (company.directoryAsOf != null && (!dateOnly(company.directoryAsOf) || company.directoryAsOf > data.asOf)) fail();
+      if (company.directoryStatus === 'stale' && !dateOnly(company.directoryAsOf)) fail();
       codes.add(company.code);
     }
     const fundCodes = new Set();
@@ -188,6 +215,9 @@
       fundCodes.add(fund.code);
     }
     if (!countValue(data.coverage.companyCount) || !countValue(data.coverage.fundCount)) fail();
+    if (data.coverage.staleCompanyCount != null && (!countValue(data.coverage.staleCompanyCount) ||
+      data.coverage.staleCompanyCount !== data.companies.filter(company => company.directoryStatus === 'stale').length)) fail();
+    if (data.coverage.retainedHistoricFundCount != null && (!countValue(data.coverage.retainedHistoricFundCount) || data.coverage.retainedHistoricFundCount > data.funds.length)) fail();
     return data;
   }
 
@@ -197,6 +227,8 @@
       ['totalCompanies', 'totalFunds', 'processedFunds', 'completedCompanies', 'pendingFunds'].some(key => !countValue(data[key]))) fail();
     if (data.completedCompanies > data.totalCompanies || data.processedFunds > data.totalFunds || data.pendingFunds > data.totalFunds) fail();
     if (data.notApplicableFunds != null && (!countValue(data.notApplicableFunds) || data.notApplicableFunds + data.processedFunds > data.totalFunds)) fail();
+    if (data.deferredFunds != null && (!countValue(data.deferredFunds) || data.deferredFunds > data.totalFunds)) fail();
+    for (const key of ['nextRetryAt', 'directoryNextRetryAt']) if (data[key] != null && !validTimestamp(data[key])) fail();
     if (data.research != null) {
       const research = data.research;
       if (!isRecord(research) || typeof research.enabled !== 'boolean' ||
@@ -210,12 +242,14 @@
       if (!isRecord(company) || typeof company.code !== 'string' || typeof company.name !== 'string' ||
         !(company.totalFunds === null || countValue(company.totalFunds)) || ['processedFunds', 'withHoldings', 'withoutEquities', 'failed', 'pending'].some(key => !countValue(company[key])) || companies.has(company.code)) fail();
       if (company.notApplicable != null && !countValue(company.notApplicable)) fail();
+      if (company.deferredFunds != null && !countValue(company.deferredFunds)) fail();
       companies.add(company.code);
     }
     const funds = new Set();
     for (const fund of data.funds) {
       if (!isRecord(fund) || typeof fund.code !== 'string' || !nullableText(fund.companyCode) ||
         !['complete', 'no-equities', 'not-applicable', 'failed', 'pending'].includes(fund.status) || funds.has(fund.code)) fail();
+      for (const key of ['deferredUntil', 'lastDeferredAt']) if (fund[key] != null && !validTimestamp(fund[key])) fail();
       funds.add(fund.code);
     }
     return data;
@@ -252,6 +286,7 @@
         processedFunds: entry?.processedFunds ?? null, withHoldings: entry?.withHoldings ?? null,
         withoutEquities: entry?.withoutEquities ?? null, failed: entry?.failed ?? null, pending: entry?.pending ?? null,
         notApplicable: entry?.notApplicable ?? null,
+        deferredFunds: entry?.deferredFunds ?? null,
         lastAttemptAt: entry?.lastAttemptAt || null };
     });
   }
@@ -483,6 +518,8 @@
       $('stat-companies').textContent = `${formatNumber(overview.coveredCompanies, 0)} / ${overview.totalCompanies === null ? '—' : formatNumber(overview.totalCompanies, 0)}`;
       $('stat-scope').textContent = overview.totalFunds !== null ? '目录按份额计数；同组合持仓不重复合计' : '全量目录生成中，分母尚未确认';
       $('stat-company-note').textContent = overview.totalCompanies !== null ? '目录公司均可查询处理状态' : '全量目录生成中，已有报告不代表全量';
+      const freshness = catalogFreshness(state.catalog);
+      if (freshness.staleCompanyCount) $('stat-company-note').textContent = `${freshness.staleCompanyCount} 家归属沿用缓存，核验日期见公司行`;
       const global = state.manifest?.coverage;
       if (global) {
         $('stat-period').textContent = state.manifest.targetPeriodEnd || global.targetPeriodEnd || global.latestPeriod || state.period?.targetPeriodEnd || '未提供';
@@ -494,27 +531,37 @@
       updateCompanyOptions(); updateStatistics();
       const overview = coverageOverview(state.catalog, state.progress, state.data);
       const incomplete = !catalogComplete(state.catalog);
-      $('catalog-badge').textContent = incomplete ? `全量目录生成中${state.catalog ? ` · 已发现 ${state.catalog.companies.length} 家` : ''}` : `${state.catalog.companies.length} 家目录公司`;
+      const freshness = catalogFreshness(state.catalog);
+      const staleLabel = freshness.staleCompanyCount ? ` · ${freshness.staleCompanyCount} 家沿用缓存归属` : '';
+      $('catalog-badge').textContent = (incomplete ? `目录核验未齐${state.catalog ? ` · 已发现 ${state.catalog.companies.length} 家` : ''}` : `${state.catalog.companies.length} 家目录公司`) + staleLabel;
       $('catalog-badge').className = `badge ${incomplete ? 'warning' : 'success'}`;
       $('progress-count').textContent = state.progress ? `${incomplete ? '当前已发现目录' : ''}已取得记录 ${formatNumber(state.progress.processedFunds, 0)} / ${formatNumber(state.progress.totalFunds, 0)} 只基金份额` : '处理进度待生成';
-      $('progress-detail').textContent = state.progress ? `${formatNumber(state.progress.failedFunds ?? 0, 0)} 只报告 / 数据未取得 · ${formatNumber(state.progress.pendingFunds, 0)} 只待处理 · ${formatNumber(state.progress.notApplicableFunds ?? 0, 0)} 只期后成立` : '已有记录与字段完整是两项独立计数。';
+      $('progress-detail').textContent = state.progress ? `${formatNumber(state.progress.failedFunds ?? 0, 0)} 只抓取后仍未取得 · ${formatNumber(state.progress.pendingFunds, 0)} 只待处理 · ${formatNumber(state.progress.deferredFunds ?? 0, 0)} 只本批未轮到 · ${formatNumber(state.progress.notApplicableFunds ?? 0, 0)} 只期后成立` : '已有记录与字段完整是两项独立计数。';
       $('progress-percent').textContent = overview.percent === null ? '—' : `${formatNumber(overview.percent, 1)}%`;
       $('coverage-progress').value = overview.percent || 0;
       const research = researchOverview(state.progress);
       const quality = $('research-status'); quality.replaceChildren();
       if (research) {
-        const statusLabels = { complete: '研究字段已齐', 'incomplete-running': '仍在补采', 'incomplete-exhausted': '仍有缺项，需继续处理' };
-        quality.append(el('strong', '', `研究字段齐全 ${formatNumber(research.completeFunds, 0)} / ${formatNumber(research.applicableFunds, 0)} 只适用份额 · ${statusLabels[research.completionStatus]}`));
+        const retry = retryState(state.progress);
+        quality.append(el('strong', '', `研究字段齐全 ${formatNumber(research.completeFunds, 0)} / ${formatNumber(research.applicableFunds, 0)} 只适用份额 · ${retry.label}`));
         quality.append(el('span', '', `待补 ${formatNumber(research.pendingFunds, 0)} · 本轮重试已用完 ${formatNumber(research.exhaustedFunds, 0)}`));
+        if (retry.detail) quality.append(el('p', '', retry.detail));
+        if (state.progress?.deferredFunds) quality.append(el('p', '', `本批未轮到 ${formatNumber(state.progress.deferredFunds, 0)} 只：保留原状态与尝试次数，不记为一次新的抓取失败；该数可能与原有待处理或失败状态重叠。`));
         if (research.notApplicableFunds) quality.append(el('span', '', `另有 ${formatNumber(research.notApplicableFunds, 0)} 只由公开成立日期确认期后成立，不计入持仓与研究完成数。`));
         const labels = { holdings: '持仓披露表', pdf: 'PDF', strategy: '季报策略', nav: '净资产', baseline: '上期基准', prices: '行情' };
         quality.append(el('p', '', Object.entries(labels).map(([key, label]) => `${label} ${formatNumber(research.fieldCoverage[key], 0)}`).join(' · ')));
-      } else quality.append(el('p', '', '研究完整度尚未核验；取得持仓或无股票证据不代表 PDF、策略、规模和比较基准都已齐全。'));
-      $('catalog-dates').textContent = [state.catalog ? `目录采集 ${state.catalog.retrievedAt}` : '目录待生成',
+      } else {
+        quality.append(el('p', '', '研究完整度尚未核验；取得持仓或无股票证据不代表 PDF、策略、规模和比较基准都已齐全。'));
+        const retry = retryState(state.progress);
+        if (retry.detail) quality.append(el('p', '', `${retry.label}。${retry.detail}`));
+      }
+      $('catalog-dates').textContent = [state.catalog ? `主目录截至 ${state.catalog.asOf} · 本次目录获取 ${state.catalog.retrievedAt}` : '目录待生成',
         state.progress ? `进度更新 ${state.progress.updatedAt}` : '进度待生成'].join(' · ');
       const companies = companyCoverage(state.catalog, state.progress, $('company-search').value);
       $('catalog-status').textContent = state.directoryFailures.length ? `${state.directoryFailures.join('；')}。已有目录与进度保留原时点。` :
         `显示 ${companies.length} 家公司。点击公司名称查看当前已收录报告；“未取得”表示本次未完成报告或数据获取。`;
+      if (freshness.staleCompanyCount) $('catalog-status').textContent += ` ${freshness.staleCompanyCount} 家公司保留旧核验归属，本次主目录日期不代表这些公司已重新核验。`;
+      if (freshness.retainedHistoricFundCount) $('catalog-status').textContent += ` 另保留 ${formatNumber(freshness.retainedHistoricFundCount, 0)} 个历史产品代码，未因本次主目录缺少它们而删除。`;
       const container = $('company-coverage'); container.replaceChildren();
       if (!companies.length) {
         container.append(emptyState(state.catalog || state.progress ? '没有匹配的公司' : '全量目录待生成',
@@ -522,7 +569,7 @@
         return;
       }
       const table = el('table', 'company-table'); const thead = el('thead'); const head = el('tr');
-      ['基金公司', '目录份额', '已取得记录', '有股票持仓', '无股票持仓', '期后成立', '报告 / 数据未取得', '待处理', '来源'].forEach(label => {
+      ['基金公司', '目录份额', '已取得记录', '有股票持仓', '无股票持仓', '期后成立', '抓取后仍未取得', '待处理', '本批未轮到', '来源'].forEach(label => {
         const th = el('th', '', label); th.scope = 'col'; head.append(th);
       });
       thead.append(head); const tbody = el('tbody');
@@ -534,10 +581,11 @@
           state.limit = 30; if (state.manifest) loadCompany(company.code, 0); else renderResults(); renderDirectory(); $('results').scrollIntoView({ behavior: 'auto', block: 'start' });
         });
         identity.append(button, el('span', 'company-code', company.code));
+        identity.append(el('small', 'company-state', companyDirectoryLabel(company, state.catalog?.asOf)));
         if (company.lastAttemptAt) identity.append(el('small', '', `最近处理 ${company.lastAttemptAt}`));
         else identity.append(el('small', '', '尚无处理时点记录'));
         tr.append(identity);
-        for (const key of ['totalFunds', 'processedFunds', 'withHoldings', 'withoutEquities', 'notApplicable', 'failed', 'pending']) {
+        for (const key of ['totalFunds', 'processedFunds', 'withHoldings', 'withoutEquities', 'notApplicable', 'failed', 'pending', 'deferredFunds']) {
           tr.append(el('td', key === 'failed' ? 'count-failed' : key === 'pending' ? 'count-pending' : '', company[key] === null ? '—' : formatNumber(company[key], 0)));
         }
         const source = el('td'); if (!addLink(source, '目录 ↗', company.sourceUrl)) source.textContent = '—'; tr.append(source); tbody.append(tr);
@@ -641,6 +689,9 @@
       summary.append(heading, count); card.append(summary);
       const body = el('div', 'fund-body');
       const metadata = el('div', 'fund-metadata');
+      const companyIndex = catalogIndex(state.catalog);
+      const directoryCompany = companyIndex.companies.get(companyCodeFor(fund, companyIndex));
+      if (directoryCompany?.directoryStatus === 'stale') addMetadata(metadata, '机构归属', companyDirectoryLabel(directoryCompany));
       if (fund.asOf) addMetadata(metadata, '该基金观察截至', fund.asOf);
       if (fund.retrievedAt) addMetadata(metadata, '该基金采集', fund.retrievedAt);
       addMetadata(metadata, '期末净资产', formatMoney(fund.selectedReport?.navYuan));
@@ -893,6 +944,6 @@
     initializePeriods();
   }
 
-  return { validateDataset, validateCatalog, validateProgress, validatePeriods, selectQuarter, periodDataPath, validatePeriodDataset, responseText, researchOverview, fundQuality, catalogComplete, safeCompanyPath, companyPages, catalogIndex, companyCoverage, coverageOverview, safeHttpUrl, managerNames, managerAttributionLabel, reportPeriod, changeGroup, latestFunds, filterFunds,
+  return { validateDataset, validateCatalog, validateProgress, validatePeriods, selectQuarter, periodDataPath, validatePeriodDataset, responseText, researchOverview, retryState, formatRetryAt, fundQuality, catalogComplete, catalogFreshness, companyDirectoryLabel, safeCompanyPath, companyPages, catalogIndex, companyCoverage, coverageOverview, safeHttpUrl, managerNames, managerAttributionLabel, reportPeriod, changeGroup, latestFunds, filterFunds,
     formatNumber, formatMoney, signed, holdingValue, priceDescription, csvCell, exportCsv, observationState, mount };
 });

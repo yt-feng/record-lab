@@ -27,7 +27,7 @@ const BUILD_CODES = new Set([
   'ANNOUNCEMENT_PAGE_LIMIT', 'ANNOUNCEMENT_PAGINATION_STALLED',
 ]);
 const STAGES = new Set(['metadata', 'announcements', 'holdings', 'report', 'nav', 'narrative',
-  'join', 'prices', 'build', 'collection', 'target-report', 'no-equities-report', 'quarterly-report']);
+  'join', 'prices', 'build', 'collection', 'budget', 'target-report', 'no-equities-report', 'quarterly-report']);
 const fundCode = value => typeof value === 'string' && /^\d{6}$/.test(value);
 const clone = value => JSON.parse(JSON.stringify(value));
 
@@ -388,6 +388,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
   let freshFundCount = 0;
   let batchNoEquitiesFundCount = 0;
   let failedFundCount = 0;
+  let deferredFundCount = 0;
   for (const code of requested) {
     const items = groups.get(code) || [];
     const old = cached.get(code);
@@ -426,12 +427,26 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
         result.reports = [];
         result.warnings = ['公开成立日期晚于本期末，该产品不适用本期报告。'];
         funds.push(result); freshFundCount += 1;
-        batchResults.push({ code, status: 'not-applicable', errorCode: null });
+        batchResults.push({ code, status: 'not-applicable', attempted: true, errorCode: null });
+        continue;
+      }
+      // Only an explicit unstarted receipt may bypass the source-failure budget.
+      // Missing legacy records, partial requests, and conflicting evidence still fail.
+      const deferred = items.length > 0 && items.every(item => item.collectionAttempt?.attempted === false
+        && item.collectionAttempt.status === 'deferred-budget'
+        && item.collectionAttempt.errorCode === 'BATCH_DEADLINE_REACHED'
+        && (!Array.isArray(item.reports) || item.reports.length === 0)
+        && !item.noEquitiesEvidence && !item.notApplicableEvidence)
+        && !errors.some(issue => issue.code === code && issue.errorCode !== 'BATCH_DEADLINE_REACHED');
+      if (deferred) {
+        deferredFundCount += 1;
+        batchResults.push({ code, status: 'deferred-budget', attempted: false, errorCode: 'BATCH_DEADLINE_REACHED' });
+        if (old) funds.push(cachedFund(old, 'BATCH_DEADLINE_REACHED'));
         continue;
       }
       const reason = items.length ? 'NO_VALID_REPORTS' : 'FUND_NOT_COLLECTED';
       addError(reason, code); failedFundCount += 1;
-      batchResults.push({ code, status: 'failed', errorCode: reason });
+      batchResults.push({ code, status: 'failed', attempted: true, errorCode: reason });
       if (old) funds.push(cachedFund(old, reason));
       continue;
     }
@@ -457,7 +472,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
     if (!current.selectedReport) {
       const reason = 'TARGET_REPORT_MISSING';
       addError(reason, code); failedFundCount += 1;
-      batchResults.push({ code, status: 'failed', errorCode: reason });
+      batchResults.push({ code, status: 'failed', attempted: true, errorCode: reason });
       if (old) funds.push(cachedFund(old, reason));
       continue;
     }
@@ -471,7 +486,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
     }
     if (reason) {
       addError(reason, code); failedFundCount += 1; funds.push(cachedFund(old, reason));
-      batchResults.push({ code, status: 'failed', errorCode: reason }); continue;
+      batchResults.push({ code, status: 'failed', attempted: true, errorCode: reason }); continue;
     }
     // Preserve source records across runs; selected data must first pass fresh-data
     // gates above, so history can never disguise an entirely failed collection.
@@ -504,9 +519,10 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
     funds.push(finalFund); freshFundCount += 1;
     if (finalFund.selectedReport.reportOnly) failedFundCount += 1;
     batchResults.push({ code, status: finalFund.status === 'no-equities' ? 'no-equities' : finalFund.selectedReport.reportOnly ? 'failed' : 'complete',
-      errorCode: finalFund.selectedReport.reportOnly ? 'HOLDINGS_UNRESOLVED' : null });
+      attempted: true, errorCode: finalFund.selectedReport.reportOnly ? 'HOLDINGS_UNRESOLVED' : null });
   }
-  if (!freshFundCount) throw new SafeBuildError('NO_VALID_FRESH_FUNDS');
+  // A receipt-only part is necessary to preserve explicitly unstarted products.
+  if (!freshFundCount && !deferredFundCount) throw new SafeBuildError('NO_VALID_FRESH_FUNDS');
   let retainedFundCount = 0;
   if (preserveOthers) {
     for (const [code, old] of cached) {
@@ -550,7 +566,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
       noEquitiesFundCount: publishedFunds.filter(fund => fund.status === 'no-equities').length,
       notApplicableFundCount: publishedFunds.filter(fund => fund.notApplicableEvidence).length,
       batchNoEquitiesFundCount,
-      failedFundCount, retainedFundCount,
+      failedFundCount, deferredFundCount, retainedFundCount,
       shareClassDeduplicatedCount: funds.length - publishedFunds.length,
     },
     companyCoverage,

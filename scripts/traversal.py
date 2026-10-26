@@ -24,7 +24,13 @@ ERROR_CODES = {
     "HOLDING_COVERAGE_REGRESSION", "REPORT_COVERAGE_REGRESSION", "CONTRADICTORY_NO_EQUITIES",
     "INVALID_REPORT", "INVALID_REPORT_SOURCE", "REPORT_IDENTITY_MISMATCH", "INVALID_NO_EQUITIES_EVIDENCE",
     "BATCH_DEADLINE_REACHED", "PRICE_BUDGET_REACHED",
+    "TIMEOUT", "NETWORK_ERROR", "HTTP_ERROR", "TLS_FAILED", "TARGET_REPORT_UNAVAILABLE",
+    "PDF_PARSE_FAILED", "PDF_TEXT_EMPTY", "INVALID_PDF", "UNSUPPORTED_MARKET", "HOLDINGS_UNRESOLVED", "INVALID_FORMAT", "PARSE_FAILED",
 }
+PARSER_ERRORS = {"PDF_PARSE_FAILED", "PDF_TEXT_EMPTY", "INVALID_PDF", "UNSUPPORTED_MARKET", "HOLDINGS_UNRESOLVED", "INVALID_FORMAT", "PARSE_FAILED"}
+RECOVERABLE_ERRORS = {"NO_VALID_REPORTS", "TARGET_REPORT_MISSING", "NO_REPORTS", "TARGET_REPORT_UNAVAILABLE",
+                      "NO_DATED_HOLDINGS", "TIMEOUT", "NETWORK_ERROR", "HTTP_ERROR", "TLS_FAILED",
+                      "BATCH_FAILED", "FUND_NOT_COLLECTED", "BATCH_DEADLINE_REACHED"}
 COMMAND_ERRORS = {"INVALID_CONFIG", "INVALID_CATALOG", "INVALID_PROGRESS", "INVALID_ARGUMENTS",
                   "READ_FAILED", "WRITE_FAILED", "TRAVERSAL_FAILED"}
 
@@ -136,6 +142,70 @@ def quality_enabled(config):
     return isinstance(config, dict) and config.get("requireReportQuality") is True
 
 
+def counter(value, default=0):
+    return min(1_000_000, max(0, value)) if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+def retry_state(previous, last, now):
+    previous = previous if isinstance(previous, dict) else {}
+    cycle = date(previous.get("cycleDate"))
+    last_date = instant(last)
+    if cycle is None or cycle > now.date():
+        cycle = last_date.date() if last_date and last_date <= now else now.date()
+    return {"cycleDate": cycle.isoformat(), "scheduledCycles": min(4, counter(previous.get("scheduledCycles"))),
+            "nextRetryAt": None}
+
+
+def midnight(value):
+    return dt.datetime.combine(value, dt.time(), tzinfo=dt.timezone.utc).isoformat()
+
+
+def retry_lane(lane, limit, recoverable, config, now, daily=True):
+    """Open a bounded later cycle; future eligibility never means work now."""
+    retry = lane["retry"]
+    retry["nextRetryAt"] = None
+    policy = config.get("retryPolicy") if isinstance(config, dict) else None
+    if not isinstance(policy, dict) or not recoverable or lane["attempts"] < limit:
+        return
+    cycle = date(retry["cycleDate"])
+    last = instant(lane.get("lastAttemptAt"))
+    anchor = max(cycle, last.date()) if last else cycle
+    until = date(policy.get("dailyUntil")) if daily else None
+    next_day = anchor + dt.timedelta(days=1)
+    daily_cycle = bool(until and next_day <= until and now.date() <= until)
+    if daily_cycle:
+        due = next_day
+    else:
+        maximum = min(4, counter(policy.get("maxScheduledCycles"), 4))
+        if retry["scheduledCycles"] >= maximum:
+            return
+        interval = min(30, max(7, counter(policy.get("intervalDays"), 7)))
+        due = anchor + dt.timedelta(days=interval)
+    if due <= now.date():
+        lane["attempts"] = 0
+        retry["cycleDate"] = now.date().isoformat()
+        if not daily_cycle:
+            retry["scheduledCycles"] += 1
+        if lane.get("status") == "exhausted":
+            lane["status"] = "pending"
+    else:
+        retry["nextRetryAt"] = midnight(due)
+
+
+def apply_retry_policy(states, config, now):
+    for state in states.values():
+        retry_lane(state, 2, state["status"] == "failed" and state.get("errorCode") in RECOVERABLE_ERRORS, config, now)
+        quality = state["quality"]
+        fields = quality["fields"]
+        missing_report = fields["pdf"] == "missing" and quality.get("pdfRetryable", True)
+        retry_lane(quality, QUALITY_MAX_ATTEMPTS, state["status"] in SUCCESS and missing_report, config, now)
+        retry_lane(state["enrichment"], 3, state["status"] == "complete" and state["enrichment"]["status"] == "exhausted",
+                   config, now, daily=False)
+        times = [state.get("deferredUntil"), state["retry"]["nextRetryAt"],
+                 quality["retry"]["nextRetryAt"], state["enrichment"]["retry"]["nextRetryAt"]]
+        state["nextRetryAt"] = min((value for value in times if instant(value) and instant(value) > now), default=None)
+
+
 def base_states(catalog, previous, phase, now, config=None):
     companies, records = catalog_records(catalog)
     old = {}
@@ -162,6 +232,10 @@ def base_states(catalog, previous, phase, now, config=None):
             failures = 0
         states[code] = {"code": code, "companyCode": record["companyCode"], "status": status,
                         "attempts": failures, "lastAttemptAt": attempted_at if valid_attempt else None,
+                        "totalAttempts": counter(prior.get("totalAttempts"), counter(prior.get("attempts"))),
+                        "retry": retry_state(prior.get("retry"), attempted_at if valid_attempt else None, now),
+                        "deferredUntil": prior.get("deferredUntil") if instant(prior.get("deferredUntil")) and instant(prior["deferredUntil"]) > now else None,
+                        "lastDeferredAt": prior.get("lastDeferredAt") if instant(prior.get("lastDeferredAt")) and instant(prior["lastDeferredAt"]) <= now else None,
                         "errorCode": prior.get("errorCode") if status == "failed" and prior.get("errorCode") in ERROR_CODES else None,
                         "attempted": bool(prior.get("attempted", valid_attempt and prior.get("attribution") != "portfolio-evidence")),
                         "representativeCode": prior.get("representativeCode") if is_code(prior.get("representativeCode"))
@@ -175,12 +249,20 @@ def base_states(catalog, previous, phase, now, config=None):
                     or exemption_phase.get("baselinePeriodEnd") != phase["baselinePeriodEnd"]):
                 prior_quality = {key: value for key, value in prior_quality.items() if key != "baselineExemption"}
         if version_changed:
-            prior_enrichment = {**(prior_enrichment if isinstance(prior_enrichment, dict) else {}), "attempts": 0}
-            prior_quality = {**(prior_quality if isinstance(prior_quality, dict) else {}), "attempts": 0}
+            states[code]["retry"] = retry_state(None, None, now)
+            prior_enrichment = prior_enrichment if isinstance(prior_enrichment, dict) else {}
+            prior_quality = prior_quality if isinstance(prior_quality, dict) else {}
+            prior_enrichment = {**prior_enrichment, "attempts": 0,
+                                "totalAttempts": counter(prior_enrichment.get("totalAttempts"), counter(prior_enrichment.get("attempts"))),
+                                "retry": retry_state(None, None, now)}
+            prior_quality = {**prior_quality, "attempts": 0,
+                             "totalAttempts": counter(prior_quality.get("totalAttempts"), counter(prior_quality.get("attempts"))),
+                             "retry": retry_state(None, None, now)}
         states[code]["enrichment"] = normalize_enrichment(prior_enrichment, status, now)
         states[code]["quality"] = normalize_quality(prior_quality, status, now)
         if status == "not-applicable":
             states[code]["notApplicableEvidence"] = {key: exemption[key] for key in ("reason", "date", "sourceUrl", "periodEnd", "fundCode")}
+    apply_retry_policy(states, config, now)
     return companies, records, states
 
 
@@ -192,7 +274,7 @@ def eligible(states):
     # Institution mapping is an independent catalogue task. A valid fund code
     # can be collected directly even while its owner remains unresolved.
     return [code for code, state in states.items()
-            if state["status"] in {"pending", "failed"} and state["attempts"] < 2]
+            if state["status"] in {"pending", "failed"} and state["attempts"] < 2 and not state.get("deferredUntil")]
 
 
 def stock_key(item):
@@ -267,6 +349,7 @@ def normalize_enrichment(previous, status, now):
     if not instant(last) or instant(last) > now + dt.timedelta(minutes=5):
         last = None
     result = {"status": "not-applicable", "attempts": attempts, "lastAttemptAt": last,
+              "totalAttempts": counter(previous.get("totalAttempts"), attempts), "retry": retry_state(previous.get("retry"), last, now),
               "holdingCount": None, "priceAvailable": None, "missingStocks": [], "holdingsIdentity": None,
               "errorCode": None}
     if status == "no-equities":
@@ -283,6 +366,7 @@ def normalize_enrichment(previous, status, now):
 
 def enrichment_eligible(states):
     return [code for code, state in states.items() if state["status"] == "complete"
+            and not state.get("deferredUntil")
             and state["attribution"] != "portfolio-evidence" and state.get("representativeCode", code) == code
             and state["enrichment"]["status"] == "pending"
             and state["enrichment"]["attempts"] < 3]
@@ -307,7 +391,9 @@ def normalize_quality(previous, status, now):
     raw_fields = previous.get("fields") if isinstance(previous.get("fields"), dict) else {}
     if status == "not-applicable":
         return {"fields": {key: "not-applicable" for key in QUALITY_FIELDS}, "missingFields": [],
-                "attempts": 0, "lastAttemptAt": None, "status": "not-applicable"}
+                "attempts": 0, "totalAttempts": counter(previous.get("totalAttempts")),
+                "retry": retry_state(previous.get("retry"), previous.get("lastAttemptAt"), now),
+                "lastAttemptAt": None, "status": "not-applicable"}
     fields = {key: raw_fields.get(key) if raw_fields.get(key) in QUALITY_VALUES else "missing"
               for key in QUALITY_FIELDS}
     if status == "no-equities":
@@ -325,6 +411,8 @@ def normalize_quality(previous, status, now):
         last = None
     missing = [key for key in QUALITY_FIELDS if fields[key] not in QUALITY_ACCEPTED]
     result = {"fields": fields, "missingFields": missing, "attempts": attempts, "lastAttemptAt": last,
+              "totalAttempts": counter(previous.get("totalAttempts"), attempts), "retry": retry_state(previous.get("retry"), last, now),
+              "pdfRetryable": previous.get("pdfRetryable") is not False,
               "status": "complete" if not missing else "exhausted" if attempts >= QUALITY_MAX_ATTEMPTS else "pending"}
     if baseline_exempt and fields["baseline"] == "not-applicable":
         result["baselineExemption"] = {key: baseline_exemption[key] for key in ("reason", "date", "sourceUrl", "fundCode", "baselinePeriodEnd", "periodEnd")}
@@ -409,7 +497,8 @@ def report_quality(fund, phase, now):
         coverage = price_coverage(fund)
         if valid_price_coverage(coverage) and coverage["holdingCount"] > 0:
             fields["prices"] = "complete" if coverage["priceAvailable"] == coverage["holdingCount"] else "partial" if coverage["priceAvailable"] else "missing"
-    result = {"fields": fields}
+    result = {"fields": fields,
+              "pdfRetryable": not report.get("parseMethod") and report.get("parseErrorCode") in (None, *RECOVERABLE_ERRORS)}
     if fields["baseline"] == "not-applicable" and valid_baseline_exemption(baseline_exemption, now):
         result["baselineExemption"] = baseline_exemption
     return result
@@ -417,6 +506,7 @@ def report_quality(fund, phase, now):
 
 def quality_eligible(states):
     return [code for code, state in states.items() if state["status"] in SUCCESS
+            and not state.get("deferredUntil")
             and state["attribution"] != "portfolio-evidence" and state.get("representativeCode", code) == code
             and state["quality"]["status"] == "pending" and state["quality"]["attempts"] < QUALITY_MAX_ATTEMPTS]
 
@@ -520,6 +610,7 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
         raise TraversalError("INVALID_ARGUMENTS")
     companies, records, states = base_states(catalog, previous, phase, current, config)
     hydrate_quality(states, retained, phase, current)
+    apply_retry_policy(states, config, current)
     selected = []
     enrich_codes = set(enrichment_eligible(states))
     quality_codes = set(quality_eligible(states)) if quality_enabled(config) else set()
@@ -549,7 +640,7 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
         matrix.append({"id": str(index), "config": filename})
     passes = previous.get("directoryPasses", 0) if isinstance(previous, dict) and previous.get("phase") == phase else 0
     passes = passes if isinstance(passes, int) else 0
-    continuing = bool(selected) or directory_incomplete(companies, records) and passes < 12
+    continuing = bool(selected)
     return {"batches": batches, "matrix": matrix,
             "meta": {"hasWork": bool(selected), "continueRun": continuing, "selectedCount": len(selected),
                      "enrichmentCount": sum(code in enrich_codes and code not in quality_codes for code in selected),
@@ -634,7 +725,10 @@ def build_status(config, snapshot=None, now=None):
     for code, item in wanted.items():
         declared = results.get(code, {})
         proof = observed.get(code)
-        if code in exemptions and declared.get("status") == "not-applicable":
+        if valid_deferred(declared):
+            row = {"code": code, "companyCode": item.get("companyCode") or item.get("companyId"),
+                   "status": "deferred-budget", "attempted": False, "errorCode": "BATCH_DEADLINE_REACHED"}
+        elif code in exemptions and declared.get("status") == "not-applicable":
             row = {"code": code, "companyCode": item.get("companyCode") or item.get("companyId"),
                    "status": "not-applicable", "errorCode": None,
                    "notApplicableEvidence": {key: exemptions[code][key] for key in ("reason", "date", "sourceUrl", "periodEnd", "fundCode")}}
@@ -644,6 +738,12 @@ def build_status(config, snapshot=None, now=None):
                    "status": status, "errorCode": None, "reportEvidence": evidence, "priceCoverage": coverage}
         else:
             error = declared.get("errorCode")
+            if snapshot_ok and error in {"NO_VALID_REPORTS", "FUND_FAILED"}:
+                diagnostics = [entry.get("errorCode") for entry in snapshot.get("errors", [])
+                               if isinstance(entry, dict) and entry.get("code") == code
+                               and entry.get("stage") in {"report", "quarterly-report", "no-equities-report", "holdings", "build"}
+                               and entry.get("errorCode") in PARSER_ERRORS]
+                error = diagnostics[0] if diagnostics else error
             row = {"code": code, "companyCode": item.get("companyCode") or item.get("companyId"), "status": "failed",
                    "errorCode": error if error in ERROR_CODES else "FUND_FAILED" if snapshot_ok else "BATCH_FAILED"}
         row["enrichmentAttempt"] = code in enrich_codes
@@ -652,6 +752,11 @@ def build_status(config, snapshot=None, now=None):
             row["reportQuality"] = qualities[code]
         rows.append(row)
     return {"schemaVersion": 1, "phase": phase, "attemptedAt": current.isoformat(), "funds": rows, "portfolioAliases": aliases}
+
+
+def valid_deferred(item):
+    return (isinstance(item, dict) and item.get("status") == "deferred-budget" and item.get("attempted") is False
+            and item.get("errorCode") == "BATCH_DEADLINE_REACHED")
 
 
 def valid_event_evidence(evidence, status, phase, attempted_at):
@@ -691,7 +796,7 @@ def valid_status(document, config, now=None):
         if not isinstance(item, dict) or item.get("code") not in wanted or item["code"] in seen:
             return False
         seen.add(item["code"])
-        if item.get("companyCode") != wanted[item["code"]] or item.get("status") not in TERMINAL | {"failed"}:
+        if item.get("companyCode") != wanted[item["code"]] or item.get("status") not in TERMINAL | {"failed", "deferred-budget"}:
             return False
         if bool(item.get("enrichmentAttempt")) != (item["code"] in enrich_codes):
             return False
@@ -701,7 +806,12 @@ def valid_status(document, config, now=None):
             return False
         if item.get("priceCoverage") is not None and not valid_price_coverage(item["priceCoverage"]):
             return False
-        if item["status"] == "not-applicable":
+        if item["status"] == "deferred-budget":
+            if not valid_deferred(item):
+                return False
+        elif item.get("attempted") is False:
+            return False
+        elif item["status"] == "not-applicable":
             if not valid_not_applicable(item.get("notApplicableEvidence"), item["code"], phase, attempted):
                 return False
         elif item["status"] == "failed":
@@ -732,6 +842,9 @@ def reconcile_observations(statuses, receipt, config, now=None):
         raise TraversalError("INVALID_PROGRESS")
     observations = {}
     for item in receipt["funds"]:
+        if valid_deferred(item) and is_code(item.get("code")) and item.get("representativeCode") in (None, item["code"]):
+            observations[item["code"]] = item
+            continue
         if (isinstance(item, dict) and is_code(item.get("code")) and item.get("status") == "not-applicable"
                 and item.get("representativeCode") == item["code"]
                 and instant(item.get("observedAt")) and instant(item["observedAt"]) <= generated
@@ -754,7 +867,13 @@ def reconcile_observations(statuses, receipt, config, now=None):
                 continue
             row = dict(original)
             observation = observations.get(row.get("code"))
-            if row.get("status") in TERMINAL:
+            if row.get("status") == "deferred-budget":
+                owner = observation.get("companyCode") if observation else None
+                if owner == "unknown":
+                    owner = None
+                if not valid_deferred(row) or not valid_deferred(observation) or owner != row.get("companyCode"):
+                    row.update({"status": "failed", "attempted": True, "errorCode": "BATCH_FAILED"})
+            elif row.get("status") in TERMINAL:
                 observed_company = observation.get("companyCode") if observation else None
                 if observed_company == "unknown":
                     observed_company = None
@@ -810,7 +929,18 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
             if item.get("companyCode") != state["companyCode"]:
                 continue
             status = item.get("status")
+            if status == "deferred-budget":
+                prior_deferred = instant(state.get("lastDeferredAt"))
+                prior_attempt = instant(state.get("lastAttemptAt"))
+                if (valid_deferred(item) and (not prior_deferred or attempted > prior_deferred)
+                        and (not prior_attempt or attempted > prior_attempt)):
+                    state["lastDeferredAt"] = document["attemptedAt"]
+                    until = midnight(attempted.date() + dt.timedelta(days=1))
+                    state["deferredUntil"] = until if instant(until) > current else None
+                continue
             if status not in TERMINAL | {"failed"}:
+                continue
+            if item.get("attempted") is False:
                 continue
             if status == "not-applicable":
                 if not valid_not_applicable(item.get("notApplicableEvidence"), item["code"], phase, attempted):
@@ -819,6 +949,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                 if state["status"] in SUCCESS or prior_attempt and attempted <= prior_attempt:
                     continue
                 state.update({"status": status, "lastAttemptAt": document["attemptedAt"], "attempted": True,
+                              "totalAttempts": state["totalAttempts"] + 1, "deferredUntil": None,
                               "attribution": "direct", "errorCode": None,
                               "notApplicableEvidence": {key: item["notApplicableEvidence"][key] for key in ("reason", "date", "sourceUrl", "periodEnd", "fundCode")}})
                 state["quality"] = normalize_quality(None, status, current)
@@ -838,6 +969,9 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                 if prior_quality and attempted <= prior_quality:
                     continue
                 quality["attempts"] = min(QUALITY_MAX_ATTEMPTS, quality["attempts"] + 1)
+                quality["totalAttempts"] += 1
+                state["totalAttempts"] += 1
+                state["deferredUntil"] = None
                 quality["lastAttemptAt"] = document["attemptedAt"]
                 state["lastAttemptAt"] = document["attemptedAt"]
                 state["attempted"] = True
@@ -856,6 +990,9 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                 if extra["status"] == "complete" or prior_extra and attempted <= prior_extra:
                     continue
                 extra["attempts"] = min(3, extra["attempts"] + 1)
+                extra["totalAttempts"] += 1
+                state["totalAttempts"] += 1
+                state["deferredUntil"] = None
                 extra["lastAttemptAt"] = document["attemptedAt"]
                 state["lastAttemptAt"] = document["attemptedAt"]
                 state["attempted"] = True
@@ -870,7 +1007,8 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                 if state["status"] in SUCCESS and status in SUCCESS:
                     accepted_success.add(item["code"])
                 continue
-            state.update({"lastAttemptAt": document["attemptedAt"], "attempted": True, "attribution": "direct"})
+            state.update({"lastAttemptAt": document["attemptedAt"], "attempted": True, "attribution": "direct",
+                          "totalAttempts": state["totalAttempts"] + 1, "deferredUntil": None})
             if valid_quality(item.get("reportQuality"), phase):
                 state["quality"] = normalize_quality({**state["quality"], **item["reportQuality"]}, status, current)
             if status == "failed":
@@ -915,6 +1053,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                 if code in states and states[code]["status"] == "complete" and status == "complete":
                     apply_coverage(states[code], proof.get("priceCoverage"))
     hydrate_quality(states, retained, phase, current)
+    apply_retry_policy(states, config, current)
     passes = previous.get("directoryPasses", 0) if matching_previous else 0
     passes = min(12, max(0, passes)) if isinstance(passes, int) else 0
     last_directory = previous.get("lastDirectoryObservedAt") if matching_previous else None
@@ -938,6 +1077,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
         company_rows.append({"code": code, "name": company["name"], "totalFunds": total,
                              "processedFunds": complete + noeq, "withHoldings": complete, "withoutEquities": noeq,
                              "failed": failed, "pending": pending, "notApplicable": not_applicable, "lastAttemptAt": last,
+                             "deferredFunds": sum(bool(item.get("deferredUntil")) for item in members),
                              "enrichmentPending": sum(item["attribution"] != "portfolio-evidence" and item["representativeCode"] == item["code"] and item["enrichment"]["status"] == "pending" for item in members),
                              "enrichmentExhausted": sum(item["attribution"] != "portfolio-evidence" and item["representativeCode"] == item["code"] and item["enrichment"]["status"] == "exhausted" for item in members),
                              "researchComplete": sum(item["status"] in SUCCESS and item["quality"]["status"] == "complete" for item in members),
@@ -947,19 +1087,23 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
     failed = sum(state["status"] == "failed" for state in all_states)
     not_applicable = sum(state["status"] == "not-applicable" for state in all_states)
     continuing = bool(eligible(states) or enrichment_eligible(states)
-                      or quality_enabled(config) and quality_eligible(states)) or directory_incomplete(companies, records) and passes < 12
+                      or quality_enabled(config) and quality_eligible(states))
     enrichment_states = [state["enrichment"] for state in all_states if state["status"] == "complete" and state["attribution"] != "portfolio-evidence" and state["representativeCode"] == state["code"]]
     research_complete = sum(state["status"] in SUCCESS and state["quality"]["status"] == "complete" for state in all_states)
     research_pending = sum(state["status"] in SUCCESS and state["quality"]["status"] == "pending" for state in all_states)
     research_exhausted = sum(state["status"] in SUCCESS and state["quality"]["status"] == "exhausted" for state in all_states)
     applicable = len(records) - not_applicable
-    completed = research_complete == applicable if quality_enabled(config) else processed == applicable
+    completed = (research_complete == applicable if quality_enabled(config) else processed == applicable) and not directory_incomplete(companies, records)
+    directory_retry = midnight(current.date() + dt.timedelta(days=1)) if directory_incomplete(companies, records) and passes < 12 else None
+    next_retry = min((value for value in [directory_retry, *(state.get("nextRetryAt") for state in all_states)] if value), default=None)
     return {"schemaVersion": 1, "phase": phase, "updatedAt": current.isoformat(), "collectorVersion": collector_version(config),
             "totalCompanies": len(companies), "totalFunds": len(records), "processedFunds": processed,
             "attemptedFunds": sum(state["attempted"] for state in all_states),
             "completedCompanies": sum(company["directoryStatus"] == "complete" and company["totalFunds"] == company["processedFunds"] + company["notApplicable"] for company in company_rows),
             "pendingFunds": len(records) - processed - failed - not_applicable, "failedFunds": failed,
             "notApplicableFunds": not_applicable,
+            "deferredFunds": sum(bool(state.get("deferredUntil")) for state in all_states),
+            "nextRetryAt": next_retry, "directoryNextRetryAt": directory_retry,
             "retryableFailedFunds": sum(state["status"] == "failed" and state["attempts"] < 2 for state in all_states),
             "unmappedFunds": sum(state["companyCode"] is None for state in all_states),
             "completionStatus": "complete" if completed else "incomplete-running" if continuing else "incomplete-exhausted",
@@ -984,7 +1128,10 @@ def read_json(path, optional=False):
     if optional and not path.exists():
         return None
     try:
-        if path.is_symlink() or path.stat().st_size > 25_000_000:
+        # Coverage contains one small record per directory code; bounded company
+        # snapshots retain their smaller limit instead of lifting every read.
+        maximum = 96_000_000 if path.name == "progress.json" else 25_000_000
+        if path.is_symlink() or path.stat().st_size > maximum:
             raise ValueError("bounded-read")
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:

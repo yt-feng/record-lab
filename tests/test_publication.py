@@ -160,5 +160,19 @@ class HistoryPublicationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Invalid history blob response'):
                 read(b'0'*40)
 
+    def test_large_progress_is_scanned_and_other_paths_cannot_reuse_its_size_allowance(self):
+        content = 'x'*2048
+        self.commit_file('web/data/periods/2026Q3/progress.json', content)
+        oid = self.git('rev-parse', 'HEAD:web/data/periods/2026Q3/progress.json').encode()
+        with mock.patch.object(guard, 'MAX_CONTENT_BYTES', 1024), mock.patch.object(guard, 'MAX_PROGRESS_BYTES', 4096):
+            self.assertEqual(guard.scan(self.root)[1], [])
+            self.assertEqual(guard.scan_history(self.root), [])
+            self.commit_file('web/data/latest.json', content)
+            self.assertIn('unsupported_content', guard.scan(self.root)[1])
+            self.assertIn('unsupported_content', guard.scan_history(self.root, cached_blobs=frozenset({oid})))
+        self.commit_file('web/data/progress.json', 'gh'+'p_'+'z'*32)
+        self.assertIn('credential', guard.scan(self.root)[1])
+        self.assertIn('credential', guard.scan_history(self.root))
+
 if __name__ == '__main__':
     unittest.main()

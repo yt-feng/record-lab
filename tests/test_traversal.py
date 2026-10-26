@@ -433,6 +433,149 @@ class TraversalTests(unittest.TestCase):
         self.assertEqual(result["attemptedFunds"], 0)
         self.assertEqual(result["processedFunds"], 0)
 
+    def retry_fixture(self, error="NO_VALID_REPORTS", unmapped=False):
+        config = {"targetPeriodEnd": "2026-09-30", "baselinePeriodEnd": "2026-06-30",
+                  "collectorVersion": 2, "requireReportQuality": True,
+                  "retryPolicy": {"dailyUntil": "2026-11-30", "intervalDays": 7, "maxScheduledCycles": 4}}
+        owner = None if unmapped else "co1"
+        directory = {"schemaVersion": 1, "retrievedAt": "2026-10-26T06:00:00Z",
+                     "companies": [{"code": "co1", "name": "合成", "fundCount": 0 if unmapped else 1, "directoryStatus": "complete"}],
+                     "funds": [{"code": "000001", "name": "合成", "companyCode": owner}]}
+        previous = {"schemaVersion": 1, "phase": traversal.phase_for(config), "collectorVersion": 2,
+                    "directoryPasses": 1, "lastDirectoryObservedAt": directory["retrievedAt"],
+                    "funds": [{"code": "000001", "companyCode": owner, "status": "failed", "attempts": 2,
+                               "lastAttemptAt": "2026-10-26T06:00:00Z", "errorCode": error, "attempted": True}]}
+        return directory, previous, config
+
+    def test_missing_report_rechecks_next_day_without_empty_chain_or_lost_totals(self):
+        directory, previous, config = self.retry_fixture()
+        today = traversal.merge_progress(directory, previous, config, now="2026-10-26T07:00:00Z")
+        self.assertFalse(today["continueRun"])
+        self.assertEqual(today["nextRetryAt"], "2026-10-27T00:00:00+00:00")
+        self.assertEqual(today["funds"][0]["totalAttempts"], 2)
+        tomorrow = traversal.merge_progress(directory, today, config, now="2026-10-27T07:00:00Z")
+        self.assertTrue(tomorrow["continueRun"])
+        self.assertEqual(tomorrow["funds"][0]["attempts"], 0)
+        self.assertEqual(tomorrow["funds"][0]["totalAttempts"], 2)
+        self.assertEqual(tomorrow["funds"][0]["retry"]["cycleDate"], "2026-10-27")
+        failed = {"schemaVersion": 1, "phase": traversal.phase_for(config), "attemptedAt": "2026-10-27T08:00:00Z",
+                  "funds": [{"code": "000001", "companyCode": "co1", "status": "failed", "errorCode": "NO_VALID_REPORTS"}]}
+        result = traversal.merge_progress(directory, tomorrow, config, [failed], now="2026-10-27T09:00:00Z")
+        replay = traversal.merge_progress(directory, result, config, [failed], now="2026-10-27T09:00:00Z")
+        self.assertEqual((replay["funds"][0]["attempts"], replay["funds"][0]["totalAttempts"]), (1, 3))
+        failed["attemptedAt"] = "2026-10-27T10:00:00Z"
+        exhausted = traversal.merge_progress(directory, replay, config, [failed], now="2026-10-27T11:00:00Z")
+        self.assertFalse(exhausted["continueRun"])
+        self.assertEqual((exhausted["funds"][0]["attempts"], exhausted["funds"][0]["totalAttempts"]), (2, 4))
+        self.assertEqual(exhausted["nextRetryAt"], "2026-10-28T00:00:00+00:00")
+
+    def test_historical_quarter_uses_weekly_instead_of_daily_recheck(self):
+        directory, previous, config = self.retry_fixture(error="NETWORK_ERROR")
+        config.update({"targetPeriodEnd": "2026-06-30", "baselinePeriodEnd": "2026-03-31"})
+        config["retryPolicy"]["dailyUntil"] = None
+        previous["phase"] = traversal.phase_for(config)
+        waiting = traversal.merge_progress(directory, previous, config, now="2026-10-27T07:00:00Z")
+        self.assertFalse(waiting["continueRun"])
+        self.assertEqual(waiting["nextRetryAt"], "2026-11-02T00:00:00+00:00")
+
+    def test_weekly_recheck_has_four_cycles_and_daily_window_does_not_extend_forever(self):
+        directory, previous, config = self.retry_fixture()
+        previous["funds"][0]["lastAttemptAt"] = "2026-11-30T06:00:00Z"
+        after_window = traversal.merge_progress(directory, previous, config, now="2026-12-01T07:00:00Z")
+        self.assertFalse(after_window["continueRun"])
+        self.assertEqual(after_window["nextRetryAt"], "2026-12-07T00:00:00+00:00")
+        for day in (7, 14, 21, 28):
+            stamp = f"2026-12-{day:02d}T07:00:00Z"
+            opened = traversal.merge_progress(directory, after_window, config, now=stamp)
+            self.assertEqual(opened["funds"][0]["attempts"], 0)
+            self.assertTrue(opened["continueRun"])
+            opened["funds"][0].update({"attempts": 2, "lastAttemptAt": stamp})
+            after_window = traversal.merge_progress(directory, opened, config, now=stamp)
+        self.assertEqual(after_window["funds"][0]["retry"]["scheduledCycles"], 4)
+        self.assertIsNone(after_window["nextRetryAt"])
+        self.assertFalse(traversal.merge_progress(directory, after_window, config, now="2027-01-05T07:00:00Z")["continueRun"])
+
+    def test_unsupported_parser_does_not_reopen_on_schedule(self):
+        directory, previous, config = self.retry_fixture(error="PDF_PARSE_FAILED")
+        result = traversal.merge_progress(directory, previous, config, now="2026-10-27T07:00:00Z")
+        self.assertFalse(result["continueRun"])
+        self.assertIsNone(result["nextRetryAt"])
+        self.assertEqual(result["funds"][0]["attempts"], 2)
+
+    def test_unmapped_exhausted_directory_does_not_create_empty_chain(self):
+        directory, previous, config = self.retry_fixture(error="PDF_PARSE_FAILED", unmapped=True)
+        result = traversal.merge_progress(directory, previous, config, now="2026-10-26T07:00:00Z")
+        plan = traversal.plan_batches(directory, result, config, now="2026-10-26T07:00:00Z")
+        self.assertEqual(plan["matrix"], [])
+        self.assertFalse(plan["meta"]["continueRun"])
+        self.assertFalse(result["continueRun"])
+        self.assertEqual(result["completionStatus"], "incomplete-exhausted")
+        self.assertEqual(result["directoryNextRetryAt"], "2026-10-27T00:00:00+00:00")
+        self.assertEqual(result["directoryPasses"], 1)
+
+    def test_missing_pdf_quality_reopens_but_truncated_parser_does_not(self):
+        directory, previous, config = self.retry_fixture()
+        fund = previous["funds"][0]
+        fund.update({"status": "complete", "quality": {"attempts": 3, "lastAttemptAt": fund["lastAttemptAt"],
+                     "fields": {key: "missing" if key == "pdf" else "complete" for key in traversal.QUALITY_FIELDS}},
+                     "enrichment": self.coverage(2)})
+        opened = traversal.merge_progress(directory, previous, config, now="2026-10-27T07:00:00Z")
+        self.assertEqual(opened["funds"][0]["status"], "complete")
+        self.assertEqual(opened["funds"][0]["quality"]["attempts"], 0)
+        self.assertEqual(opened["funds"][0]["quality"]["totalAttempts"], 3)
+        fund["quality"]["fields"]["pdf"] = "truncated"
+        closed = traversal.merge_progress(directory, previous, config, now="2026-10-27T07:00:00Z")
+        self.assertEqual(closed["funds"][0]["quality"]["attempts"], 3)
+        self.assertFalse(closed["continueRun"])
+        self.assertIsNone(closed["nextRetryAt"])
+
+    def test_deferred_budget_receipt_preserves_unattempted_state_and_rechecks_tomorrow(self):
+        directory, _, config = self.retry_fixture()
+        batch = {**config, "funds": [{"code": "000001", "companyCode": "co1"}]}
+        raw = {"schemaVersion": 1, "sourceMode": "actions", "targetPeriodEnd": "2026-09-30", "funds": [],
+               "batchResults": [{"code": "000001", "status": "deferred-budget", "attempted": False, "errorCode": "BATCH_DEADLINE_REACHED"}]}
+        status = traversal.build_status(batch, raw, "2026-10-26T07:00:00Z")
+        self.assertTrue(traversal.valid_status(status, batch, "2026-10-26T07:00:00Z"))
+        receipt = {"schemaVersion": 1, "phase": traversal.phase_for(config), "generatedAt": "2026-10-26T07:00:00Z",
+                   "funds": [{**raw["batchResults"][0], "companyCode": "co1"}]}
+        reconciled = traversal.reconcile_observations([status], receipt, config, "2026-10-26T07:00:00Z")
+        today = traversal.merge_progress(directory, None, config, reconciled, now="2026-10-26T07:00:00Z")
+        self.assertEqual(today["funds"][0]["status"], "pending")
+        self.assertEqual(today["funds"][0]["attempts"], 0)
+        self.assertEqual(today["funds"][0]["totalAttempts"], 0)
+        self.assertEqual(today["attemptedFunds"], 0)
+        self.assertEqual(today["deferredFunds"], 1)
+        self.assertFalse(today["continueRun"])
+        tomorrow = traversal.merge_progress(directory, today, config, now="2026-10-27T07:00:00Z")
+        self.assertTrue(tomorrow["continueRun"])
+        self.assertEqual(tomorrow["deferredFunds"], 0)
+        bad = json.loads(json.dumps(status)); bad["funds"][0]["attempted"] = True
+        self.assertFalse(traversal.valid_status(bad, batch, "2026-10-26T07:00:00Z"))
+
+    def test_deferred_quality_keeps_available_holdings_and_both_attempt_counts(self):
+        directory, previous, config = self.retry_fixture()
+        prior = previous["funds"][0]
+        prior.update({"status": "complete", "totalAttempts": 6, "quality": {"attempts": 2, "totalAttempts": 5,
+                      "fields": {key: "missing" for key in traversal.QUALITY_FIELDS}, "lastAttemptAt": prior["lastAttemptAt"]}})
+        event = {"schemaVersion": 1, "phase": traversal.phase_for(config), "attemptedAt": "2026-10-26T07:00:00Z",
+                 "funds": [{"code": "000001", "companyCode": "co1", "status": "deferred-budget", "attempted": False,
+                            "errorCode": "BATCH_DEADLINE_REACHED", "qualityAttempt": True}]}
+        result = traversal.merge_progress(directory, previous, config, [event], now="2026-10-26T07:00:00Z")
+        fund = result["funds"][0]
+        self.assertEqual((fund["status"], fund["totalAttempts"]), ("complete", 6))
+        self.assertEqual((fund["quality"]["attempts"], fund["quality"]["totalAttempts"]), (2, 5))
+        self.assertEqual(result["deferredFunds"], 1)
+        self.assertFalse(result["continueRun"])
+
+    def test_status_preserves_definite_parser_failure_over_missing_report_wrapper(self):
+        _, _, config = self.retry_fixture()
+        batch = {**config, "funds": [{"code": "000001", "companyCode": "co1"}]}
+        snapshot = {"schemaVersion": 1, "sourceMode": "actions", "funds": [],
+                    "batchResults": [{"code": "000001", "status": "failed", "errorCode": "NO_VALID_REPORTS"}],
+                    "errors": [{"code": "000001", "stage": "report", "errorCode": "PDF_PARSE_FAILED"}]}
+        status = traversal.build_status(batch, snapshot, "2026-10-26T07:00:00Z")
+        self.assertEqual(status["funds"][0]["errorCode"], "PDF_PARSE_FAILED")
+
     def test_bond_type_does_not_establish_no_equities(self):
         record = event(code="000003", status="no-equities", company="co2")
         record["funds"][0]["reportEvidence"] = evidence()

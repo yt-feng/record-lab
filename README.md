@@ -12,7 +12,13 @@ The quarter collection workflow processes bounded batches with independent check
 
 Each run records its own information cutoff and collection timestamp. Current manager profiles are labeled as such; report-specific manager attribution requires report or tenure evidence. Quarterly disclosure entrants and exits do not prove purchases or sales. Stock high/low intervals are a reference range, not the portfolio's actual acquisition cost.
 
-Holdings collection and research completeness are separate counts. Research coverage checks PDF text, quarter-specific strategy, NAV, the exact comparison quarter, and price coverage. Missing fields remain visible and enter a bounded repair queue. Exhausted retries mean an incomplete result, even if the workflow itself succeeds. All product codes are attempted, including products whose company mapping is not yet resolved.
+When an individual company directory refresh fails, its previously verified ownership remains explicitly cached with the original verification date. The fresh master-directory date does not imply that cached company ownership was rechecked; historical product codes remain available and unmapped products can still be collected by code.
+
+Holdings collection and research completeness are separate counts. Research coverage checks the disclosed holdings table, PDF text, quarter-specific strategy, NAV, the exact comparison quarter, and price coverage. Missing fields remain visible and enter a bounded repair queue. Exhausted retries mean an incomplete result, even if the workflow itself succeeds. All product codes are attempted, including products whose company mapping is not yet resolved.
+
+A product that did not start before a batch's time budget ended is deferred, preserving its prior state and attempt count. It is not a new collection failure. The display separates these deferrals from attempted requests that did not produce valid observations; deferrals can overlap a product's existing pending or failed state. Workflows continue immediately only while work is currently eligible. `nextRetryAt` records the earliest later check, so a finished daily wave can remain incomplete and await a later scheduled run.
+
+The configured Q3 follow-up window ends on **30 November 2026**. This is an operational collection window, not a statutory report-disclosure deadline. Reaching it does not convert missing data into a complete result.
 
 Products with an explicitly sourced inception date after the target quarter are shown separately as not applicable. They do not count as holdings, no-equity observations, or completed research; the research denominator excludes only these proven exemptions.
 

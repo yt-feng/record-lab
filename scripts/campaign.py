@@ -32,6 +32,8 @@ def quarter_config(base, quarter, as_of):
     return {**base, 'funds': [], 'quarter': quarter, 'asOf': as_of,
             'targetPeriodEnd': target, 'baselinePeriodEnd': baseline,
             'collectorVersion': 2, 'requireReportQuality': True,
+            'retryPolicy': {'dailyUntil': '2026-11-30' if quarter == '2026Q3' else None,
+                            'intervalDays': 7, 'maxScheduledCycles': 4},
             'scope': f'{quarter} 全目录产品与报告逐项补齐'}
 
 
@@ -61,7 +63,10 @@ def refresh_directory(root, as_of):
         subprocess.run([sys.executable, 'scripts/discover.py', '--output', str(root / 'catalog.json'),
                         '--state', 'raw/catalog-state.json', '--as-of', as_of,
                         '--allow-partial', '--max-companies', '250'], check=True)
-        return {'status': 'refreshed', 'asOf': as_of}
+        refreshed = read_json(root / 'catalog.json')
+        return {'status': 'refreshed' if refreshed.get('coverage', {}).get('directoryComplete') else 'partial',
+                'asOf': refreshed.get('asOf'),
+                'staleCompanyCount': refreshed.get('coverage', {}).get('staleCompanyCount', 0)}
     except subprocess.CalledProcessError:
         # Discovery's regression gate preserves the old complete directory. A
         # failed refresh must not prevent known products' reports being read.

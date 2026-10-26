@@ -225,6 +225,25 @@ class CheckpointTests(unittest.TestCase):
         fund, errors = collect_fund({"code": "000001"}, "2026-09-29", provider=NeverRequest(), deadline=time.monotonic() - 1)
         self.assertEqual(fund["reports"], [])
         self.assertEqual(errors[0]["errorCode"], "BATCH_DEADLINE_REACHED")
+        self.assertEqual(fund["collectionAttempt"], {"attempted": False, "status": "deferred-budget", "errorCode": "BATCH_DEADLINE_REACHED"})
+
+    def test_queued_budget_expiry_keeps_attempted_and_unstarted_products_separate(self):
+        clock, calls = [0], []
+        class Source:
+            def overview(self, code):
+                calls.append(code)
+                clock[0] = 2
+                raise DataError("TIMEOUT")
+        config = {"funds": [{"code": "000001"}, {"code": "000002"}],
+                  "maxWorkers": 1, "maxBatchSeconds": 1, "maxPriceSymbols": 0}
+        with patch("collect.time.monotonic", side_effect=lambda: clock[0]), patch("collect.PublicProvider", Source):
+            result = collect(config, "2026-09-29")
+        self.assertEqual(calls, ["000001"])
+        self.assertTrue(result["funds"][0]["collectionAttempt"]["attempted"])
+        self.assertFalse(result["funds"][1]["collectionAttempt"]["attempted"])
+        self.assertEqual(result["coverage"]["attemptedFundRequests"], 1)
+        self.assertEqual(result["coverage"]["deferredFundRequests"], 1)
+        self.assertIn({"code": "000001", "stage": "metadata", "errorCode": "TIMEOUT"}, result["errors"])
 
     def test_q2_prices_do_not_require_q1_holdings(self):
         calls = []

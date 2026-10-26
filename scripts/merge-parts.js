@@ -239,11 +239,15 @@ function finalObservation(fund) {
     shareClassCodes: fund.sourcePortfolioCode && publicUrl(fund.portfolioSourceUrl) ? fund.shareClassCodes : [fund.code] };
 }
 
-function mergeReceipt(funds, codes, config, now) {
+function mergeReceipt(funds, codes, config, now, attempts = new Map()) {
   const observations = new Map();
   for (const fund of funds) {
     const item = finalObservation(fund);
     for (const code of item.shareClassCodes) if (codes.has(code)) observations.set(code, { code, ...item });
+  }
+  for (const [code, attempt] of attempts) {
+    if (attempt.attempted === false) observations.set(code, { code, ...attempt });
+    else if (observations.has(code)) observations.get(code).attempted = true;
   }
   return { schemaVersion: 1, phase: { targetPeriodEnd: config.targetPeriodEnd, baselinePeriodEnd: config.baselinePeriodEnd },
     generatedAt: now.toISOString(), requestedCodes: [...codes].sort(), funds: [...observations.values()].sort((a, b) => a.code.localeCompare(b.code)) };
@@ -261,8 +265,21 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
   const errors = [];
   const addError = code => errors.push(fixedErrors.has(code) ? code : 'INVALID_FUND');
   const requestedCodes = new Set(receiptCodes.filter(code => typeof code === 'string' && CODE.test(code)));
+  const attempts = new Map();
   for (const snapshot of snapshots) {
     for (const item of [...(snapshot?.batchResults || []), ...(snapshot?.funds || [])]) if (CODE.test(item?.code || '')) requestedCodes.add(item.code);
+    if (!validEnvelope(snapshot, currentTime, config)) continue;
+    const freshCodes = new Set(snapshot.funds.filter(item => item?.dataStatus === 'fresh').map(item => item.code));
+    for (const item of snapshot.batchResults || []) {
+      if (!CODE.test(item?.code || '') || !directoryMap.has(item.code)) continue;
+      const deferred = item.status === 'deferred-budget' && item.attempted === false
+        && item.errorCode === 'BATCH_DEADLINE_REACHED' && !freshCodes.has(item.code);
+      if (deferred && attempts.get(item.code)?.attempted !== true) {
+        attempts.set(item.code, { status: 'deferred-budget', attempted: false, errorCode: 'BATCH_DEADLINE_REACHED',
+          companyCode: directoryMap.get(item.code).companyId || 'unknown' });
+      } else if (!deferred) attempts.set(item.code, { attempted: true });
+    }
+    for (const code of freshCodes) attempts.set(code, { attempted: true });
   }
   let migratedBootstrapFundCount = 0;
   const hasBootstrap = previousManifest && Array.isArray(previousManifest.funds) && previousManifest.funds.length
@@ -315,7 +332,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
     }
   }
   const funds = deduplicatePortfolios([...byCode.values()], addError);
-  const receipt = mergeReceipt(funds, requestedCodes, config, currentTime);
+  const receipt = mergeReceipt(funds, requestedCodes, config, currentTime, attempts);
   // No new observation means no fabricated new timestamp or overwritten old files.
   const needsRepartition = Object.values(previousCompanies).some(item => item.funds?.length > (pageLimits?.maxFunds || MAX_COMPANY_FUNDS)
     || Buffer.byteLength(JSON.stringify(item)) + 1 > (pageLimits?.maxBytes || MAX_COMPANY_BYTES));

@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import re
 
-from publication_guard import inspect_content
+from publication_guard import inspect_content, content_limit
 
 COMPANY_PATH = re.compile(r'^\./data/companies/([A-Za-z0-9_-]{1,64})\.json$')
 
@@ -21,7 +21,7 @@ def prepare(source='web', output='.cache/site', max_bytes=900_000_000):
         relative = file.relative_to(root)
         if file.suffix not in {'.json', '.js', '.css', '.html'}: raise ValueError('SITE_FILE_TYPE')
         raw = file.read_bytes()
-        if inspect_content(raw): raise ValueError('SITE_PUBLICATION_REJECTED')
+        if inspect_content(raw, content_limit('web/' + relative.as_posix())): raise ValueError('SITE_PUBLICATION_REJECTED')
         destination = target / relative
         if file.name == 'latest.json':
             body = json.loads(raw)
