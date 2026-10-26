@@ -1,0 +1,61 @@
+name: Verify bounded price source census
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: verify-price-source-census
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/*/
+            /scripts/
+            /lib/
+            /config/
+            /web/*.js
+            /tests/
+            /.github/
+      - uses: actions/checkout@v4
+        with:
+          ref: '383e7996dcbe4b6a8ff4535c8f3dc8292abb3bda'
+          path: .cache/price-census-source
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /web/data/periods/2026Q3/latest.json
+            /web/data/periods/2026Q3/companies/
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Validate bounded source and fixed proof contracts
+        run: |
+          node --test tests/test_price_source_census.js
+          python -m unittest discover -s tests -p 'test_verify_price_source_census.py'
+      - name: Restore original proof and census current immutable sources
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/verify_price_source_census.py --data-repo .cache/price-census-source --output .cache/price-source-census
+      - name: Retain source-bound diagnostic candidate
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: price-source-census-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .cache/price-source-census/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
