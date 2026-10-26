@@ -202,6 +202,8 @@ class Workbook:
                           for node in group if local(node.tag) == 'numFmt'}
                 formats = [custom.get(node.get('numFmtId')) for group in root if local(group.tag) == 'cellXfs'
                            for node in group if local(node.tag) == 'xf']
+                self.number_format_ids = [node.get('numFmtId') for group in root if local(group.tag) == 'cellXfs'
+                                          for node in group if local(node.tag) == 'xf']
                 if any(value is not None and len(value) > 512 for value in formats):
                     raise VerificationError('XML_LIMIT')
         return shared, formats
@@ -238,6 +240,7 @@ class Workbook:
             raise VerificationError('UNSUPPORTED_SCHEMA')
         number_format = formats[int(style)] if style is not None else None
         return {'reference': reference, 'column': match[1], 'type': kind, 'rawValue': raw, 'value': value,
+                'numberFormatId': self.number_format_ids[int(style)] if style is not None else None,
                 'numberFormat': number_format, 'hasFormula': any(local(node.tag) == 'f' for node in cell)}
 
 

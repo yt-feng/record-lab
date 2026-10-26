@@ -128,6 +128,17 @@ class HistoricalUniverseTests(unittest.TestCase):
             cell = {'type': 'n', 'hasFormula': False, 'numberFormat': 'yyyy/m/d;@', 'rawValue': serial}
             self.assertEqual(history.excel_1900_date(cell), expected)
 
+    def test_builtin_or_missing_number_formats_remain_inspectable_without_dropping_codes(self):
+        for replacement in ['<c r="D4">', '<c r="D4" s="0">']:
+            data = files([product(3, '000001'), product(4, '018774').replace('<c r="D4" s="2">', replacement)])
+            result = parse(workbook(data))
+            self.assertEqual(len(result['records']), 2)
+            self.assertEqual(result['parseStatus'], 'partial')
+            diagnostic = result['diagnostics']['unresolvedInceptionSamples'][0]
+            self.assertIsNone(diagnostic['numberFormat'])
+            self.assertEqual(diagnostic['rawValue'], '45118')
+            self.assertIsNotNone(history.summary_for(result))
+
     def test_all_duplicate_code_rows_are_quarantined_with_unique_output_records(self):
         result = parse(workbook(files([product(3, '018774'), product(4, '018774', '冲突名称')])))
         self.assertEqual(result['parseStatus'], 'partial')

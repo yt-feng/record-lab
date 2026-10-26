@@ -174,7 +174,8 @@ def parse_official_index(data, *, retrieved_at):
             else:
                 date_issues.append({'row': number, 'code': code, 'reason': 'FOUNDATION_DATE_UNRESOLVED',
                     'type': date_cell['type'], 'hasFormula': date_cell['hasFormula'],
-                    'numberFormat': date_cell['numberFormat'][:80], 'rawValue': date_cell['rawValue'][:80],
+                    'numberFormat': date_cell['numberFormat'][:80] if date_cell['numberFormat'] is not None else None,
+                    'numberFormatId': date_cell.get('numberFormatId'), 'rawValue': date_cell['rawValue'][:80],
                     'cachedValue': date_cell['value'][:80]})
             candidates.append(record)
         for numbers in duplicates.values():
@@ -203,7 +204,7 @@ def parse_official_index(data, *, retrieved_at):
                        'cachedFormulaNameRows': name_cache_count, 'rejectionReasons': dict(sorted(reason_counts.items())),
                        'productRowsComplete': product_rows_complete, 'inceptionMetadataComplete': not date_issues,
                        'unresolvedInceptionRows': len(date_issues), 'unresolvedInceptionSamples': date_issues[:20],
-                       'inceptionFormatIssues': dict(Counter(json.dumps({key: issue[key] for key in ('type', 'hasFormula', 'numberFormat')},
+                       'inceptionFormatIssues': dict(Counter(json.dumps({key: issue[key] for key in ('type', 'hasFormula', 'numberFormat', 'numberFormatId')},
                             sort_keys=True) for issue in date_issues)),
                        'rejectedRowSamples': sorted(rejected, key=lambda row: row['row'])[:20],
                        'omittedRejectedRowSamples': max(0, len(rejected) - 20),
