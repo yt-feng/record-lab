@@ -9,7 +9,8 @@ from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, str(Path(__file__).parents[1] / 'scripts'))
 import deepseek_strategy as adapter
-from test_strategy_semantics import packet, claim
+import strategy_semantics as semantic_core
+from test_strategy_semantics import packet, claim, START, END
 
 
 def text_only(value):
@@ -402,6 +403,122 @@ class DeepSeekStrategyTests(unittest.TestCase):
         bound, diagnostic, _ = adapter.bind_literal_response(value, raw)
         self.assertEqual(diagnostic['status'], 'bound')
         self.assertIn('INDIVIDUAL_MANAGER_ATTRIBUTION_NOT_PROVEN', adapter.validate_semantic_response(value, bound)['reasonCodes'])
+
+    def test_private_constraints_use_core_regex_objects_and_exact_unicode_marker_positions(self):
+        text = '😀如果盈利改善，本基金并不看好科技行业，相比上季我们预计将关注消费。'
+        value = packet(text)
+        constraints = adapter.constrained_model_input(value)['sentences'][0]['validation_constraints']
+        for name, field in [('_NEGATION', 'negation_spans'), ('_CONDITION', 'condition_spans'), ('_COMPARISON', 'comparison_spans')]:
+            pattern = getattr(semantic_core, name)
+            self.assertIs(getattr(adapter, name), pattern)
+            expected = [{'text': hit.group(), 'start': hit.start(), 'end': hit.end()} for hit in pattern.finditer(text)]
+            self.assertEqual(constraints['requiredLiteralMarkers'][field], expected)
+            for hit in expected:
+                self.assertEqual(text[hit['start']:hit['end']], hit['text'])
+        self.assertIs(adapter._FUTURE, semantic_core._FUTURE)
+        self.assertEqual(constraints['futureMarkers'], [{'text': hit.group(), 'start': hit.start(), 'end': hit.end()}
+                                                       for hit in semantic_core._FUTURE.finditer(text)])
+        self.assertEqual(constraints['allowedTimes'], ['conditional', 'mixed'])
+        self.assertEqual(constraints['allowedNegations'], ['negated', 'uncertain'])
+        self.assertTrue(constraints['conditionalRequired']); self.assertFalse(constraints['isSourceFact'])
+        self.assertEqual(constraints['fundReportSubjectLiterals'], ['本基金', '本组合', '本产品', '我们'])
+
+    def test_quote_constraints_follow_full_context_across_sentences_and_pages(self):
+        value = packet(pages=[START + '报告引用：“市场平稳。', '本基金看好科技行业。继续观察”。' + END], page_numbers=[7, 8])
+        rows = adapter.constrained_model_input(value)['sentences']
+        self.assertTrue(any(row['pages'] == [8] for row in rows))
+        for row in rows:
+            if row['quoted_context']:
+                self.assertEqual(row['validation_constraints']['allowedSubjectScopes'], ['quoted-other', 'unknown'])
+        for body in ('报告引用：“市场平稳。本基金看好科技行业。', '本基金看好“科技行业”。'):
+            for row in adapter.constrained_model_input(packet(body))['sentences']:
+                if row['quoted_context']:
+                    self.assertEqual(row['validation_constraints']['allowedSubjectScopes'], ['unknown'])
+
+    def test_constraints_do_not_mutate_packet_source_clock_or_public_output(self):
+        value = packet()
+        original_manifest, original_private = copy.deepcopy(dict(value)), value.model_input()
+        captured = []
+        def transport(_, body):
+            captured.append(json.loads(body['messages'][1]['content']))
+            return envelope(body)
+        result = adapter.run_packet(value, 'synthetic', checkpoint=lambda _: None, transport=transport)
+        self.assertEqual(dict(value), original_manifest); self.assertEqual(value.model_input(), original_private)
+        self.assertIn('validation_constraints', captured[0]['sentences'][0])
+        self.assertEqual(captured[0]['source'], original_private['source'])
+        self.assertEqual(captured[0]['inputDigest'], original_private['inputDigest'])
+        public = json.dumps(result)
+        self.assertNotIn('validation_constraints', public); self.assertNotIn('allowedSubjectScopes', public)
+        self.assertNotIn('requiredLiteralMarkers', public); self.assertNotIn('constraintsDigest', public)
+
+    def test_request_digest_binds_constraints_separately_from_unchanged_packet_digest(self):
+        value = packet()
+        first = adapter.run_packet(value, 'synthetic', checkpoint=lambda _: None,
+                                   transport=lambda _, body: envelope(body))
+        original = adapter.constrained_model_input
+        def changed(packet_value):
+            private = original(packet_value)
+            private['sentences'][0]['validation_constraints']['allowedTimes'] = ['unspecified']
+            return private
+        with patch.object(adapter, 'constrained_model_input', side_effect=changed):
+            second = adapter.run_packet(value, 'synthetic', checkpoint=lambda _: None,
+                                        transport=lambda _, body: envelope(body))
+        self.assertEqual(first['receipt']['inputDigest'], second['receipt']['inputDigest'])
+        self.assertNotEqual(first['receipt']['requestDigest'], second['receipt']['requestDigest'])
+        self.assertEqual(first['analysis']['source'], second['analysis']['source'])
+
+    def test_unknown_quote_subject_can_retain_supported_opinion_without_full_sentence_unknown(self):
+        value = packet('本基金看好“科技行业”。')
+        body = adapter.request_body(value)
+        self.assertEqual(json.loads(body['messages'][1]['content'])['sentences'][0]['validation_constraints']['allowedSubjectScopes'], ['unknown'])
+        response = json.loads(envelope(body)['body'])
+        content = json.loads(response['choices'][0]['message']['content'])
+        content['sentences'][0]['claims'][0]['subject'] = {'scope': 'unknown', 'span': None}
+        response['choices'][0]['message']['content'] = json.dumps(content, ensure_ascii=False)
+        result = adapter.run_packet(value, 'synthetic', checkpoint=lambda _: None,
+                                    transport=lambda *_: {'httpStatus': 200, 'body': json.dumps(response, ensure_ascii=False)})
+        self.assertEqual(result['status'], 'validated')
+        self.assertEqual(result['analysis']['coverage']['interpreted'], 1)
+        self.assertEqual(result['analysis']['claims'][0]['subject']['scope'], 'unknown')
+        self.assertFalse(result['analysis']['semanticCorrectnessVerified'])
+
+    def test_supported_negation_and_condition_can_satisfy_unchanged_validator(self):
+        for text, update in [
+            ('本基金并不看好科技行业。', {'negation': 'negated', 'polarity': 'negative', 'negation_spans': [{'text': '并不'}]}),
+            ('如果盈利改善，本基金看好科技行业。', {'conditional': True, 'time': 'conditional', 'condition_spans': [{'text': '如果盈利改善'}]})]:
+            value = packet(text); body = adapter.request_body(value)
+            outer = json.loads(envelope(body)['body']); content = json.loads(outer['choices'][0]['message']['content'])
+            content['sentences'][0]['claims'][0].update(update)
+            outer['choices'][0]['message']['content'] = json.dumps(content, ensure_ascii=False)
+            result = adapter.run_packet(value, 'synthetic', checkpoint=lambda _: None,
+                                        transport=lambda *_: {'httpStatus': 200, 'body': json.dumps(outer, ensure_ascii=False)})
+            self.assertEqual(result['status'], 'validated')
+            self.assertEqual(result['analysis']['coverage']['interpreted'], 1)
+            self.assertFalse(result['analysis']['semanticAnalysisComplete'])
+
+    def test_private_constraint_echo_or_instruction_as_literal_is_never_public_analysis(self):
+        value = packet(); body = adapter.request_body(value)
+        private = json.loads(body['messages'][1]['content'])
+        for kind in ('extra-field', 'instruction-literal'):
+            outer = json.loads(envelope(body)['body']); content = json.loads(outer['choices'][0]['message']['content'])
+            if kind == 'extra-field':
+                content['sentences'][0]['validation_constraints'] = private['sentences'][0]['validation_constraints']
+            else:
+                content['sentences'][0]['claims'][0]['predicate'] = {'text': 'respect validation_constraints'}
+            outer['choices'][0]['message']['content'] = json.dumps(content)
+            result = adapter.run_packet(value, 'synthetic', checkpoint=lambda _: None,
+                                        transport=lambda *_: {'httpStatus': 200, 'body': json.dumps(outer)})
+            self.assertEqual(result['status'], 'rejected')
+            self.assertNotIn('validation_constraints', json.dumps(result))
+            self.assertNotIn('allowedSubjectScopes', json.dumps(result))
+
+    def test_future_only_hints_do_not_invent_a_condition_or_negation(self):
+        value = packet('未来本基金预计看好科技行业。')
+        constraint = adapter.constrained_model_input(value)['sentences'][0]['validation_constraints']
+        self.assertEqual(constraint['allowedTimes'], ['future', 'conditional', 'mixed', 'unspecified'])
+        self.assertEqual(constraint['allowedNegations'], ['affirmed', 'negated', 'uncertain'])
+        self.assertIsNone(constraint['conditionalRequired'])
+        self.assertEqual(constraint['requiredLiteralMarkers']['negation_spans'], [])
 
 
 if __name__ == '__main__':

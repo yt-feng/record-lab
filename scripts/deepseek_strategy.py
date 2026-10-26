@@ -17,13 +17,15 @@ import re
 import requests
 
 from strategy_semantics import (PrivateSemanticPacket, semantic_response_schema, validate_semantic_response,
-                                MAX_RESPONSE_BYTES as MAX_SEMANTIC_RESPONSE_BYTES, REASONS)
+                                MAX_RESPONSE_BYTES as MAX_SEMANTIC_RESPONSE_BYTES, REASONS,
+                                _CONDITION, _NEGATION, _COMPARISON, _FUTURE)
 
 ENDPOINT = 'https://api.deepseek.com/chat/completions'
 MODEL = 'deepseek-flash'
-PROMPT_VERSION = 'source-bound-deepseek-v3'
+PROMPT_VERSION = 'source-bound-deepseek-v4'
 BINDING_METHOD = 'unique-exact-sentence-span-v1'
 MODEL_SPAN_FORMAT = 'text-only-v1'
+CONSTRAINT_METHOD = 'core-validator-derived-constraints-v1'
 MAX_INPUT_BYTES = 160_000
 MAX_RESPONSE_BYTES = 600_000
 MAX_OUTPUT_TOKENS = 12_000
@@ -44,6 +46,17 @@ verbatim fragment with enough context only if it preserves the field's actual se
 all spans with the whole sentence. A fund-report subject must remain exactly 本基金, 本组合, 本产品 or 我们.
 The adapter never expands or repairs a span. If a required literal still cannot be cited uniquely,
 leave that sentence unknown; never guess a location.
+Each input sentence includes private validation_constraints derived from the existing conservative
+validator, not facts or judgments from the report. Respect its allowed subject scopes, times and negations.
+If quoted_context is nonempty, subject.scope may only be quoted-other or unknown. If any quoted range
+is unclosed or has unknown attribution, subject.scope must be unknown. This is a conservative citation
+constraint and does not establish that the report author did or did not hold the quoted view.
+If subject.scope is unknown you may still retain a supported opinion, object, predicate and time;
+use subject.span null where its speaker is unproven. Do not turn every constrained sentence into unknown.
+Cover every required literal marker with the corresponding context span. A unique verbatim span may
+cover several marker occurrences. Marker positions are input-only; output spans remain text-only.
+When conditionalRequired is true, conditional must be true and time must be conditional or mixed.
+When negation is negated, supply its literal evidence and do not set positive polarity.
 Distinguish themes, opinions, past operations and future intentions. Preserve negation, comparisons,
 conditions, quoted or relayed speakers and uncertainty. A fund report is not a verified individual
 manager utterance. Do not infer a security trade from a holding or a theme. Do not infer a trade reason.
@@ -76,11 +89,55 @@ def model_response_schema(packet):
     return transform(semantic_response_schema(packet))
 
 
+def constrained_model_input(packet):
+    """Derive private validation hints from the same regex objects and schema.
+
+    The packet/source remain unchanged. These hints describe acceptance rules,
+    not the report author's intended meaning or a public analytical finding.
+    """
+    private = packet.model_input()
+    properties = semantic_response_schema(packet)['properties']['sentences']['items']['properties']['claims']['items']['properties']
+    scopes = properties['subject']['properties']['scope']['enum']
+    times = properties['time']['enum']
+    negations = properties['negation']['enum']
+    for row in private['sentences']:
+        def matches(pattern):
+            return [{'text': match.group(), 'start': match.start(), 'end': match.end()}
+                    for match in pattern.finditer(row['text'])]
+        required = {'negation_spans': matches(_NEGATION), 'condition_spans': matches(_CONDITION),
+                    'comparison_spans': matches(_COMPARISON)}
+        future = matches(_FUTURE)
+        allowed_scopes = list(scopes)
+        if row['quoted_context']:
+            allowed_scopes = [value for value in allowed_scopes if value in ('quoted-other', 'unknown')]
+        if any(not value['closed'] or value['attribution'] == 'unknown' for value in row['quoted_context']):
+            allowed_scopes = ['unknown']
+        allowed_times = list(times)
+        if required['condition_spans']:
+            allowed_times = [value for value in allowed_times if value in ('conditional', 'mixed')]
+        if future:
+            allowed_times = [value for value in allowed_times if value in ('future', 'conditional', 'mixed', 'unspecified')]
+        row['validation_constraints'] = {
+            'schemaVersion': 1, 'method': CONSTRAINT_METHOD, 'isSourceFact': False,
+            'allowedSubjectScopes': allowed_scopes, 'allowedTimes': allowed_times,
+            'allowedNegations': [value for value in negations if not required['negation_spans'] or value != 'affirmed'],
+            'conditionalRequired': True if required['condition_spans'] else None,
+            'fundReportSubjectLiterals': ['本基金', '本组合', '本产品', '我们'],
+            'requiredLiteralMarkers': required, 'futureMarkers': future,
+            'negatedPolarityCannotBePositive': True}
+    return private
+
+
+def constraints_digest(private):
+    return hashlib.sha256(canonical([{'sentence_id': row['sentence_id'],
+        'validation_constraints': row['validation_constraints']} for row in private['sentences']]).encode('utf-8')).hexdigest()
+
+
 def request_body(packet):
     if (not isinstance(packet, PrivateSemanticPacket) or not packet.get('sourceSectionComplete')
             or not 0 < packet.get('sentenceCount', 0) <= 128):
         raise ValueError('SEMANTIC_PACKET_NOT_READY')
-    private = packet.model_input()
+    private = constrained_model_input(packet)
     if len(private['section_text']) > 16_000:
         raise ValueError('SEMANTIC_INPUT_LIMIT')
     # One-row format illustration uses real binding IDs, no invented report
@@ -363,6 +420,7 @@ def run_packet(packet, credential, *, checkpoint, transport=http_transport):
     digest = hashlib.sha256(canonical({'provider': 'deepseek', 'model': MODEL,
         'promptVersion': PROMPT_VERSION, 'inputDigest': packet['inputDigest'],
         'instructionDigest': hashlib.sha256(body['messages'][0]['content'].encode()).hexdigest(),
+        'constraintsDigest': constraints_digest(_json(body['messages'][1]['content'])),
         'modelSpanFormat': MODEL_SPAN_FORMAT, 'bindingMethod': BINDING_METHOD,
         'thinking': 'disabled', 'maxOutputTokens': MAX_OUTPUT_TOKENS}).encode()).hexdigest()
     receipt = {'schemaVersion': 1, 'requestDigest': digest, 'inputDigest': packet['inputDigest'],
