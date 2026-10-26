@@ -139,6 +139,20 @@ class HistoricalUniverseTests(unittest.TestCase):
             self.assertEqual(diagnostic['rawValue'], '45118')
             self.assertIsNotNone(history.summary_for(result))
 
+    def test_observed_builtin_14_date_format_is_explicitly_supported(self):
+        entries = files()
+        entries['xl/styles.xml'] = entries['xl/styles.xml'].replace('<xf numFmtId="165"/>', '<xf numFmtId="14"/>')
+        result = parse(workbook(entries))
+        self.assertEqual(result['parseStatus'], 'complete')
+        self.assertEqual(result['diagnostics']['unresolvedInceptionRows'], 0)
+        self.assertEqual(result['records'][1]['inceptionDate'], '2023-07-11')
+        self.assertEqual(result['records'][1]['inceptionEvidence']['numberFormatId'], '14')
+        # A custom numeric format that shadows an ID is not that built-in date.
+        entries['xl/styles.xml'] = entries['xl/styles.xml'].replace('<numFmts>', '<numFmts><numFmt numFmtId="14" formatCode="0.00"/>')
+        result = parse(workbook(entries))
+        self.assertEqual(result['parseStatus'], 'partial')
+        self.assertNotIn('inceptionDate', result['records'][1])
+
     def test_all_duplicate_code_rows_are_quarantined_with_unique_output_records(self):
         result = parse(workbook(files([product(3, '018774'), product(4, '018774', '冲突名称')])))
         self.assertEqual(result['parseStatus'], 'partial')

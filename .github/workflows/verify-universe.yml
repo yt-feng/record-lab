@@ -18,6 +18,7 @@ jobs:
           sparse-checkout: |
             /scripts/verify_universe.py
             /scripts/historical_universe.py
+            /scripts/source_dates.py
             /scripts/publication_guard.py
             /scripts/publication_cache.py
             /tests/test_verify_universe.py

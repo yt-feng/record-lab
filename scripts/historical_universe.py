@@ -10,12 +10,13 @@ from pathlib import Path
 import re
 
 from publication_guard import inspect_content
+from source_dates import china_date
 from verify_universe import Workbook, VerificationError, SOURCE_URL, SOURCE_AS_OF, TARGET_CODES, download_official, local
 
 SOURCE_HASH = '0f6ac234b792bb6334c0c94ec37fa6c0548363c80017c946d11a5c7e95d3a9e0'
 EXPECTED_PRODUCTS = 14170
 SOURCE_ID = 'csrc-fund-products-20260630'
-PARSER_VERSION = 'csrc-20260630-abcd-v2'
+PARSER_VERSION = 'csrc-20260630-abcd-v3'
 SHEET = 'Sheet1'
 OUTPUT = Path('.cache/universe-verification/result.json')
 ERRORS = {'ACTIONS_REQUIRED', 'SOURCE_HASH_MISMATCH', 'INVALID_OBSERVATION_TIME', 'HISTORICAL_SCHEMA_MISMATCH',
@@ -32,7 +33,7 @@ def observation_time(value):
     try:
         observed = dt.datetime.fromisoformat(value.replace('Z', '+00:00')) if isinstance(value, str) else value
         if (not isinstance(observed, dt.datetime) or observed.tzinfo is None
-                or observed.astimezone(dt.timezone.utc).date() < dt.date.fromisoformat(SOURCE_AS_OF)
+                or china_date(observed) < dt.date.fromisoformat(SOURCE_AS_OF)
                 or observed > dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)):
             raise ValueError
         return observed.astimezone(dt.timezone.utc).isoformat()
@@ -40,8 +41,14 @@ def observation_time(value):
         raise HistoricalUniverseError('INVALID_OBSERVATION_TIME') from None
 
 
+def known_date_format(cell):
+    # The real pinned workbook uses both the explicit custom date format and
+    # SpreadsheetML's built-in date format 14. No General-format inference.
+    return cell['numberFormat'] == 'yyyy/m/d;@' or (cell['numberFormat'] is None and cell.get('numberFormatId') == '14')
+
+
 def excel_1900_date(cell):
-    if (cell['type'] != 'n' or cell['hasFormula'] or cell['numberFormat'] != 'yyyy/m/d;@'
+    if (cell['type'] != 'n' or cell['hasFormula'] or not known_date_format(cell)
             or not re.fullmatch(r'[1-9][0-9]{0,5}', cell['rawValue'])):
         return None
     serial = int(cell['rawValue'])
@@ -156,7 +163,7 @@ def parse_official_index(data, *, retrieved_at):
             # product code/name from the dated official index. A demonstrably
             # later founding date is a period contradiction, not an unknown.
             if (date is None and date_cell['type'] == 'n' and not date_cell['hasFormula']
-                    and date_cell['numberFormat'] == 'yyyy/m/d;@'
+                    and known_date_format(date_cell)
                     and re.fullmatch(r'[1-9][0-9]{0,5}', date_cell['rawValue'])
                     and int(date_cell['rawValue']) > (dt.date.fromisoformat(SOURCE_AS_OF) - dt.date(1899, 12, 30)).days):
                 reasons.append('FOUNDATION_AFTER_INDEX_DATE')
@@ -170,7 +177,8 @@ def parse_official_index(data, *, retrieved_at):
             if date is not None:
                 record.update(inceptionDate=date, inceptionSourceUrl=SOURCE_URL,
                     inceptionEvidence={'sourceId': SOURCE_ID, 'sheet': SHEET, 'row': number, 'column': 'D',
-                                       'rawSerial': date_cell['rawValue'], 'numberFormat': date_cell['numberFormat'], 'dateSystem': '1900'})
+                                       'rawSerial': date_cell['rawValue'], 'numberFormat': date_cell['numberFormat'],
+                                       'numberFormatId': date_cell.get('numberFormatId'), 'dateSystem': '1900'})
             else:
                 date_issues.append({'row': number, 'code': code, 'reason': 'FOUNDATION_DATE_UNRESOLVED',
                     'type': date_cell['type'], 'hasFormula': date_cell['hasFormula'],
