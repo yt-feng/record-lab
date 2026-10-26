@@ -68,6 +68,12 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
     except Exception as error:
         errors.append(safe_error(code, "announcements", error))
         return fund, errors
+    allowed_periods = {p for p in (target_period, baseline_period) if p}
+    if allowed_periods:
+        reports = [r for r in reports if r["periodEnd"] in allowed_periods]
+    if not any(not target_period or r["periodEnd"] == target_period for r in reports):
+        errors.append({"code": code, "stage": "target-report", "errorCode": "TARGET_REPORT_UNAVAILABLE"})
+        return fund, errors
     snapshots = {}
     year = int((target_period or as_of)[:4])
     for selected_year in range(year, year - min(max(1, history_years), 3), -1):
@@ -81,13 +87,6 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         needed = {p for p in (target_period, baseline_period) if p}
         if (needed and needed.issubset(snapshots)) or (not needed and len([p for p in snapshots if p <= as_of]) >= 2):
             break
-    allowed_periods = {p for p in (target_period, baseline_period) if p}
-    if allowed_periods:
-        reports = [r for r in reports if r["periodEnd"] in allowed_periods]
-    target_reports = [r for r in reports if not target_period or r["periodEnd"] == target_period]
-    if not target_reports:
-        errors.append({"code": code, "stage": "target-report", "errorCode": "TARGET_REPORT_UNAVAILABLE"})
-        return fund, errors
     extraction_keys = ("parseMethod", "parseErrorCode", "sourceTextHash", "pageStats",
                        "strategyExcerpts", "strategyThemes", "reportPdfSourceUrl",
                        "reportPdfPeriodEnd", "reportPdfKind")

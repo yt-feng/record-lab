@@ -301,16 +301,44 @@ def parse_announcements(data, as_of, expected_code=None):
     return sorted(reports, key=lambda r: (r["periodEnd"], r["publishedAt"]), reverse=True)
 
 
+def pdf_portfolio_identity(pages):
+    """Read only explicit identity labels and their adjacent code-only rows.
+
+    PDF table labels routinely wrap inside words. Keep the code rows bounded
+    and stop at the next text label so security codes and share totals elsewhere
+    on the page cannot become share-class aliases.
+    """
+    spaced = lambda label: r"\s*".join(label)
+    intro = "\n".join(pages[:12])
+    main = re.search(spaced("基金主代码") + r"\s*[:：]?\s*(\d{6})(?!\d)", intro)
+    main_code = main[1] if main else None
+    labels = ["下属分级基金的交易代码", "下属分类基金的交易代码"]
+    classes = re.search("(?:" + "|".join(spaced(label) for label in labels) + ")", intro)
+    codes = []
+    if classes:
+        tail = intro[classes.end():].lstrip(" \t:：")
+        for line in tail.splitlines()[:8]:
+            line = line.strip()
+            if not line and not codes:
+                continue
+            if not re.fullmatch(r"\d{6}(?:[ \t]+\d{6})*", line):
+                break
+            codes.extend(line.split())
+    codes = list(dict.fromkeys(codes))
+    if main_code and codes and main_code not in codes:
+        codes = []
+    multi_class = bool(classes or re.search(
+        "|".join(spaced(label) for label in ("下属分级基金", "下属分类基金", "各类基金份额"))
+        + r"|[AC]\s*类\s*基\s*金\s*份\s*额", intro))
+    return main_code, codes, multi_class
+
+
 def parse_pdf_pages(pages, source_url, period_end, kind):
     """Conservative extraction of one NAV cell and one bounded strategy excerpt."""
     from report_extract import strategy_section_end
     nav = None
     narrative = None
-    joined_intro = "\n".join(pages[:5])
-    multi_class = bool(re.search(r"下属(?:分级|分类)基金|各类基金份额|[AC]类基金份额", joined_intro))
-    main_code = re.search(r"基金主代码\s*(\d{6})", joined_intro)
-    classes = re.search(r"下属(?:分级|分类)基金的交易代码([^\n]*(?:\n[^\n]*)?)", joined_intro)
-    class_codes = re.findall(r"\b\d{6}\b", classes[1]) if classes else []
+    main_code, class_codes, multi_class = pdf_portfolio_identity(pages)
     if kind in ("semiannual", "annual"):
         all_text = re.sub(r"[ \t]+", "", "\n".join(pages))
         # The first column of the balance sheet is this report's period end.
@@ -387,7 +415,7 @@ def parse_pdf_pages(pages, source_url, period_end, kind):
         if narrative and (nav is not None or kind != "quarterly"):
             break
     return {"navYuan": nav, "narrative": narrative,
-            "portfolioCode": main_code[1] if main_code else None,
+            "portfolioCode": main_code,
             "shareClassCodes": class_codes}
 
 

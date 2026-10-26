@@ -21,6 +21,26 @@
   const MAX_DATA_BYTES = 80 * 1024 * 1024;
   function safeCompanyPath(path) { return typeof path === 'string' && /^\.\/data\/companies\/[A-Za-z0-9_-]+\.json(?:\.gz)?$/.test(path) ? path : null; }
   function companyPages(manifest, code) { return (manifest?.companyFiles || []).filter(file => file.companyCode === code).slice().sort((a, b) => (a.partIndex || 1) - (b.partIndex || 1)); }
+  function companyRecordSummaries(manifest, catalog = null, query = '') {
+    const summaries = new Map();
+    for (const file of manifest?.companyFiles || []) {
+      if (!summaries.has(file.companyCode)) summaries.set(file.companyCode, { code: file.companyCode, name: file.companyName, records: 0, holdings: 0, pages: 0, managers: new Set(), directoryFunds: [] });
+      const company = summaries.get(file.companyCode);
+      company.records += file.fundCount;
+      company.holdings += file.holdingCount || 0;
+      company.pages++;
+      for (const manager of file.managers || []) company.managers.add(manager);
+    }
+    for (const fund of catalog?.funds || []) {
+      const company = summaries.get(fund.companyCode);
+      if (company) company.directoryFunds.push(`${fund.code} ${fund.name || ''}`);
+    }
+    const tokens = query.toLocaleLowerCase().trim().split(/\s+/).filter(Boolean);
+    return [...summaries.values()].filter(company => {
+      const search = [company.code, company.name, ...company.managers, ...company.directoryFunds].join(' ').toLocaleLowerCase();
+      return tokens.every(token => search.includes(token));
+    }).map(({ directoryFunds, managers, ...company }) => ({ ...company, managers: [...managers] }));
+  }
   function catalogComplete(catalog) { return Boolean(catalog && catalog.coverage.complete !== false && catalog.coverage.directoryComplete !== false &&
     !catalog.companies?.some(company => company.directoryStatus === 'stale') && !['bootstrap', 'partial-directory', 'limited-probe', 'unavailable'].includes(catalog.coverage.status)); }
   function companyDirectoryLabel(company, catalogAsOf) {
@@ -524,10 +544,11 @@
     function updateCompanyOptions() {
       const previous = inputs.company.value;
       inputs.company.replaceChildren();
-      const entries = [['', state.manifest ? '选择公司，逐家查看' : state.catalog ? '全部目录公司' : '全部已收录公司']];
+      const entries = [['', state.manifest ? '全部已收录公司总览' : state.catalog ? '全部目录公司' : '全部已收录公司']];
+      const records = new Map(companyRecordSummaries(state.manifest).map(company => [company.code, company.records]));
       const index = catalogIndex(state.catalog);
-      for (const company of state.catalog?.companies || state.progress?.companies || []) entries.push([`code:${company.code}`, company.name]);
-      for (const file of state.manifest?.companyFiles || []) if (!entries.some(([value]) => value === `code:${file.companyCode}`)) entries.push([`code:${file.companyCode}`, file.companyName]);
+      for (const company of state.catalog?.companies || state.progress?.companies || []) entries.push([`code:${company.code}`, state.manifest ? `${company.name} · ${records.get(company.code) || 0} 份已收录记录` : company.name]);
+      for (const file of state.manifest?.companyFiles || []) if (!entries.some(([value]) => value === `code:${file.companyCode}`)) entries.push([`code:${file.companyCode}`, `${file.companyName} · ${records.get(file.companyCode)} 份已收录记录`]);
       const extra = new Set((state.data?.funds || []).filter(fund => !companyCodeFor(fund, index)).map(fund => fund.company).filter(Boolean));
       for (const company of [...extra].sort((a, b) => a.localeCompare(b, 'zh-CN'))) entries.push([company, company]);
       for (const [value, label] of entries) { const option = el('option', '', label); option.value = value; inputs.company.append(option); }
@@ -809,7 +830,8 @@
 
     function updatePagination() {
       const pages = companyPages(state.manifest, state.companyCode);
-      $('company-navigation').hidden = !state.manifest;
+      $('company-navigation').hidden = !state.manifest || !state.companyCode;
+      $('browse-companies').hidden = !state.manifest || !state.companyCode;
       $('company-page-status').textContent = pages.length ? `${pages[0].companyName} · 第 ${state.pageIndex + 1} / ${pages.length} 页 · 公司共 ${pages[0].companyFundCount ?? pages.reduce((sum, page) => sum + page.fundCount, 0)} 份记录${state.loadingCompany ? ' · 正在载入' : ''}` : '这家公司尚无可载入记录，处理状态保留在上方目录中';
       $('company-prev').disabled = state.loadingCompany || state.pageIndex <= 0;
       $('company-next').disabled = state.loadingCompany || state.pageIndex + 1 >= pages.length;
@@ -821,8 +843,9 @@
       const pages = companyPages(state.manifest, code);
       state.companyCode = code; state.pageIndex = pageIndex; state.loadingCompany = Boolean(pages[pageIndex]);
       if (!samePage || !pages[pageIndex]) state.data = null;
-      inputs.company.value = `code:${code}`;
+      inputs.company.value = code ? `code:${code}` : '';
       updatePagination(); renderResults();
+      if (!code) { updateObservation('当前显示本季度全部已收录公司；点击公司查看记录。目录规模不代表采集完成。'); return; }
       if (!pages[pageIndex]) return;
       const controller = new win.AbortController(); const timer = win.setTimeout(() => controller.abort(), 20000);
       try {
@@ -844,6 +867,28 @@
       } finally { win.clearTimeout(timer); }
     }
     function renderResults() {
+      const overviewMode = Boolean(state.manifest && !state.companyCode);
+      $('results-heading').textContent = overviewMode ? '本季度已收录公司总览' : '经理与持仓明细';
+      $('filter-tip').textContent = overviewMode ? '总览可按公司、经理或基金目录名称 / 代码定位公司。基金目录命中不代表该基金报告已取得；进入公司后可搜索股票与导出当前页。' : '当前只显示所选公司的一页记录；搜索与导出限当前页。点击「全部已收录公司」返回本季度总览。';
+      inputs.query.placeholder = overviewMode ? '查找公司、经理或基金目录名称 / 代码' : '搜索当前公司页的基金、经理或股票';
+      for (const key of ['manager', 'period', 'change']) inputs[key].disabled = overviewMode;
+      if (overviewMode) {
+        state.filtered = []; $('export-csv').disabled = true;
+        const all = companyRecordSummaries(state.manifest);
+        const companies = companyRecordSummaries(state.manifest, state.catalog, inputs.query.value);
+        $('result-count').textContent = `${companies.length} / ${all.length} 家已收录公司 · 全季 ${formatNumber(state.manifest.coverage.fundCount, 0)} 份记录`;
+        const target = $('fund-results'); target.replaceChildren();
+        target.append(el('p', 'browse-note', '以下是本季度实际已收录的公司与记录，包含字段待补的报告；其余公司的采集状态见上方覆盖清单。点击公司进入基金明细。'));
+        if (!companies.length) { target.append(emptyState('未找到有已收录记录的匹配公司', '可在上方全量公司清单查询尚未取得报告的公司；未取得的数据不会补成空持仓。')); return; }
+        const grid = el('div', 'company-record-grid');
+        for (const company of companies) {
+          const button = el('button', 'company-record-card'); button.type = 'button';
+          button.append(el('strong', '', company.name), el('span', '', `${formatNumber(company.records, 0)} 份记录 · 本期已解析 ${formatNumber(company.holdings, 0)} 条持仓`), el('small', '', `${company.pages} 页 · 查看基金明细 →`));
+          button.addEventListener('click', () => { inputs.query.value = ''; inputs.manager.value = ''; inputs.change.value = ''; inputs.period.value = 'latest'; loadCompany(company.code, 0); renderDirectory(); });
+          grid.append(button);
+        }
+        target.append(grid); return;
+      }
       if (state.loadingCompany) {
         $('fund-results').replaceChildren(emptyState('正在载入所选公司的当前页', '每次只载入一页记录；其他公司继续保留在覆盖目录中。'));
         $('export-csv').disabled = true; $('result-count').textContent = '正在载入'; return;
@@ -858,7 +903,7 @@
       const filters = Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key, input.value]));
       state.filtered = filterFunds(state.data.funds, filters, state.catalog);
       const rowCount = state.filtered.reduce((sum, fund) => sum + fund.visibleRows.length, 0);
-      $('result-count').textContent = `${new Set(state.filtered.map(fund => fund.code)).size} 只基金 · ${state.filtered.length} 份记录 · ${rowCount} 条持仓`;
+      $('result-count').textContent = `${state.manifest ? '当前公司页：' : ''}${new Set(state.filtered.map(fund => fund.code)).size} 只基金 · ${state.filtered.length} 份记录 · ${rowCount} 条披露对比`;
       $('export-csv').disabled = rowCount === 0;
       const target = $('fund-results'); target.replaceChildren();
       if (!state.filtered.length) {
@@ -908,7 +953,7 @@
         state.failed = false; state.mode = 'remote'; updateQuarterHeading();
         if (data.companyFiles?.length) {
           state.manifest = data; updateCompanyOptions(); updateStatistics();
-          const code = inputs.company.value.startsWith('code:') ? inputs.company.value.slice(5) : data.companyFiles[0].companyCode;
+          const code = inputs.company.value.startsWith('code:') ? inputs.company.value.slice(5) : '';
           await loadCompany(code, 0);
         } else {
           state.manifest = null; state.data = data; updateDataset(); updatePagination();
@@ -935,6 +980,7 @@
       else renderResults();
     });
     $('company-search').addEventListener('input', renderDirectory);
+    $('browse-companies').addEventListener('click', () => { inputs.query.value = ''; inputs.manager.value = ''; inputs.change.value = ''; inputs.period.value = 'latest'; loadCompany('', 0); renderDirectory(); });
     $('company-prev').addEventListener('click', () => loadCompany(state.companyCode, state.pageIndex - 1));
     $('company-next').addEventListener('click', () => loadCompany(state.companyCode, state.pageIndex + 1));
     $('reset-filters').addEventListener('click', () => { Object.entries(inputs).forEach(([key, input]) => { if (key !== 'company' || !state.manifest) input.value = key === 'period' ? 'latest' : ''; }); state.limit = 30; renderResults(); });
@@ -970,6 +1016,6 @@
     initializePeriods();
   }
 
-  return { validateDataset, validateCatalog, validateProgress, validatePeriods, selectQuarter, periodDataPath, validatePeriodDataset, responseText, researchOverview, retryState, formatRetryAt, fundQuality, catalogComplete, catalogFreshness, companyDirectoryLabel, safeCompanyPath, companyPages, catalogIndex, companyCoverage, coverageOverview, safeHttpUrl, validEmptyStockEvidence, managerNames, managerAttributionLabel, reportPeriod, changeGroup, latestFunds, filterFunds,
+  return { validateDataset, validateCatalog, validateProgress, validatePeriods, selectQuarter, periodDataPath, validatePeriodDataset, responseText, researchOverview, retryState, formatRetryAt, fundQuality, catalogComplete, catalogFreshness, companyDirectoryLabel, safeCompanyPath, companyPages, companyRecordSummaries, catalogIndex, companyCoverage, coverageOverview, safeHttpUrl, validEmptyStockEvidence, managerNames, managerAttributionLabel, reportPeriod, changeGroup, latestFunds, filterFunds,
     formatNumber, formatMoney, signed, holdingValue, priceDescription, csvCell, exportCsv, observationState, mount };
 });

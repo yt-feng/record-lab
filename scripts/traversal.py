@@ -631,6 +631,57 @@ def valid_not_applicable(evidence, code, phase, now):
             and urlparse(evidence["sourceUrl"]).path.endswith(f"jbgk_{code}.html"))
 
 
+def fair_lane(codes, states):
+    """Rotate institutions and prefer products with fewer prior attempts."""
+    visits = {}
+    for state in states.values():
+        company = state["companyCode"] or "~unmapped"
+        visits[company] = visits.get(company, 0) + state["totalAttempts"]
+        visits[company] += state["quality"]["totalAttempts"] + state["enrichment"]["totalAttempts"]
+    queues = {}
+    def order(code):
+        state = states[code]
+        return (state["totalAttempts"] + state["quality"]["totalAttempts"] + state["enrichment"]["totalAttempts"],
+                state.get("lastAttemptAt") or "", code)
+    for code in sorted(codes, key=order):
+        queues.setdefault(states[code]["companyCode"] or "~unmapped", deque()).append(code)
+    companies = deque(sorted(queues, key=lambda company: (visits[company], company)))
+    ordered = deque()
+    while companies:
+        company = companies.popleft()
+        ordered.append(queues[company].popleft())
+        if queues[company]:
+            companies.append(company)
+    return ordered
+
+
+def fair_research_selection(states, source_codes, quality_codes, enrich_codes, capacity):
+    """Reserve capacity for report repair without stalling the first pass.
+
+    With every lane populated, each ten slots contain six new products, two
+    report repairs, one source retry and one price repair. Empty lanes yield
+    their capacity to the remaining work; per-product retry limits still apply.
+    """
+    lanes = {
+        "fresh": fair_lane([code for code in source_codes if states[code]["status"] == "pending"], states),
+        "retry": fair_lane([code for code in source_codes if states[code]["status"] != "pending"], states),
+        "quality": fair_lane(quality_codes, states),
+        "prices": fair_lane(set(enrich_codes) - set(quality_codes), states),
+    }
+    rotation = ("fresh", "quality", "fresh", "fresh", "retry", "fresh", "quality", "fresh", "prices", "fresh")
+    selected, seen = [], set()
+    while len(selected) < capacity and any(lanes.values()):
+        for lane in rotation:
+            queue = lanes[lane]
+            while queue and queue[0] in seen:
+                queue.popleft()
+            if queue and len(selected) < capacity:
+                code = queue.popleft()
+                selected.append(code)
+                seen.add(code)
+    return selected
+
+
 def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, retained=()):
     current = utc_now(now)
     phase = phase_for(config)
@@ -642,18 +693,14 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
     selected = []
     enrich_codes = set(enrichment_eligible(states))
     quality_codes = set(quality_eligible(states)) if quality_enabled(config) else set()
-    pools = (eligible(states), quality_codes, enrich_codes) if quality_enabled(config) else (enrich_codes, eligible(states))
-    for pool in pools:
-        queues = {}
-        for code in sorted(pool):
-            if code not in selected:
-                queues.setdefault(states[code]["companyCode"] or "~unmapped", deque()).append(code)
-        order = deque(sorted(queues))
-        while order and len(selected) < shards * batch_size:
-            company = order.popleft()
-            selected.append(queues[company].popleft())
-            if queues[company]:
-                order.append(company)
+    source_codes = eligible(states)
+    if quality_enabled(config):
+        selected = fair_research_selection(states, source_codes, quality_codes, enrich_codes, shards * batch_size)
+    else:
+        for pool in (enrich_codes, source_codes):
+            queue = fair_lane([code for code in pool if code not in selected], states)
+            while queue and len(selected) < shards * batch_size:
+                selected.append(queue.popleft())
     batches, matrix = {}, []
     for index, start in enumerate(range(0, len(selected), batch_size)):
         batch = {key: value for key, value in config.items() if key not in {"funds", "traversal"}}
@@ -671,6 +718,8 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
     continuing = bool(selected)
     return {"batches": batches, "matrix": matrix,
             "meta": {"hasWork": bool(selected), "continueRun": continuing, "selectedCount": len(selected),
+                     "freshCount": sum(code in source_codes and states[code]["status"] == "pending" for code in selected),
+                     "retryCount": sum(code in source_codes and states[code]["status"] != "pending" for code in selected),
                      "enrichmentCount": sum(code in enrich_codes and code not in quality_codes for code in selected),
                      "qualityCount": sum(code in quality_codes for code in selected), "phase": phase}}
 

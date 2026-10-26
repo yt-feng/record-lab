@@ -6,7 +6,7 @@ The browser reads separate **2026Q2 (30 June versus 31 March)** and **2026Q3 (30
 
 ## Use
 
-Open the published page, filter by institution, manager, instrument, or period, and export the visible records to CSV. Every comparison shows the observation date and source. Refresh reloads the generated snapshot; it does not run collection in the browser.
+Open the published page to see all companies with collected records in the selected quarter, then enter a company to browse its records. Overview search locates companies by company, manager, or fund-directory name/code; a directory match does not prove that product's report has been collected. Inside a company, search and CSV export apply to the current page. Every comparison shows the observation date and source. Refresh reloads the generated snapshot; it does not run collection in the browser.
 
 The quarter collection workflow processes bounded batches with independent checkpoints under `web/data/periods/<quarter>/`. It retains the existing Q2 snapshot while collecting Q3. Company partitions keep browser downloads bounded; the published site can use gzip company files while keeping the source JSON in Git. No API key is required for text-layer PDF parsing. A failed or incomplete upstream response remains explicit; an older valid observation retains its original date. A missing Q3 publication never falls back to displaying Q2 as Q3.
 
@@ -15,6 +15,8 @@ Each run records its own information cutoff and collection timestamp. Current ma
 When an individual company directory refresh fails, its previously verified ownership remains explicitly cached with the original verification date. The fresh master-directory date does not imply that cached company ownership was rechecked; historical product codes remain available and unmapped products can still be collected by code.
 
 Holdings collection and research completeness are separate counts. Research coverage checks the disclosed holdings table, PDF text, quarter-specific strategy, NAV, the exact comparison quarter, and price coverage. Missing fields remain visible and enter a bounded repair queue. Exhausted retries mean an incomplete result, even if the workflow itself succeeds. All product codes are attempted, including products whose company mapping is not yet resolved.
+
+Each collection wave can schedule 16 batches of 75 products per quarter, with at most 16 batch jobs running concurrently and two collection workers per job. New products, report repairs, source retries, and price repairs receive separate capacity so missing-source work cannot indefinitely block PDF and strategy completion. Where every queue has work, ten slots allocate six new products, two report repairs, one source retry, and one price repair; unused slots move to other queues. Per-product attempt limits still apply. This is task capacity, not a promise that every request will succeed or every report has been published.
 
 A product that did not start before a batch's time budget ended is deferred, preserving its prior state and attempt count. It is not a new collection failure. The display separates these deferrals from attempted requests that did not produce valid observations; deferrals can overlap a product's existing pending or failed state. Workflows continue immediately only while work is currently eligible. `nextRetryAt` records the earliest later check, so a finished daily wave can remain incomplete and await a later scheduled run.
 

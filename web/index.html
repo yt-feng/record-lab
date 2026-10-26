@@ -49,10 +49,11 @@
         <label>持仓报告期<select id="filter-period"><option value="">全部报告期</option></select></label>
         <label>披露变化<select id="filter-change"><option value="">全部变化</option><option value="increased">持股数增加</option><option value="decreased">持股数减少</option><option value="entered">进入披露名单</option><option value="left">离开披露名单</option><option value="unchanged">持股数未变</option><option value="unknown">无法比较</option></select></label>
       </div>
-      <p class="filter-tip">按公司逐家查看；搜索与导出仅作用于当前公司已载入页。上方公司清单可搜索全部已发现公司。</p>
+      <p id="filter-tip" class="filter-tip">先查看本季度全部已收录公司，再进入公司查看基金明细；目录规模不代表采集完成。</p>
+      <button id="browse-companies" class="text-button" type="button" hidden>← 全部已收录公司</button>
       <div id="company-navigation" class="company-navigation" hidden><span id="company-page-status"></span><div><button id="company-prev" type="button" class="text-button">← 上一页</button><button id="company-next" type="button" class="text-button">下一页 →</button></div></div>
     </section>
-    <section id="results" aria-label="基金经理与持仓明细" tabindex="-1"><div class="results-title"><h2>经理与持仓明细</h2><span id="result-count">等待数据</span></div><div id="fund-results" aria-live="polite"><div class="empty-state"><span class="empty-icon" aria-hidden="true">≋</span><h3>正在整理报告</h3><p>载入完成后，可按经理展开基金持仓与报告说明。</p></div></div></section>
+    <section id="results" aria-label="基金经理与持仓明细" tabindex="-1"><div class="results-title"><h2 id="results-heading">本季度已收录公司总览</h2><span id="result-count">等待数据</span></div><div id="fund-results" aria-live="polite"><div class="empty-state"><span class="empty-icon" aria-hidden="true">≋</span><h3>正在整理报告</h3><p>载入完成后，可查看各家已收录公司并进入基金持仓与报告说明。</p></div></div></section>
     <section class="methodology" id="methodology"><div class="section-title"><div><p class="eyebrow">READING THE DATA</p><h2>把披露事实与估算分开看</h2></div></div><div class="method-grid"><article><span>01 / 报告有时点</span><h3>报告期、公告日、采集日各不同</h3><p>持仓按报告期末观察；基金经理归属可能来自较晚的公开信息。每张基金卡保留这些日期，运作说明也独立标明覆盖期间。</p></article><article><span>02 / 持仓有边界</span><h3>披露名单中的变化</h3><p>只有可比较的持股数量才标记增加或减少。名单进出无法证明完整交易，非相邻报告期的变化也不代表单季买卖。基金份额类别不能直接相加。</p></article><article><span>03 / 价格不是成本</span><h3>用区间价格提供参考</h3><p>股价区间取对应观察窗口中的最高与最低价，保留币种、价格口径与实际行情覆盖日期；缺失价格不补零。公司行动、交易时间和历史仓位都会影响实际成本。</p></article><article><span>04 / 逻辑来自原文</span><h3>保留经理说明与来源</h3><p>运作说明是报告层面的表述，不能自动解释每只股票的变动。优先阅读原报告，并关注说明期与当前持仓期是否一致。</p></article></div><div id="coverage-notes" class="coverage-notes"></div></section>
   </main>
   <footer class="wrap footer"><span>RECORD LAB <b> / </b> 公募持仓跟踪</span><span>公开来源 · 明确时点 · 保留缺失</span></footer>

@@ -31,7 +31,7 @@ def quarter_config(base, quarter, as_of):
         raise ValueError('INVALID_AS_OF')
     return {**base, 'funds': [], 'quarter': quarter, 'asOf': as_of,
             'targetPeriodEnd': target, 'baselinePeriodEnd': baseline,
-            'collectorVersion': 2, 'requireReportQuality': True,
+            'collectorVersion': 3, 'requireReportQuality': True,
             'retryPolicy': {'dailyUntil': '2026-11-30' if quarter == '2026Q3' else None,
                             'intervalDays': 7, 'maxScheduledCycles': 4},
             'scope': f'{quarter} 全目录产品与报告逐项补齐'}
@@ -77,7 +77,7 @@ def refresh_directory(root, as_of):
         return {'status': 'cached', 'asOf': current.get('asOf'), 'errorCode': 'DIRECTORY_REFRESH_FAILED'}
 
 
-def plan(quarter, as_of, data='web/data', shards=4, batch_size=50, refresh=True):
+def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True):
     root = Path(data)
     directory_status = refresh_directory(root, as_of) if refresh else {'status': 'provided'}
     catalog = read_json(root / 'catalog.json')
@@ -167,8 +167,8 @@ def main():
     parser.add_argument('command', choices=['plan', 'publish'])
     parser.add_argument('--quarter', choices=['both', *PERIODS], default='both')
     parser.add_argument('--as-of', default=dt.datetime.now(dt.timezone.utc).date().isoformat())
-    parser.add_argument('--shards', type=int, default=4)
-    parser.add_argument('--batch-size', type=int, default=50)
+    parser.add_argument('--shards', type=int, default=16)
+    parser.add_argument('--batch-size', type=int, default=75)
     args = parser.parse_args()
     if os.environ.get('GITHUB_ACTIONS') != 'true': raise ValueError('BATCH_REQUIRES_ACTIONS')
     result = plan(args.quarter, args.as_of, shards=args.shards, batch_size=args.batch_size) if args.command == 'plan' else publish()

@@ -349,6 +349,52 @@ class TraversalTests(unittest.TestCase):
         self.assertIn("000003", [item["code"] for item in partial["batches"]["batch-0.json"]["funds"]])
         self.assertTrue(partial["meta"]["continueRun"])
 
+    def test_research_plan_reserves_repair_slots_while_new_products_remain(self):
+        config = {**CONFIG, "collectorVersion": 3, "requireReportQuality": True}
+        directory = {"schemaVersion": 1, "companies": [
+            {"code": "co1", "name": "合成机构", "fundCount": 40, "directoryStatus": "complete"}],
+            "funds": [{"code": f"{i:06d}", "companyCode": "co1"} for i in range(1, 41)]}
+        previous = {"schemaVersion": 1, "phase": PHASE, "collectorVersion": 3, "funds": [
+            {"code": f"{i:06d}", "companyCode": "co1", "status": "failed" if i <= 10 else "complete",
+             "attempts": 1, "totalAttempts": 1, "lastAttemptAt": "2026-09-29T11:00:00Z",
+             "errorCode": "NETWORK_ERROR" if i <= 10 else None}
+            for i in [*range(1, 11), *range(31, 41)]]}
+        plan = traversal.plan_batches(directory, previous, config, shards=1, batch_size=10, now=NOW)
+        selected = [item["code"] for item in plan["batches"]["batch-0.json"]["funds"]]
+        self.assertEqual(selected[0], "000011")
+        self.assertEqual(plan["meta"]["qualityCount"], 2)
+        self.assertEqual(plan["meta"]["retryCount"], 1)
+        self.assertEqual(plan["meta"]["freshCount"], 7)
+        self.assertEqual(len(set(selected)), 10)
+        self.assertEqual(previous["funds"][0]["attempts"], 1)
+
+    def test_fair_lanes_keep_price_repairs_and_reuse_empty_capacity(self):
+        states = {}
+        for i, status in enumerate(["pending"] * 12 + ["failed"] * 4 + ["complete"] * 8, 1):
+            states[f"{i:06d}"] = {"status": status, "companyCode": "co1", "totalAttempts": 0,
+                "quality": {"totalAttempts": 0}, "enrichment": {"totalAttempts": 0}}
+        source = [f"{i:06d}" for i in range(1, 17)]
+        quality = {f"{i:06d}" for i in range(17, 21)}
+        prices = {f"{i:06d}" for i in range(17, 25)}
+        selected = traversal.fair_research_selection(states, source, quality, prices, 10)
+        self.assertEqual(sum(code in quality for code in selected), 2)
+        self.assertEqual(sum(code in prices - quality for code in selected), 1)
+        self.assertEqual(sum(states[code]["status"] == "pending" for code in selected), 6)
+        self.assertEqual(sum(states[code]["status"] == "failed" for code in selected), 1)
+        self.assertEqual(len(set(selected)), 10)
+        all_selected = traversal.fair_research_selection(states, source, quality, prices, 100)
+        self.assertEqual(set(all_selected), set(states))
+        self.assertEqual(len(all_selected), len(states))
+
+    def test_round_robin_starts_with_less_visited_institution(self):
+        states = {"000001": {"companyCode": "co1", "totalAttempts": 2, "lastAttemptAt": NOW,
+                    "quality": {"totalAttempts": 0}, "enrichment": {"totalAttempts": 0}},
+                  "000002": {"companyCode": "co1", "totalAttempts": 0,
+                    "quality": {"totalAttempts": 0}, "enrichment": {"totalAttempts": 0}},
+                  "000003": {"companyCode": "co2", "totalAttempts": 0,
+                    "quality": {"totalAttempts": 0}, "enrichment": {"totalAttempts": 0}}}
+        self.assertEqual(list(traversal.fair_lane(states, states)), ["000003", "000002", "000001"])
+
     def test_missing_snapshot_marks_every_actual_batch_item_failed(self):
         batch = {**CONFIG, "funds": [{"code": "000001", "companyCode": "co1"}]}
         result = traversal.build_status(batch, None, now=NOW)

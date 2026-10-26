@@ -200,6 +200,23 @@ test('manifest accepts multiple pages per company and sorts pages without loadin
   assert.throws(() => ui.validateDataset(manifest), /INVALID_DATASET/);
 });
 
+test('all-company overview counts each partition once and locates companies without claiming missing funds are collected', () => {
+  const manifest = { companyFiles: [
+    { companyCode: 'c1', companyName: '甲公司', fundCount: 3, holdingCount: 20, companyFundCount: 5, managers: ['甲经理'] },
+    { companyCode: 'c1', companyName: '甲公司', fundCount: 2, holdingCount: 10, companyFundCount: 5, managers: ['甲经理', '乙经理'] },
+    { companyCode: 'c2', companyName: '乙公司', fundCount: 1, holdingCount: 0, managers: [] }
+  ] };
+  const companies = ui.companyRecordSummaries(manifest, fixtureCatalog());
+  assert.equal(companies.length, 2);
+  assert.deepEqual(companies[0], { code: 'c1', name: '甲公司', records: 5, holdings: 30, pages: 2, managers: ['甲经理', '乙经理'] });
+  assert.equal(companies[1].records, 1);
+  assert.deepEqual(ui.companyRecordSummaries(manifest, fixtureCatalog(), '000002').map(company => company.code), ['c1']);
+  assert.deepEqual(ui.companyRecordSummaries(manifest, fixtureCatalog(), '乙经理').map(company => company.code), ['c1']);
+  assert.deepEqual(ui.companyRecordSummaries(manifest, fixtureCatalog(), '不存在'), []);
+  assert.deepEqual(ui.companyRecordSummaries(null, fixtureCatalog()), []);
+  assert.equal(manifest.companyFiles[0].fundCount, 3);
+});
+
 test('progress validates success counts while incomplete company directories remain unknown', () => {
   const progress = { schemaVersion: 1, updatedAt: '2026-09-29T01:00:00Z', totalCompanies: 2, totalFunds: 2,
     processedFunds: 1, completedCompanies: 0, pendingFunds: 1, funds: [{ code: '000001', companyCode: 'c1', status: 'complete' }, { code: '000002', companyCode: null, status: 'pending' }],

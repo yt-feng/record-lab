@@ -53,7 +53,7 @@ class CampaignTests(unittest.TestCase):
                     batch = read_json('.cache/plan/' + item['config'])
                     self.assertEqual(batch['traversal']['batchId'], item['id'])
                     self.assertTrue(batch['requireReportQuality'])
-                    self.assertEqual(batch['collectorVersion'], 2)
+                    self.assertEqual(batch['collectorVersion'], 3)
                 # One new product is explicitly post-Q3; all other batch work
                 # is absent, as if a runner stopped before writing its artifact.
                 import datetime as dt
@@ -92,7 +92,7 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual((q3['targetPeriodEnd'], q3['baselinePeriodEnd']), ('2026-09-30', '2026-06-30'))
         self.assertEqual(q3['asOf'], '2026-10-26')
         self.assertTrue(q2['requireReportQuality'])
-        self.assertEqual(q2['collectorVersion'], 2)
+        self.assertEqual(q2['collectorVersion'], 3)
         self.assertIsNone(q2['retryPolicy']['dailyUntil'])
         self.assertEqual(q3['retryPolicy']['dailyUntil'], '2026-11-30')
         self.assertEqual(q3['retryPolicy']['maxScheduledCycles'], 4)

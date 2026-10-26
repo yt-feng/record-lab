@@ -64,6 +64,27 @@ class ParserTests(unittest.TestCase):
         self.assertIsNone(result["navYuan"])
         self.assertEqual(result["portfolioCode"], "000001")
 
+    def test_wrapped_pdf_identity_labels_and_values_on_later_intro_page(self):
+        pages = ["合成封面与目录"] * 5 + [
+            "2.1 基金基本情况\n基金主代\n码 000001\n下属分级基金的基\n金简称 合成A 合成C 合成D\n"
+            "下属分级基金的交\n易代码 000001 000002\n000003\n报告期末下属分级基金的份额总额\n"
+            "600001 600002 600003\n4.期末基金资产净值 10,000,000.00 20,000,000.00 30,000,000.00\n"
+            "5.期末基金份额净值 1.1234 1.2345 1.3456"]
+        result = parse_pdf_pages(pages, "https://example.org/report.pdf", "2026-06-30", "quarterly")
+        self.assertEqual(result["portfolioCode"], "000001")
+        self.assertEqual(result["shareClassCodes"], ["000001", "000002", "000003"])
+        self.assertEqual(result["navYuan"], 60000000)
+
+    def test_pdf_aliases_cannot_skip_labels_or_accept_monetary_values(self):
+        for values in ("000001 123456.00", "基金份额说明\n000001 000002", "000002 000003"):
+            with self.subTest(values=values):
+                page = "基金主代码 000001\n下属分级基金的交\n易代码 " + values
+                result = parse_pdf_pages([page], "https://example.org/report.pdf", "2026-06-30", "quarterly")
+                self.assertEqual(result["shareClassCodes"], [])
+        page = "基金主代码 000001\n下属分级基金的基金简称 合成A 合成C\n交易明细 000001 000002"
+        result = parse_pdf_pages([page], "https://example.org/report.pdf", "2026-06-30", "quarterly")
+        self.assertEqual(result["shareClassCodes"], [])
+
     def test_interim_balance_uses_current_portfolio_nav_not_previous_year(self):
         pages = ["基金主代码 000001\n下属分级基金的基金简称 示例A 示例C",
                  "6.1 资产负债表\n本期末 2026 年 6 月 30 日 上年度末2025年12月31日\n净资产合计 30,000,000.00 50,000,000.00\n6.2 利润表"]
@@ -115,16 +136,20 @@ class ParserTests(unittest.TestCase):
 
     def test_fixed_target_does_not_substitute_previous_quarter(self):
         class PreviousOnly:
+            announcement_error_code = "ANNOUNCEMENT_PAGE_LIMIT"
             def overview(self, code):
                 return {"name": "示例", "company": "机构", "managers": []}
             def announcements(self, code, as_of):
                 return [{"title": "示例2026年第1季度报告", "periodEnd": "2026-03-31", "publishedAt": "2026-04-22", "kind": "quarterly", "sourceUrl": "https://example.org/report.pdf"}]
             def holdings(self, code, year):
-                return {"2026-03-31": [{"stockCode": "600001"}]}
+                raise AssertionError("Do not fetch historical tables when the target report is absent")
         fund, errors = collect_fund({"code": "000001"}, "2026-09-29", provider=PreviousOnly(),
                                     target_period="2026-06-30", baseline_period="2026-03-31")
         self.assertEqual(fund["reports"], [])
         self.assertIn("TARGET_REPORT_UNAVAILABLE", [error["errorCode"] for error in errors])
+        self.assertIn("ANNOUNCEMENT_PAGE_LIMIT", [error["errorCode"] for error in errors])
+        self.assertNotIn("holdings", [error["stage"] for error in errors])
+        self.assertTrue(fund["collectionAttempt"]["attempted"])
 
 
 def yahoo_fixture(symbol="600519.SS", currency="CNY", exchange="SHH"):
@@ -280,6 +305,26 @@ if __name__ == "__main__":
     unittest.main()
 
 class ReportRecoveryTests(unittest.TestCase):
+    def test_wrapped_share_class_identity_recovers_only_listed_alias(self):
+        report = {"title": "合成2026年第3季度报告", "periodEnd": "2026-09-30", "kind": "quarterly",
+                  "publishedAt": "2026-10-20", "sourceUrl": "https://example.org/report.pdf"}
+        class Source:
+            def overview(self, code): return {"name": "合成份额", "company": "合成机构", "managers": []}
+            def announcements(self, code, as_of): return [report]
+            def holdings(self, code, year):
+                return {"2026-09-30": [{"stockCode": "600001", "stockName": "合成证券", "market": "CN",
+                                         "currency": "CNY", "shares": 100, "weightPct": 1, "marketValueYuan": 10000}]}
+            def report_details(self, document):
+                return parse_pdf_pages(["基金主代码 000001\n下属分级基金的交\n易代码 000001 000002"],
+                                       document["sourceUrl"], document["periodEnd"], document["kind"])
+        fund, errors = collect_fund({"code": "000002"}, "2026-10-26", provider=Source(), target_period="2026-09-30")
+        self.assertEqual(fund["shareClassCodes"], ["000001", "000002"])
+        self.assertEqual(len(fund["reports"]), 1)
+        self.assertNotIn("REPORT_IDENTITY_MISMATCH", [e["errorCode"] for e in errors])
+        unrelated, errors = collect_fund({"code": "000003"}, "2026-10-26", provider=Source(), target_period="2026-09-30")
+        self.assertEqual(unrelated["reports"], [])
+        self.assertIn("REPORT_IDENTITY_MISMATCH", [e["errorCode"] for e in errors])
+
     def test_narrative_stops_at_major_section_when_performance_heading_is_absent(self):
         pages = ["4.4 报告期内基金投资策略和运作分析\n本基金本季度依据基本面与估值水平调整投资组合，同时关注资产流动性及行业配置变化。\n§5 投资组合报告",
                  "5.1 报告期末基金资产组合情况\n本基金组合调整增加降低增持减持配置表格。"]
