@@ -2,6 +2,14 @@ name: Verify supplemental fund announcement discovery
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: Verify two-page pagination first; enumeration repeats the required verification
+        required: true
+        default: pagination-probe
+        type: choice
+        options:
+          - pagination-probe
+          - enumerate
       as_of:
         description: Last publication date to inspect (clamped to actual current date)
         required: true
@@ -37,16 +45,17 @@ jobs:
           python-version: '3.12'
       - name: Test discovery boundaries without network
         run: python -m unittest discover -s tests -p 'test_cninfo_discovery.py'
-      - name: Enumerate bounded public announcement windows without PDFs
+      - name: Verify bounded pagination or enumerate public windows without PDFs
         env:
+          DISCOVERY_MODE: ${{ inputs.mode }}
           DISCOVERY_AS_OF: ${{ inputs.as_of }}
           DISCOVERY_Q2_LATE: ${{ inputs.include_q2_late }}
         run: |
-          args=(--as-of "$DISCOVERY_AS_OF")
+          args=(--mode "$DISCOVERY_MODE" --as-of "$DISCOVERY_AS_OF")
           if [ "$DISCOVERY_Q2_LATE" = "true" ]; then args+=(--include-q2-late); fi
           python scripts/cninfo_discovery.py "${args[@]}"
       - name: Retain guarded metadata candidates and explicit coverage limits
-        if: always()
+        if: always() && inputs.mode == 'enumerate'
         uses: actions/upload-artifact@v4
         with:
           name: supplemental-cninfo-discovery
@@ -55,6 +64,15 @@ jobs:
             .cache/cninfo-discovery/candidates.json
             .cache/cninfo-discovery/announcements-2026Q?-*.json
             .cache/cninfo-discovery/codes-2026Q?-*.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+      - name: Retain bounded pagination proof without source bodies or PDFs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supplemental-cninfo-pagination
+          path: .cache/cninfo-pagination/summary.json
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7

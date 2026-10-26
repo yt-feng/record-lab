@@ -281,22 +281,100 @@ class CninfoDiscoveryTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 'UNEXPECTED_REDIRECT')
 
     def test_main_writes_two_guarded_periods_from_injected_source_and_no_production_paths(self):
-        source = FakeSource([announcement(), announcement('2001', '018775', '2026-07-03', '合成基金2026年第2季度报告')],
+        records = [announcement(str(1000+i), f'{300000+i:06d}', '2026-10-22') for i in range(31)]
+        records += [announcement(str(2000+i), f'{400000+i:06d}', '2026-07-15', '合成基金2026年第2季度报告') for i in range(31)]
+        source = FakeSource(records,
                             edit=lambda _params, answer: answer | {'retrievedAt': '2026-10-26T23:00:00Z'})
         class FixedClock(dt.datetime):
             @classmethod
             def now(cls, tz=None):
                 return cls(2026, 10, 26, 10, tzinfo=discovery.UTC).astimezone(tz or discovery.UTC)
         with tempfile.TemporaryDirectory() as folder:
-            output = Path(folder)
-            with patch.object(discovery, 'OUTPUT', output), patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), patch.object(discovery, 'ActionsTransport', return_value=source), patch.object(discovery.dt, 'datetime', FixedClock):
+            output = Path(folder) / 'discovery'
+            with patch.object(discovery, 'OUTPUT', output), patch.object(discovery, 'PROBE_OUTPUT', Path(folder)/'probe'), patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), patch.object(discovery, 'ActionsTransport', return_value=source), patch.object(discovery.dt, 'datetime', FixedClock):
                 self.assertEqual(discovery.main(['--as-of', '2026-10-26']), 0)
             self.assertEqual(sorted(path.name for path in output.iterdir()), ['announcements-2026Q2-0001.json',
                 'announcements-2026Q3-0001.json', 'candidates.json', 'codes-2026Q2-0001.json', 'codes-2026Q3-0001.json', 'summary.json'])
             summary = json.loads((output / 'summary.json').read_text())
             self.assertEqual([result['targetPeriod'] for result in summary['periods']], ['2026Q2', '2026Q3'])
-            self.assertEqual([result['counts']['candidateCodes'] for result in summary['periods']], [1, 1])
+            self.assertEqual([result['counts']['candidateCodes'] for result in summary['periods']], [31, 31])
+            self.assertTrue(all(item['paginationVerification']['status'] == 'verified-pagination' for item in summary['periods']))
             self.assertFalse(summary['productionCatalogModified'])
+
+    def test_bounded_probe_requires_disjoint_empty_keyword_pages_for_both_quarters(self):
+        records = [announcement(str(1000+i), f'{300000+i:06d}', '2026-10-22') for i in range(65)]
+        records += [announcement(str(2000+i), f'{400000+i:06d}', '2026-07-15', '合成基金2026年第2季度报告') for i in range(65)]
+        source = FakeSource(records)
+        result = discovery.pagination_probe(fetch_page=source, observed_at=NOW, as_of='2026-10-26')
+        self.assertTrue(result['mayEnumerate'])
+        self.assertEqual(result['requestCount'], 8)
+        self.assertEqual(len(source.calls), 8)
+        self.assertEqual(result['verifiedPageSize'], 30)
+        self.assertFalse(result['windowEnumerationComplete'])
+        self.assertTrue(all(item['overlapCount'] == 0 for item in result['profiles']))
+        self.assertTrue(all(call['searchkey'] == '' for call in source.calls[:6]))
+        self.assertEqual(source.calls[-1]['searchkey'], '2026')
+        self.assertNotIn('announcementTitle', json.dumps(result))
+        with tempfile.TemporaryDirectory() as folder, patch.object(discovery, 'PROBE_OUTPUT', Path(folder)):
+            discovery.write_probe(result)
+            self.assertLess((Path(folder)/'summary.json').stat().st_size, discovery.MAX_PROBE_BYTES)
+
+    def test_keyword_success_cannot_hide_empty_keyword_page_reset(self):
+        records = [announcement(str(1000+i), f'{300000+i:06d}', '2026-10-22') for i in range(65)]
+        records += [announcement(str(2000+i), f'{400000+i:06d}', '2026-07-15', '合成基金2026年第2季度报告') for i in range(65)]
+        source = FakeSource(records)
+        calls = []
+        def reset(params):
+            calls.append(params)
+            return source(params if params['searchkey'] else params | {'pageNum': '1'})
+        result = discovery.pagination_probe(fetch_page=reset, observed_at=NOW, as_of='2026-10-26')
+        self.assertFalse(result['mayEnumerate'])
+        self.assertIsNone(result['verifiedPageSize'])
+        self.assertEqual(len(calls), 8)
+        self.assertEqual(result['profiles'][-1]['status'], 'verified-pagination')
+        self.assertEqual(result['profiles'][0]['overlapCount'], 30)
+        self.assertFalse(result['profiles'][0]['checks']['disjointIds'])
+
+    def test_probe_detects_ignored_page_size_counts_drift_and_preserves_first_page_on_failure(self):
+        records = [announcement(str(1000+i), f'{300000+i:06d}', '2026-10-22') for i in range(65)]
+        records += [announcement(str(2000+i), f'{400000+i:06d}', '2026-07-15', '合成基金2026年第2季度报告') for i in range(65)]
+        source = FakeSource(records)
+        def drift(params):
+            answer = source(params)
+            if params['pageNum'] == '2': answer['payload']['totalRecordNum'] += 1
+            return answer
+        result = discovery.pagination_probe(fetch_page=drift, observed_at=NOW, as_of='2026-10-26')
+        self.assertFalse(result['mayEnumerate'])
+        self.assertFalse(result['profiles'][0]['checks']['stableCounts'])
+        def fail(params):
+            if params['pageNum'] == '2': raise discovery.DiscoveryError('NETWORK_ERROR')
+            return source(params)
+        result = discovery.pagination_probe(fetch_page=fail, observed_at=NOW, as_of='2026-10-26')
+        self.assertFalse(result['mayEnumerate'])
+        self.assertEqual(result['profiles'][0]['pages'][0]['rowCount'], 30)
+        self.assertEqual(result['profiles'][0]['errors'], ['NETWORK_ERROR'])
+        result = discovery.pagination_probe(fetch_page=lambda p: source(p | {'pageSize': '5'}), observed_at=NOW, as_of='2026-10-26')
+        self.assertFalse(result['mayEnumerate'])
+        self.assertFalse(result['profiles'][0]['checks']['requestedPageSizeHonoured'])
+
+    def test_failed_probe_does_not_touch_previous_candidates_and_enumeration_stops_before_traversal(self):
+        class FixedClock(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 26, 10, tzinfo=discovery.UTC).astimezone(tz or discovery.UTC)
+        source = FakeSource([])
+        with tempfile.TemporaryDirectory() as folder:
+            output, probe = Path(folder)/'discovery', Path(folder)/'probe'
+            output.mkdir(); (output/'candidates.json').write_text('previous-owned-candidates')
+            with patch.object(discovery, 'OUTPUT', output), patch.object(discovery, 'PROBE_OUTPUT', probe), \
+                    patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), patch.object(discovery, 'ActionsTransport', return_value=source), \
+                    patch.object(discovery.dt, 'datetime', FixedClock):
+                self.assertEqual(discovery.main(['--mode', 'pagination-probe']), 1)
+                self.assertEqual((output/'candidates.json').read_text(), 'previous-owned-candidates')
+                source.calls.clear()
+                self.assertEqual(discovery.main(['--mode', 'enumerate']), 1)
+                self.assertEqual(len(source.calls), 4)
+                self.assertEqual(json.loads((output/'summary.json').read_text())['errorCode'], 'PAGINATION_NOT_VERIFIED')
 
     def test_split_probe_candidates_survive_budget_and_child_network_failure(self):
         rows = [announcement('1001'), announcement('1002', '018775', '2026-10-02')]

@@ -26,7 +26,9 @@ ENTRY = 'https://www.cninfo.com.cn/new/commonUrl/pageOfSearch?lastPage=index&url
 SOURCE_SCRIPT = 'https://www.cninfo.com.cn/new/js/app/disclosure/notice/history-notice.js?v=20260710082532'
 CHINA = dt.timezone(dt.timedelta(hours=8))
 UTC = dt.timezone.utc
-PAGE_SIZE = 100
+# Official history-notice.js initializes page.size to 30. This alone is not
+# proof that the server honours pagination; Actions verifies two pages first.
+PAGE_SIZE = 30
 MAX_PAGES_PER_SLICE = 20  # Deliberately below the site's UI limit of 100 pages.
 MAX_REQUESTS = 200
 MAX_ROWS = 40_000
@@ -36,6 +38,8 @@ MAX_SHARD_BYTES = 2_000_000
 MAX_ARTIFACT_BYTES = 64_000_000
 MAX_SECONDS = 600
 OUTPUT = Path('.cache/cninfo-discovery')
+PROBE_OUTPUT = Path('.cache/cninfo-pagination')
+MAX_PROBE_BYTES = 32_000
 
 
 class DiscoveryError(Exception):
@@ -82,6 +86,91 @@ def params_for(start, end, page, page_size=PAGE_SIZE):
             'category': 'category_jdbg_jjgg', 'trade': '',
             'seDate': f'{start.isoformat()}~{end.isoformat()}', 'sortName': '',
             'sortType': '', 'isHLtitle': 'true'}
+
+
+def pagination_probe(*, fetch_page, observed_at, as_of, controls=True):
+    """At most eight public metadata requests; never treat a keyword as all rows."""
+    observed = timestamp(observed_at)
+    cutoff = min(date_value(as_of), observed.astimezone(CHINA).date())
+    profiles = [
+        ('q2-empty-30', '2026Q2', '2026-07-15', '2026-07-21', 30, '', True),
+        ('q3-empty-30', '2026Q3', '2026-10-22', '2026-10-26', 30, '', True)]
+    if controls:
+        profiles.extend([
+            ('q3-empty-5', '2026Q3', '2026-10-22', '2026-10-26', 5, '', False),
+            ('q3-keyword-5', '2026Q3', '2026-10-22', '2026-10-26', 5, '2026', False)])
+    results = []; requests = 0
+    for label, period, start, stop, size, search, required in profiles:
+        end = min(date_value(stop), cutoff)
+        result = {'id': label, 'targetPeriod': period, 'requiredForEnumeration': required,
+                  'query': {'start': start, 'end': end.isoformat(), 'pageSize': size, 'searchkey': search,
+                            'column': 'fund', 'tabName': 'fulltext', 'category': 'category_jdbg_jjgg'},
+                  'pages': [], 'checks': {}, 'status': 'partial', 'errors': []}
+        results.append(result)
+        if end < date_value(start):
+            result['errors'].append('WINDOW_NOT_STARTED'); continue
+        for page in (1, 2):
+            params = params_for(date_value(start), end, page, size); params['searchkey'] = search
+            requests += 1
+            try:
+                receipt = fetch_page(params)
+                if not isinstance(receipt, dict): raise DiscoveryError('INVALID_PAGE_RECEIPT')
+                at = timestamp(receipt.get('retrievedAt'))
+                if (at < observed or not re.fullmatch(r'[a-f0-9]{64}', str(receipt.get('contentHash', '')))
+                        or not integer(receipt.get('responseBytes'), 1, MAX_RESPONSE_BYTES)):
+                    raise DiscoveryError('INVALID_PAGE_RECEIPT')
+                payload = receipt.get('payload')
+                if (not isinstance(payload, dict) or not integer(payload.get('totalRecordNum'))
+                        or not integer(payload.get('totalAnnouncement')) or not isinstance(payload.get('hasMore'), bool)):
+                    raise DiscoveryError('INVALID_PAGE_SCHEMA')
+                rows = payload.get('announcements')
+                if rows is None and payload['totalRecordNum'] == 0: rows = []
+                if not isinstance(rows, list) or len(rows) > 100: raise DiscoveryError('INVALID_PAGE_SCHEMA')
+                ids = [row.get('announcementId') if isinstance(row, dict) else None for row in rows]
+                ids_valid = all(isinstance(aid, str) and re.fullmatch(r'[0-9]{1,20}', aid) for aid in ids)
+                result['pages'].append({'page': page, 'requestedPageSize': size, 'rowCount': len(rows),
+                    'totalRecordNum': payload['totalRecordNum'], 'totalAnnouncement': payload['totalAnnouncement'],
+                    'declaredPageCount': payload.get('totalpages') if integer(payload.get('totalpages')) else None,
+                    'hasMore': payload['hasMore'], 'announcementIds': ids if ids_valid else [],
+                    'idsValid': ids_valid, 'retrievedAt': stamp(at), 'contentHash': receipt['contentHash'],
+                    'responseBytes': receipt['responseBytes']})
+            except DiscoveryError as error:
+                result['errors'].append(error.code)
+            except Exception:
+                result['errors'].append('PAGE_FETCH_FAILED')
+        if len(result['pages']) == 2:
+            first, second = result['pages']
+            total = first['totalRecordNum']; a, b = set(first['announcementIds']), set(second['announcementIds'])
+            result['checks'] = {
+                'twoNonemptyPages': first['rowCount'] > 0 and second['rowCount'] > 0,
+                'validUniqueIds': first['idsValid'] and second['idsValid']
+                    and len(a) == first['rowCount'] and len(b) == second['rowCount'],
+                'disjointIds': not a.intersection(b),
+                'differentResponses': first['contentHash'] != second['contentHash'],
+                'stableCounts': total == second['totalRecordNum'] and first['totalAnnouncement'] == second['totalAnnouncement'],
+                'requestedPageSizeHonoured': first['rowCount'] == min(size, total)
+                    and second['rowCount'] == min(size, max(0, total-size)),
+                'hasMoreMatches': first['hasMore'] == (size < total) and second['hasMore'] == (2*size < total)}
+            result['overlapCount'] = len(a.intersection(b))
+            result['uniqueAnnouncementIds'] = len(a | b)
+            if not result['errors'] and all(result['checks'].values()): result['status'] = 'verified-pagination'
+        result['errors'] = sorted(set(result['errors']))
+    verified = all(item['status'] == 'verified-pagination' for item in results if item['requiredForEnumeration'])
+    return {'schemaVersion': 1, 'artifactKind': 'pagination-probe', 'observedAt': stamp(observed), 'asOf': cutoff.isoformat(),
+        'sourceUrl': ENDPOINT, 'entryUrl': ENTRY, 'sourceScriptUrl': SOURCE_SCRIPT,
+        'officialUiPageSize': 30, 'requestCount': requests, 'requestLimit': 8 if controls else 4,
+        'status': 'verified-pagination' if verified else 'partial', 'mayEnumerate': verified,
+        'verifiedPageSize': 30 if verified else None, 'profiles': results,
+        'windowEnumerationComplete': False, 'allQuarterReportsVerified': False,
+        'historicalUniverseVerified': False, 'productionCatalogModified': False}
+
+
+def write_probe(result):
+    raw = json.dumps(result, ensure_ascii=False, separators=(',', ':')).encode()
+    if inspect_content(raw, MAX_PROBE_BYTES): raise DiscoveryError('PUBLICATION_REJECTED')
+    PROBE_OUTPUT.mkdir(parents=True, exist_ok=True)
+    temporary = PROBE_OUTPUT / 'summary.tmp'
+    temporary.write_bytes(raw); temporary.replace(PROBE_OUTPUT / 'summary.json')
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -459,15 +548,31 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--as-of', default='2026-10-26')
     parser.add_argument('--include-q2-late', action='store_true')
+    parser.add_argument('--mode', choices=('pagination-probe', 'enumerate'), default='enumerate')
     args = parser.parse_args(argv)
     if os.environ.get('GITHUB_ACTIONS') != 'true':
         print(json.dumps({'status': 'failed', 'errorCode': 'ACTIONS_REQUIRED'}))
         return 2
     try:
+        if args.mode == 'pagination-probe':
+            transport = ActionsTransport(max_requests=8, max_seconds=150)
+            verification = pagination_probe(fetch_page=transport, observed_at=dt.datetime.now(UTC), as_of=args.as_of)
+            write_probe(verification)
+            print(json.dumps({'status': verification['status'], 'mayEnumerate': verification['mayEnumerate'],
+                'requestCount': verification['requestCount'], 'historicalUniverseVerified': False,
+                'productionCatalogModified': False}))
+            return 0 if verification['mayEnumerate'] else 1
         transport = ActionsTransport(); results = []
+        verification = pagination_probe(fetch_page=transport, observed_at=dt.datetime.now(UTC), as_of=args.as_of, controls=False)
+        write_probe(verification)
+        if not verification['mayEnumerate']: raise DiscoveryError('PAGINATION_NOT_VERIFIED')
         for period in ('2026Q2', '2026Q3'):
-            results.append(discover_period(period, as_of=args.as_of, fetch_page=transport,
-                observed_at=dt.datetime.now(UTC), include_q2_late=args.include_q2_late))
+            result = discover_period(period, as_of=args.as_of, fetch_page=transport,
+                observed_at=dt.datetime.now(UTC), include_q2_late=args.include_q2_late)
+            result['paginationVerification'] = {'status': verification['status'], 'pageSize': verification['verifiedPageSize'],
+                'observedAt': verification['observedAt'], 'requestCount': verification['requestCount'],
+                'requiredProfiles': ['q2-empty-30', 'q3-empty-30']}
+            results.append(result)
         encoded = artifacts_for(results)
         complete = all(result['windowEnumerationComplete'] for result in results)
         status = 'window-enumerated' if complete else 'partial'
@@ -479,6 +584,14 @@ def main(argv=None):
     except Exception:
         encoded = {'summary.json': b'{"status":"failed","errorCode":"DISCOVERY_FAILED","historicalUniverseVerified":false,"allQuarterReportsVerified":false,"productionCatalogModified":false}'}
         complete = False; status = 'failed'
+    if args.mode == 'pagination-probe':
+        # A failed diagnostic has no authority to replace discovery candidates.
+        PROBE_OUTPUT.mkdir(parents=True, exist_ok=True)
+        raw = encoded['summary.json']
+        if inspect_content(raw, MAX_PROBE_BYTES): return 1
+        temporary = PROBE_OUTPUT / 'summary.tmp'; temporary.write_bytes(raw); temporary.replace(PROBE_OUTPUT / 'summary.json')
+        print(json.dumps({'status': status, 'mayEnumerate': False, 'productionCatalogModified': False}))
+        return 1
     OUTPUT.mkdir(parents=True, exist_ok=True)
     # No previous owned artifact may survive an unsuccessful verification.
     owned = re.compile(r'(?:summary|candidates|(?:announcements|codes)-2026Q[23]-[0-9]{4})\.json')
