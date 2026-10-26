@@ -13,7 +13,9 @@ import sys
 
 from traversal import atomic_json, read_json
 from publication_guard import inspect_content, content_limit
-from quarter_catalog import compose_quarter_catalog, freeze_catalog, validate_catalog_lock
+from quarter_catalog import (compose_quarter_catalog, freeze_catalog, validate_catalog_lock,
+                             normalize_overlay, recover_historical_overlay, combine_historical_overlays,
+                             historical_candidate_codes, report_candidate_codes)
 
 PERIODS = {
     '2026Q2': ('2026-06-30', '2026-03-31'),
@@ -79,6 +81,81 @@ def refresh_directory(root, as_of):
         return {'status': 'cached', 'asOf': current.get('asOf'), 'errorCode': 'DIRECTORY_REFRESH_FAILED'}
 
 
+def fetch_historical_overlay():
+    # The adapter also checks Actions; importing it never downloads the source.
+    from historical_universe import fetch_official_overlay
+    return fetch_official_overlay()
+
+
+def historical_error(error):
+    code = getattr(error, 'code', None)
+    return {'NETWORK_ERROR': 'HISTORICAL_NETWORK_ERROR', 'TIMEOUT': 'HISTORICAL_TIMEOUT',
+            'HTTP_REJECTED': 'HISTORICAL_HTTP_REJECTED', 'SOURCE_HASH_MISMATCH': 'HISTORICAL_SOURCE_HASH_MISMATCH',
+            'PUBLICATION_REJECTED': 'HISTORICAL_PUBLICATION_REJECTED'}.get(code, 'HISTORICAL_PARSE_FAILED')
+
+
+def retained_report_candidates(root, quarter):
+    """A damaged directory must not remove otherwise retained report records."""
+    directory = Path(root) / 'periods' / quarter
+    try:
+        manifest = read_json(directory / 'latest.json', optional=True)
+        if (not isinstance(manifest, dict) or manifest.get('schemaVersion') != 1 or manifest.get('sourceMode') != 'actions'
+                or manifest.get('targetPeriodEnd') != PERIODS[quarter][0]): return []
+        codes = set(report_candidate_codes(manifest, quarter))
+        files = manifest.get('companyFiles', [])
+        if not isinstance(files, list) or len(files) > 10000: return sorted(codes)
+        for file in files:
+            name = file.get('path') if isinstance(file, dict) else None
+            if not isinstance(name, str) or not re.fullmatch(r'\./data/companies/[A-Za-z0-9_-]{1,64}\.json', name): continue
+            path = directory / name[len('./data/'):]
+            if path.parent.is_symlink(): continue
+            try: codes.update(report_candidate_codes(read_json(path), quarter))
+            except Exception: continue
+        return sorted(codes)
+    except Exception:
+        return []
+
+
+def quarter_history(root, quarter, *, explicit=None, now=None):
+    """Use only validated source rows; a failed refresh never redates cached evidence."""
+    if explicit is not None:
+        value = explicit.get(quarter)
+        if value is not None: normalize_overlay(value, PERIODS[quarter][0], now=now)
+        return value, {'status': 'provided' if value is not None else 'not-configured'}
+    cached, cache_error, candidates = None, None, set()
+    file = Path(root) / 'periods' / quarter / 'catalog.json'
+    if file.exists() or file.is_symlink():
+        try:
+            if file.is_symlink() or file.parent.is_symlink(): raise ValueError('INVALID_HISTORICAL_CACHE')
+            raw = read_json(file)
+            candidates.update(historical_candidate_codes(raw, quarter))
+            cached = recover_historical_overlay(raw, quarter, now=now)
+        except Exception:
+            cache_error = 'HISTORICAL_CACHE_INVALID'
+    if cache_error or not file.exists():
+        candidates.update(retained_report_candidates(root, quarter))
+    if cached: candidates.difference_update(row['code'] for row in cached['records'])
+    def result(value, state):
+        if candidates: state['candidateCodes'] = sorted(candidates)
+        return value, state
+    if quarter != '2026Q2' or os.environ.get('GITHUB_ACTIONS') != 'true':
+        state = {'status': 'cached' if cached else 'not-configured' if quarter != '2026Q2' else 'local-only'}
+        if cache_error: state['cacheErrorCode'] = cache_error
+        return result(cached, state)
+    try:
+        fresh = fetch_historical_overlay()
+        clean = normalize_overlay(fresh, PERIODS[quarter][0], now=now)
+        if not clean['records']: raise ValueError('EMPTY_HISTORICAL_OVERLAY')
+        overlay = combine_historical_overlays(fresh, cached, PERIODS[quarter][0], now=now)
+        state = {'status': 'refreshed' if clean['parseStatus'] == 'complete' else 'partial'}
+        if cache_error: state['cacheErrorCode'] = cache_error
+        return result(overlay, state)
+    except Exception as error:
+        state = {'status': 'cached' if cached else 'unavailable', 'errorCode': historical_error(error)}
+        if cache_error: state['cacheErrorCode'] = cache_error
+        return result(cached, state)
+
+
 def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True, historical_overlays=None):
     selected = selected_periods(quarter)
     # Planning, Actions output and missing-part reconciliation share one bound.
@@ -94,11 +171,17 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
     directory_status = refresh_directory(root, as_of) if refresh else {'status': 'provided'}
     catalog = read_json(root / 'catalog.json')
     base = read_json('config/universe.json')
-    scoped_catalogs = {name: compose_quarter_catalog(catalog, name, overlays.get(name)) for name in selected}
+    configs = {name: quarter_config(base, name, as_of) for name in selected}
+    scoped_catalogs = {}
+    for name in selected:
+        overlay, status = quarter_history(root, name, explicit=historical_overlays)
+        candidates = status.pop('candidateCodes', [])
+        scoped_catalogs[name] = compose_quarter_catalog(catalog, name, overlay, candidates=candidates)
+        scoped_catalogs[name]['quarterUniverse']['historicalRefresh'] = status
     matrix, catalogs = [], {}
     for name in selected:
         output = seed_quarter(root, name)
-        config = quarter_config(base, name, as_of)
+        config = configs[name]
         scoped_catalog = scoped_catalogs[name]
         binding = freeze_catalog(scoped_catalog, name)
         catalogs[name] = binding

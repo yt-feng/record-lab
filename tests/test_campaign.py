@@ -41,7 +41,7 @@ class CampaignTests(unittest.TestCase):
             try:
                 os.chdir(root)
                 with patch('campaign.subprocess.run', side_effect=captured_run):
-                    result = plan('both', '2026-10-26', refresh=False)
+                    result = plan('both', '2026-10-26', refresh=False, historical_overlays={})
                 self.assertEqual(result['batchCount'], 32)
                 matrix = read_json('.cache/plan/matrix.json')
                 self.assertEqual([item['id'] for item in matrix], [str(index) for index in range(32)])
@@ -114,7 +114,7 @@ class CampaignTests(unittest.TestCase):
             try:
                 os.chdir(root)
                 child_runtime.start()
-                plan('both', '2026-10-26', shards=1, batch_size=2, refresh=False)
+                plan('both', '2026-10-26', shards=1, batch_size=2, refresh=False, historical_overlays={})
                 matrix = read_json('.cache/plan/matrix.json')
                 self.assertEqual([item['quarter'] for item in matrix], ['2026Q2', '2026Q3'])
                 self.assertEqual([item['id'] for item in matrix], ['0', '1'])

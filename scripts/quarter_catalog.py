@@ -109,13 +109,122 @@ def normalize_overlay(raw, period_end, *, now=None):
         if row.get("sourceCompanyName") is not None:
             if not _label(row["sourceCompanyName"]): raise ValueError("INVALID_HISTORICAL_RECORD")
             record["sourceCompanyName"] = row["sourceCompanyName"].strip()
+        if row.get("inceptionDate") is not None or row.get("inceptionSourceUrl") is not None:
+            source_urls = {source["sourceUrl"] for source in evidence if source["id"] in {ref["sourceId"] for ref in refs}}
+            if (not _date(row.get("inceptionDate")) or row["inceptionDate"] > period_end
+                    or not _url(row.get("inceptionSourceUrl")) or row["inceptionSourceUrl"] not in source_urls):
+                raise ValueError("INVALID_HISTORICAL_INCEPTION")
+            record.update(inceptionDate=row["inceptionDate"], inceptionSourceUrl=row["inceptionSourceUrl"])
         # Incoming companyCode/companyId and any claimed verified flag are not
         # association evidence and deliberately do not enter the result.
         records.append(record); codes.add(row["code"])
     return {"records": records, "evidence": evidence, "parseStatus": raw["parseStatus"]}
 
 
-def compose_quarter_catalog(current, quarter, overlay=None, *, legacy=False, now=None):
+def recover_historical_overlay(catalog, quarter, *, now=None):
+    """Revalidate stored row/source references without creating a new observation."""
+    period = PERIODS[quarter]
+    if (not isinstance(catalog, dict) or catalog.get("schemaVersion") != 1 or catalog.get("targetPeriodEnd") != period
+            or not isinstance(catalog.get("funds"), list) or len(catalog["funds"]) > 150000):
+        raise ValueError("INVALID_HISTORICAL_CACHE")
+    scope = catalog.get("quarterUniverse")
+    if (not isinstance(scope, dict) or scope.get("schemaVersion") != 1 or scope.get("targetPeriodEnd") != period
+            or scope.get("historicalUniverseVerified") is not False or not isinstance(scope.get("sources"), list)):
+        raise ValueError("INVALID_HISTORICAL_CACHE")
+    records, codes = [], set()
+    for row in catalog["funds"]:
+        if (not isinstance(row, dict) or not isinstance(row.get("code"), str)
+                or not re.fullmatch(r"[0-9]{6}", row["code"]) or row["code"] in codes):
+            raise ValueError("INVALID_HISTORICAL_CACHE")
+        codes.add(row["code"])
+        if "historicalPresenceEvidence" not in row: continue
+        record = {"code": row["code"], "name": row.get("name"), "type": row.get("type"),
+                  "evidence": row["historicalPresenceEvidence"]}
+        for original, name in (("historicalSourceCompanyName", "sourceCompanyName"),
+                               ("historicalInceptionDate", "inceptionDate"),
+                               ("historicalInceptionSourceUrl", "inceptionSourceUrl")):
+            if original in row: record[name] = row[original]
+        records.append(record)
+    if not records and not scope["sources"]:
+        if scope.get("historicalParseStatus") != "unchecked": raise ValueError("INVALID_HISTORICAL_CACHE")
+        return None
+    if not records or scope.get("historicalSourceCount") != len(scope["sources"]):
+        raise ValueError("INVALID_HISTORICAL_CACHE")
+    overlay = {"schemaVersion": 1, "targetPeriodEnd": period, "records": records,
+               "evidence": copy.deepcopy(scope["sources"]), "parseStatus": scope.get("historicalParseStatus")}
+    normalized = normalize_overlay(overlay, period, now=now)
+    # Missing cached rows cannot inherit the original parser's complete status.
+    expected_counts = scope.get("historicalSourceRecordCounts")
+    if expected_counts is not None and (not isinstance(expected_counts, dict)
+            or set(expected_counts) != {source["id"] for source in normalized["evidence"]}
+            or any(type(count) is not int or not 0 <= count <= 150000 for count in expected_counts.values())):
+        raise ValueError("INVALID_HISTORICAL_CACHE")
+    for source in normalized["evidence"]:
+        count = sum(any(ref["sourceId"] == source["id"] for ref in row["evidence"]) for row in normalized["records"])
+        if not count: raise ValueError("INVALID_HISTORICAL_CACHE")
+        expected = expected_counts[source["id"]] if expected_counts is not None else source.get("parsedRows")
+        if expected is None or count != expected:
+            normalized["parseStatus"] = "partial"
+    return {"schemaVersion": 1, "targetPeriodEnd": period, **normalized}
+
+
+def historical_candidate_codes(catalog, quarter):
+    """Keep same-quarter known codes without inheriting unverified source claims."""
+    if (not isinstance(catalog, dict) or type(catalog.get("schemaVersion")) is not int or catalog.get("schemaVersion") != 1
+            or catalog.get("targetPeriodEnd") != PERIODS[quarter] or catalog.get("quarter", quarter) != quarter
+            or not isinstance(catalog.get("funds"), list) or len(catalog["funds"]) > 150000):
+        return []
+    scope = catalog.get("quarterUniverse")
+    if isinstance(scope, dict) and scope.get("targetPeriodEnd", PERIODS[quarter]) != PERIODS[quarter]: return []
+    return sorted({row["code"] for row in catalog["funds"] if isinstance(row, dict)
+                   and isinstance(row.get("code"), str) and re.fullmatch(r"[0-9]{6}", row["code"]) and row["code"] != "000000"})
+
+
+def report_candidate_codes(document, quarter):
+    """Read only code references; the normal merger still validates old reports."""
+    period = PERIODS[quarter]
+    if (not isinstance(document, dict) or document.get("schemaVersion") != 1 or document.get("sourceMode") != "actions"
+            or document.get("targetPeriodEnd") != period or not _date(document.get("asOf")) or document["asOf"] < period
+            or not _stamp(document.get("retrievedAt")) or not isinstance(document.get("funds"), list)
+            or len(document["funds"]) > 1000): return []
+    codes = []
+    for row in document["funds"]:
+        report = row.get("selectedReport") if isinstance(row, dict) else None
+        if (not isinstance(report, dict) or report.get("periodEnd") != period or not _url(report.get("sourceUrl"))
+                or not isinstance(row.get("code"), str) or not re.fullmatch(r"[0-9]{6}", row["code"]) or row["code"] == "000000"):
+            continue
+        codes.append(row["code"])
+    return sorted(set(codes))
+
+
+def combine_historical_overlays(fresh, previous, period_end, *, now=None):
+    """Retain old sourced codes absent from a new source, including partial parses."""
+    new = normalize_overlay(fresh, period_end, now=now)
+    if previous is None: return {"schemaVersion": 1, "targetPeriodEnd": period_end, **new}
+    old = normalize_overlay(previous, period_end, now=now)
+    present = {row["code"] for row in new["records"]}
+    retained = [copy.deepcopy(row) for row in old["records"] if row["code"] not in present]
+    sources = {source["id"]: source for source in new["evidence"]}
+    used = {ref["sourceId"] for row in retained for ref in row["evidence"]}
+    renamed = {}
+    for source in old["evidence"]:
+        if source["id"] not in used: continue
+        identity = source["id"]
+        if identity in sources and sources[identity] != source:
+            digest = hashlib.sha256(json.dumps(source, sort_keys=True, separators=(',', ':')).encode()).hexdigest()[:16]
+            identity = source["id"][:65] + '-retained-' + digest
+        if identity in sources and sources[identity] != {**source, "id": identity}:
+            raise ValueError("HISTORICAL_SOURCE_CONFLICT")
+        sources[identity] = {**source, "id": identity}; renamed[source["id"]] = identity
+    for row in retained:
+        for ref in row["evidence"]: ref["sourceId"] = renamed[ref["sourceId"]]
+    result = {"schemaVersion": 1, "targetPeriodEnd": period_end, "records": new["records"] + retained,
+              "evidence": list(sources.values()), "parseStatus": "partial" if new["parseStatus"] != "complete"
+              or retained and old["parseStatus"] != "complete" else "complete"}
+    return {"schemaVersion": 1, "targetPeriodEnd": period_end, **normalize_overlay(result, period_end, now=now)}
+
+
+def compose_quarter_catalog(current, quarter, overlay=None, *, legacy=False, now=None, candidates=()):
     if quarter not in PERIODS or not isinstance(current, dict) or current.get("schemaVersion") != 1:
         raise ValueError("INVALID_QUARTER_CATALOG")
     if not isinstance(current.get("funds"), list) or not isinstance(current.get("companies"), list) or not isinstance(current.get("coverage"), dict):
@@ -129,24 +238,43 @@ def compose_quarter_catalog(current, quarter, overlay=None, *, legacy=False, now
     normalized = normalize_overlay(overlay, PERIODS[quarter], now=now) if overlay is not None else {"records": [], "evidence": [], "parseStatus": "unchecked"}
     original_codes = set(records)
     sources = {item["id"]: item for item in normalized["evidence"]}
+    historical_codes = {row["code"] for row in normalized["records"]}
     for row in normalized["records"]:
         if row["code"] not in records:
             records[row["code"]] = {"code": row["code"], "name": row["name"], "type": row["type"],
                 "companyCode": None, "companyName": None, "companyId": None, "company": None, "mappingStatus": "unmapped",
                 "catalogSourceUrl": sources[row["evidence"][0]["sourceId"]]["sourceUrl"]}
         records[row["code"]]["historicalPresenceEvidence"] = row["evidence"]
+        records[row["code"]].pop("historicalCandidate", None)
         if row.get("sourceCompanyName"):
             records[row["code"]]["historicalSourceCompanyName"] = row["sourceCompanyName"]
+        if row.get("inceptionDate"):
+            records[row["code"]].update(historicalInceptionDate=row["inceptionDate"],
+                                        historicalInceptionSourceUrl=row["inceptionSourceUrl"])
+    if not isinstance(candidates, (list, tuple)) or len(candidates) > 150000:
+        raise ValueError("INVALID_HISTORICAL_CANDIDATES")
+    for code in candidates:
+        if not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}", code) or code == "000000":
+            raise ValueError("INVALID_HISTORICAL_CANDIDATES")
+        if code not in records:
+            records[code] = {"code": code, "name": "历史待核验产品 " + code, "type": "未分类", "companyCode": None,
+                             "companyName": None, "companyId": None, "company": None, "mappingStatus": "unmapped",
+                             "historicalCandidate": True}
     result.update(targetPeriodEnd=PERIODS[quarter], quarter=quarter, fundCount=len(records),
                   funds=sorted(records.values(), key=lambda row: row["code"]))
     unmapped = sum(not (row.get("companyCode") or row.get("companyId")) for row in records.values())
+    candidate_count = sum(row.get("historicalCandidate") is True for row in records.values())
     result["coverage"].update(fundCount=len(records), mappedCount=len(records)-unmapped, unmappedCount=unmapped)
     result["quarterUniverse"] = {"schemaVersion": 1, "targetPeriodEnd": PERIODS[quarter],
         "currentDirectoryComplete": current["coverage"].get("directoryComplete") is True,
         "historicalUniverseVerified": False,
-        "status": "supplemented-unverified" if normalized["evidence"] or normalized["records"] else "current-directory-only",
-        "historicalSourceCount": len(normalized["evidence"]), "historicalAddedFundCount": len(set(records)-original_codes),
-        "historicalParseStatus": normalized["parseStatus"], "recordUnit": "fund-share-code", "sources": normalized["evidence"]}
+        "status": "supplemented-unverified" if normalized["evidence"] or normalized["records"] or candidate_count else "current-directory-only",
+        "historicalSourceCount": len(normalized["evidence"]), "historicalAddedFundCount": len(historical_codes-original_codes),
+        "historicalCandidateFundCount": candidate_count,
+        "historicalSourceRecordCounts": {source["id"]: sum(any(ref["sourceId"] == source["id"] for ref in row["evidence"])
+            for row in normalized["records"]) for source in normalized["evidence"]},
+        "historicalParseStatus": "partial" if candidate_count and normalized["parseStatus"] == "complete" else normalized["parseStatus"],
+        "recordUnit": "fund-share-code", "sources": normalized["evidence"]}
     if legacy: result["quarterUniverse"]["legacyPlanRecovered"] = True
     return result
 
