@@ -671,7 +671,7 @@ class TraversalTests(unittest.TestCase):
         self.assertFalse(closed["continueRun"])
         self.assertIsNone(closed["nextRetryAt"])
 
-    def test_deferred_budget_receipt_preserves_unattempted_state_and_rechecks_tomorrow(self):
+    def test_deferred_budget_receipt_preserves_unattempted_state_and_rechecks_next_wave(self):
         directory, _, config = self.retry_fixture()
         batch = {**config, "funds": [{"code": "000001", "companyCode": "co1"}]}
         raw = {"schemaVersion": 1, "sourceMode": "actions", "targetPeriodEnd": "2026-09-30", "funds": [],
@@ -686,8 +686,9 @@ class TraversalTests(unittest.TestCase):
         self.assertEqual(today["funds"][0]["attempts"], 0)
         self.assertEqual(today["funds"][0]["totalAttempts"], 0)
         self.assertEqual(today["attemptedFunds"], 0)
-        self.assertEqual(today["deferredFunds"], 1)
-        self.assertFalse(today["continueRun"])
+        self.assertEqual(today["deferredFunds"], 0)
+        self.assertEqual(today["funds"][0]["lastDeferredAt"], status["attemptedAt"])
+        self.assertTrue(today["continueRun"])
         tomorrow = traversal.merge_progress(directory, today, config, now="2026-10-27T07:00:00Z")
         self.assertTrue(tomorrow["continueRun"])
         self.assertEqual(tomorrow["deferredFunds"], 0)
@@ -706,8 +707,8 @@ class TraversalTests(unittest.TestCase):
         fund = result["funds"][0]
         self.assertEqual((fund["status"], fund["totalAttempts"]), ("complete", 6))
         self.assertEqual((fund["quality"]["attempts"], fund["quality"]["totalAttempts"]), (2, 5))
-        self.assertEqual(result["deferredFunds"], 1)
-        self.assertFalse(result["continueRun"])
+        self.assertEqual(result["deferredFunds"], 0)
+        self.assertTrue(result["continueRun"])
 
     def test_status_preserves_definite_parser_failure_over_missing_report_wrapper(self):
         _, _, config = self.retry_fixture()

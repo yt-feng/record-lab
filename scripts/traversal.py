@@ -175,6 +175,19 @@ def midnight(value):
     return dt.datetime.combine(value, dt.time(), tzinfo=dt.timezone.utc).isoformat()
 
 
+def retained_deferral_until(previous, now):
+    """Migrate only the old next-day lock for an explicitly unstarted task."""
+    due = instant(previous.get("deferredUntil"))
+    if not due or due <= now:
+        return None
+    deferred = instant(previous.get("lastDeferredAt"))
+    attempted = instant(previous.get("lastAttemptAt"))
+    if (deferred and deferred <= now and (not attempted or deferred > attempted)
+            and due == instant(midnight(deferred.date() + dt.timedelta(days=1)))):
+        return None
+    return previous["deferredUntil"]
+
+
 def retry_lane(lane, limit, recoverable, config, now, daily=True):
     """Open a bounded later cycle; future eligibility never means work now."""
     retry = lane["retry"]
@@ -249,7 +262,7 @@ def base_states(catalog, previous, phase, now, config=None):
                         "attempts": failures, "lastAttemptAt": attempted_at if valid_attempt else None,
                         "totalAttempts": counter(prior.get("totalAttempts"), counter(prior.get("attempts"))),
                         "retry": retry_state(prior.get("retry"), attempted_at if valid_attempt else None, now),
-                        "deferredUntil": prior.get("deferredUntil") if instant(prior.get("deferredUntil")) and instant(prior["deferredUntil"]) > now else None,
+                        "deferredUntil": retained_deferral_until(prior, now),
                         "lastDeferredAt": prior.get("lastDeferredAt") if instant(prior.get("lastDeferredAt")) and instant(prior["lastDeferredAt"]) <= now else None,
                         "errorCode": prior.get("errorCode") if status == "failed" and prior.get("errorCode") in ERROR_CODES else None,
                         "attempted": bool(prior.get("attempted", valid_attempt and prior.get("attribution") != "portfolio-evidence")),
@@ -894,8 +907,11 @@ def fair_lane(codes, states):
     queues = {}
     def order(code):
         state = states[code]
+        # Capacity deferrals are scheduling observations, not source attempts.
+        # Rotate them behind equally attempted work without an overnight lock.
+        activity = [value for value in (instant(state.get("lastAttemptAt")), instant(state.get("lastDeferredAt"))) if value]
         return (state["totalAttempts"] + state["quality"]["totalAttempts"] + state["enrichment"]["totalAttempts"],
-                state.get("lastAttemptAt") or "", code)
+                max(activity).timestamp() if activity else float('-inf'), code)
     for code in sorted(codes, key=order):
         queues.setdefault(states[code]["companyCode"] or "~unmapped", deque()).append(code)
     companies = deque(sorted(queues, key=lambda company: (visits[company], company)))
@@ -1484,8 +1500,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                 if (valid_deferred(item) and (not prior_deferred or attempted > prior_deferred)
                         and (not prior_attempt or attempted > prior_attempt)):
                     state["lastDeferredAt"] = document["attemptedAt"]
-                    until = midnight(attempted.date() + dt.timedelta(days=1))
-                    state["deferredUntil"] = until if instant(until) > current else None
+                    state["deferredUntil"] = None
                 continue
             if status not in TERMINAL | {"failed"}:
                 continue
