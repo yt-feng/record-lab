@@ -1,0 +1,44 @@
+name: Verify source-bound model interpretation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: verify-deepseek-strategy
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /requirements.txt
+            /scripts/
+            /config/
+            /tests/*.py
+            /.github/workflows/verify-deepseek-strategy.yml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Validate synthetic transport and evidence checks
+        run: |
+          python -m unittest discover -s tests -p 'test_deepseek_strategy.py'
+          python -m unittest discover -s tests -p 'test_verify_deepseek_strategy.py'
+      - name: Verify one fixed public report and at most one model request
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: python scripts/verify_deepseek_strategy.py
+      - name: Retain compact checks and bounded literal evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-strategy-verification
+          path: .cache/deepseek-strategy-verification/result.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
