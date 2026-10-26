@@ -238,6 +238,8 @@ class CampaignTests(unittest.TestCase):
                 (period / 'analysis.json').write_text(json.dumps({**latest, 'kind': 'quarter-analysis'}))
                 run.reset_mock(); self.assertEqual(site.ensure_analyses(root), 1); run.assert_called_once()
                 (period / 'analysis.json').write_text(json.dumps({**latest, 'kind': 'quarter-analysis', 'analysisVersion': 5, 'priceUpdatedAt': None}))
+                run.reset_mock(); self.assertEqual(site.ensure_analyses(root), 1); run.assert_called_once()
+                (period / 'analysis.json').write_text(json.dumps({**latest, 'kind': 'quarter-analysis', 'analysisVersion': 6, 'priceUpdatedAt': None}))
                 run.reset_mock(); self.assertEqual(site.ensure_analyses(root), 0); run.assert_not_called()
                 (period / 'latest.json').write_text(json.dumps({**latest, 'priceUpdatedAt': '2026-10-26T12:00:00Z'}))
                 run.reset_mock(); self.assertEqual(site.ensure_analyses(root), 1); run.assert_called_once()

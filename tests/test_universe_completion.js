@@ -24,7 +24,7 @@ test('zero records or a legacy complete flag cannot claim complete industry anal
     now: '2026-10-26T11:00:00Z', progress: { completionStatus: 'complete',
       phase: { targetPeriodEnd: '2026-06-30', baselinePeriodEnd: '2026-03-31' },
       research: { completeFunds: 0, applicableFunds: 0 } } });
-  assert.equal(result.analysisVersion, 5);
+  assert.equal(result.analysisVersion, 6);
   assert.equal(result.coverage.complete, false);
   assert.equal(result.coverage.historicalUniverseVerified, false);
   assert.equal(result.coverage.historicalUniverseStatus, 'unchecked');

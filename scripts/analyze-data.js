@@ -179,7 +179,7 @@ function emptyStock(row, phase) {
       rangeEnd: phase.target, observedCount: 0, completeness: 'partial', isCost: false,
       actualCostKnown: false, sourceUrls: [], sourceCount: 0, sourceUrlsTruncated: false, conflictingObservations: false },
     details: [], _contributions: [], _reportManagers: new Set(), _currentManagers: new Set(), _tenureManagers: new Set(), _partialManagers: new Set(),
-    _priceSources: new Set(), _prices: new Set(), _completePrice: null };
+    _priceSources: new Set(), _prices: new Set(), _completePrice: null, _completePriceConflict: false };
 }
 
 function appendValue(stock, field, value, coverage) {
@@ -327,7 +327,10 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
         if (price) {
           priceRows++; stock._priceSources.add(price.sourceUrl); stock._prices.add(`${price.low}:${price.high}`);
           for (const url of price.sourceUrls || []) if (publicUrl(url)) stock._priceSources.add(url);
-          if (validCompletePrice(price, row.market, row.stockCode, phase.start, phase.target) && !stock._completePrice) stock._completePrice = price;
+          if (validCompletePrice(price, row.market, row.stockCode, phase.start, phase.target)) {
+            if (!stock._completePrice) stock._completePrice = price;
+            else if (stock._completePrice.low !== price.low || stock._completePrice.high !== price.high) stock._completePriceConflict = true;
+          }
           Object.assign(stock.priceRange, { status: 'observed', low: stock.priceRange.low === null ? price.low : Math.min(stock.priceRange.low, price.low),
             high: stock.priceRange.high === null ? price.high : Math.max(stock.priceRange.high, price.high),
             observedCount: Math.max(stock.priceRange.observedCount, price.observedCount) });
@@ -371,8 +374,11 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
     stock.priceRange.conflictingObservations = stock._prices.size > 1;
     if (stock._completePrice) {
       const complete = stock._completePrice;
-      const close = (a, b) => Math.abs(a - b) <= Math.max(1e-6, Math.abs(a) * 1e-6, Math.abs(b) * 1e-6);
-      const consistent = close(stock.priceRange.low, complete.low) && close(stock.priceRange.high, complete.high);
+      // A narrower partial observation can agree with a complete interval. Two
+      // complete intervals must agree exactly, including when one encloses the
+      // other; the envelope alone cannot establish that consistency.
+      const consistent = !stock._completePriceConflict
+        && stock.priceRange.low === complete.low && stock.priceRange.high === complete.high;
       if (consistent) {
         Object.assign(stock.priceRange, retainedCoverage(complete, stock.market, stock.stockCode, phase.start, phase.target), {
           low: complete.low, high: complete.high, observedStart: complete.observedStart, observedEnd: complete.observedEnd,
@@ -412,7 +418,7 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
     && !unknownIdentityHoldingRecords && !conflicts && !invalidRows && !reportOnlyRecords && !coverage.managerEvidenceMissingRecords
     && !coverage.incompletePriceStocks && !coverage.strategySectionIncompleteRecords
     && inputRecords === manifest.coverage?.fundCount) { coverage.status = 'complete'; coverage.complete = true; }
-  const output = { schemaVersion: 1, analysisVersion: 5, kind: 'quarter-analysis', targetPeriodEnd: phase.target, baselinePeriodEnd: phase.baseline,
+  const output = { schemaVersion: 1, analysisVersion: 6, kind: 'quarter-analysis', targetPeriodEnd: phase.target, baselinePeriodEnd: phase.baseline,
     asOf: manifest.asOf, retrievedAt: manifest.retrievedAt, priceUpdatedAt: manifest.priceUpdatedAt || null,
     generatedAt: phase.generation, generation: phase.generation, coverage,
     stocks: ordered, portfolioFiles,
