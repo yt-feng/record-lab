@@ -25,6 +25,7 @@ test('dated zero-stock balance sheet survives normalization and browser validati
 test('zero-stock validator rejects mixed dates, non-stock rows and historical zero with current value', () => {
   for (const text of [evidence.text.replace('- -', '1.00 -'), evidence.text.replace('- -', '- 1.00'),
     evidence.text.replace('股票投资', '股票投资收益'), evidence.text.replaceAll('2026年6月30日', '2025年6月30日'),
+    evidence.text.replaceAll('6月30日', '6月030日'),
     evidence.text.replace('单位：人民币元', '单位：港元'), evidence.text + '\n附加文字']) {
     assert.equal(validZeroStock({ ...evidence, text }), false);
   }

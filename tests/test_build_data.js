@@ -344,7 +344,9 @@ test('a newer official no-equity report replaces former holdings while a same-da
   assert.equal(result.funds[0].status, 'no-equities');
   assert.equal(result.funds[0].selectedReport.periodEnd, '2026-06-30');
   assert.equal(result.funds[0].previousReport.periodEnd, '2026-03-31');
-  assert.equal(result.funds[0].summary.leftDisclosureCount, 0);
+  assert.equal(result.funds[0].summary.leftDisclosureCount, 1);
+  assert.equal(result.funds[0].rows[0].current, null);
+  assert.ok(result.funds[0].rows[0].previous);
   const samePeriodPrevious = build(raw([fund(), fund('000002')]), { config });
   const contradiction = build(raw([fund('000001', { reports: [], noEquitiesEvidence: noEquitiesEvidence() }),
     fund('000002')]), { previous: samePeriodPrevious, config });

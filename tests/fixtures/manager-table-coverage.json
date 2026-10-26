@@ -1,0 +1,694 @@
+{
+  "complete": {
+    "report": {
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly"
+    },
+    "managers": [
+      {
+        "name": "张明",
+        "startDate": "2020-01-01",
+        "endDate": null,
+        "role": "本基金基金经理",
+        "periodStart": "2026-04-01",
+        "periodEnd": "2026-06-30",
+        "activeAtPeriodEnd": true,
+        "evidence": {
+          "sourceUrl": "https://example.org/manager-report.pdf",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "tablePage": 1,
+          "section": "4.1",
+          "text": "张明 本基金基金经理 2020年1月1日 -",
+          "method": "explicit-report-manager-table",
+          "periodEnd": "2026-06-30"
+        }
+      },
+      {
+        "name": "李华",
+        "startDate": "2026-04-01",
+        "endDate": null,
+        "role": "本基金基金经理",
+        "periodStart": "2026-04-01",
+        "periodEnd": "2026-06-30",
+        "activeAtPeriodEnd": true,
+        "evidence": {
+          "sourceUrl": "https://example.org/manager-report.pdf",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "tablePage": 1,
+          "section": "4.1",
+          "text": "李华 本基金基金经理 2026年4月1日 -",
+          "method": "explicit-report-manager-table",
+          "periodEnd": "2026-06-30"
+        }
+      }
+    ],
+    "coverage": {
+      "schemaVersion": 1,
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "periodStart": "2026-04-01",
+      "sourceTextHash": "a856d7df08cb12c4b772f245d0c4c30cef40dfd06541e1d46f10618d36394967",
+      "tables": [
+        {
+          "section": "4.1",
+          "startPage": 1,
+          "endPage": 1,
+          "endSection": "4.2",
+          "heading": "4.1 基金经理（或基金经理小组）简介",
+          "endHeading": "4.2 运作说明",
+          "sectionBounded": true,
+          "pageNumbersVerified": true,
+          "pageLimitReached": false,
+          "ignoredRoles": [],
+          "candidateRows": 2,
+          "parsedRows": 2,
+          "ignoredKnownRoleRows": 0,
+          "excludedRows": 0,
+          "outsidePeriodRows": 0,
+          "duplicateRows": 0
+        }
+      ],
+      "candidateRows": 2,
+      "parsedRows": 2,
+      "ignoredKnownRoleRows": 0,
+      "excludedRows": 0,
+      "outsidePeriodRows": 0,
+      "duplicateRows": 0,
+      "outputManagerCount": 2,
+      "managerKeys": [
+        "[\"张明\",\"2020-01-01\",null,\"本基金基金经理\"]",
+        "[\"李华\",\"2026-04-01\",null,\"本基金基金经理\"]"
+      ],
+      "complete": true,
+      "status": "complete",
+      "method": "bounded-report-manager-tables",
+      "publishedAt": "2026-07-20"
+    }
+  },
+  "invalid-date": {
+    "report": {
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly"
+    },
+    "managers": [
+      {
+        "name": "张明",
+        "startDate": "2020-01-01",
+        "endDate": null,
+        "role": "本基金基金经理",
+        "periodStart": "2026-04-01",
+        "periodEnd": "2026-06-30",
+        "activeAtPeriodEnd": true,
+        "evidence": {
+          "sourceUrl": "https://example.org/manager-report.pdf",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "tablePage": 1,
+          "section": "4.1",
+          "text": "张明 本基金基金经理 2020年1月1日 -",
+          "method": "explicit-report-manager-table",
+          "periodEnd": "2026-06-30"
+        }
+      }
+    ],
+    "coverage": {
+      "schemaVersion": 1,
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "periodStart": "2026-04-01",
+      "sourceTextHash": "a0aa2fa75041873c17ee5d50a3618489bb2e6f7f578b704547e21bb82b45e41e",
+      "tables": [
+        {
+          "section": "4.1",
+          "startPage": 1,
+          "endPage": 1,
+          "endSection": "4.2",
+          "heading": "4.1 基金经理（或基金经理小组）简介",
+          "endHeading": "4.2 运作说明",
+          "sectionBounded": true,
+          "pageNumbersVerified": true,
+          "pageLimitReached": false,
+          "ignoredRoles": [],
+          "candidateRows": 2,
+          "parsedRows": 1,
+          "ignoredKnownRoleRows": 0,
+          "excludedRows": 1,
+          "outsidePeriodRows": 0,
+          "duplicateRows": 0
+        }
+      ],
+      "candidateRows": 2,
+      "parsedRows": 1,
+      "ignoredKnownRoleRows": 0,
+      "excludedRows": 1,
+      "outsidePeriodRows": 0,
+      "duplicateRows": 0,
+      "outputManagerCount": 1,
+      "managerKeys": [
+        "[\"张明\",\"2020-01-01\",null,\"本基金基金经理\"]"
+      ],
+      "complete": false,
+      "status": "partial",
+      "method": "bounded-report-manager-tables",
+      "publishedAt": "2026-07-20"
+    }
+  },
+  "missing-date": {
+    "report": {
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly"
+    },
+    "managers": [
+      {
+        "name": "张明",
+        "startDate": "2020-01-01",
+        "endDate": null,
+        "role": "本基金基金经理",
+        "periodStart": "2026-04-01",
+        "periodEnd": "2026-06-30",
+        "activeAtPeriodEnd": true,
+        "evidence": {
+          "sourceUrl": "https://example.org/manager-report.pdf",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "tablePage": 1,
+          "section": "4.1",
+          "text": "张明 本基金基金经理 2020年1月1日 -",
+          "method": "explicit-report-manager-table",
+          "periodEnd": "2026-06-30"
+        }
+      }
+    ],
+    "coverage": {
+      "schemaVersion": 1,
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "periodStart": "2026-04-01",
+      "sourceTextHash": "054e3129dcd5a3dada5b405fb9a9a76f0f7e7db7e40c8f6c70b22d95762f4a2c",
+      "tables": [
+        {
+          "section": "4.1",
+          "startPage": 1,
+          "endPage": 1,
+          "endSection": "4.2",
+          "heading": "4.1 基金经理（或基金经理小组）简介",
+          "endHeading": "4.2 运作说明",
+          "sectionBounded": true,
+          "pageNumbersVerified": true,
+          "pageLimitReached": false,
+          "ignoredRoles": [],
+          "candidateRows": 2,
+          "parsedRows": 1,
+          "ignoredKnownRoleRows": 0,
+          "excludedRows": 1,
+          "outsidePeriodRows": 0,
+          "duplicateRows": 0
+        }
+      ],
+      "candidateRows": 2,
+      "parsedRows": 1,
+      "ignoredKnownRoleRows": 0,
+      "excludedRows": 1,
+      "outsidePeriodRows": 0,
+      "duplicateRows": 0,
+      "outputManagerCount": 1,
+      "managerKeys": [
+        "[\"张明\",\"2020-01-01\",null,\"本基金基金经理\"]"
+      ],
+      "complete": false,
+      "status": "partial",
+      "method": "bounded-report-manager-tables",
+      "publishedAt": "2026-07-20"
+    }
+  },
+  "unknown-page": {
+    "report": {
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly"
+    },
+    "managers": [
+      {
+        "name": "张明",
+        "startDate": "2020-01-01",
+        "endDate": null,
+        "role": "本基金基金经理",
+        "periodStart": "2026-04-01",
+        "periodEnd": "2026-06-30",
+        "activeAtPeriodEnd": true,
+        "evidence": {
+          "sourceUrl": "https://example.org/manager-report.pdf",
+          "page": 4,
+          "pages": [
+            4
+          ],
+          "tablePage": 4,
+          "section": "4.1",
+          "text": "张明 本基金基金经理 2020年1月1日 -",
+          "method": "explicit-report-manager-table",
+          "periodEnd": "2026-06-30"
+        }
+      }
+    ],
+    "coverage": {
+      "schemaVersion": 1,
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "periodStart": "2026-04-01",
+      "sourceTextHash": "03c50d6a21567d64d9cebf2f65e78b424129df05fc9f5d1495f7645817985420",
+      "tables": [
+        {
+          "section": "4.1",
+          "startPage": 4,
+          "endPage": null,
+          "endSection": "4.2",
+          "heading": "4.1 基金经理（或基金经理小组）简介",
+          "endHeading": "4.2 运作说明",
+          "sectionBounded": true,
+          "pageNumbersVerified": false,
+          "pageLimitReached": false,
+          "ignoredRoles": [],
+          "candidateRows": 2,
+          "parsedRows": 1,
+          "ignoredKnownRoleRows": 0,
+          "excludedRows": 1,
+          "outsidePeriodRows": 0,
+          "duplicateRows": 0
+        }
+      ],
+      "candidateRows": 2,
+      "parsedRows": 1,
+      "ignoredKnownRoleRows": 0,
+      "excludedRows": 1,
+      "outsidePeriodRows": 0,
+      "duplicateRows": 0,
+      "outputManagerCount": 1,
+      "managerKeys": [
+        "[\"张明\",\"2020-01-01\",null,\"本基金基金经理\"]"
+      ],
+      "complete": false,
+      "status": "partial",
+      "method": "bounded-report-manager-tables",
+      "publishedAt": "2026-07-20"
+    }
+  },
+  "no-end-boundary": {
+    "report": {
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly"
+    },
+    "managers": [
+      {
+        "name": "张明",
+        "startDate": "2020-01-01",
+        "endDate": null,
+        "role": "本基金基金经理",
+        "periodStart": "2026-04-01",
+        "periodEnd": "2026-06-30",
+        "activeAtPeriodEnd": true,
+        "evidence": {
+          "sourceUrl": "https://example.org/manager-report.pdf",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "tablePage": 1,
+          "section": "4.1",
+          "text": "张明 本基金基金经理 2020年1月1日 -",
+          "method": "explicit-report-manager-table",
+          "periodEnd": "2026-06-30"
+        }
+      }
+    ],
+    "coverage": {
+      "schemaVersion": 1,
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "periodStart": "2026-04-01",
+      "sourceTextHash": "e416d192aa201dff98b8de3f02ad9fde92133884ba2f549cbc3b20b5dbbf075d",
+      "tables": [
+        {
+          "section": "4.1",
+          "startPage": 1,
+          "endPage": 1,
+          "endSection": null,
+          "heading": "4.1 基金经理（或基金经理小组）简介",
+          "endHeading": null,
+          "sectionBounded": false,
+          "pageNumbersVerified": true,
+          "pageLimitReached": false,
+          "ignoredRoles": [],
+          "candidateRows": 1,
+          "parsedRows": 1,
+          "ignoredKnownRoleRows": 0,
+          "excludedRows": 0,
+          "outsidePeriodRows": 0,
+          "duplicateRows": 0
+        }
+      ],
+      "candidateRows": 1,
+      "parsedRows": 1,
+      "ignoredKnownRoleRows": 0,
+      "excludedRows": 0,
+      "outsidePeriodRows": 0,
+      "duplicateRows": 0,
+      "outputManagerCount": 1,
+      "managerKeys": [
+        "[\"张明\",\"2020-01-01\",null,\"本基金基金经理\"]"
+      ],
+      "complete": false,
+      "status": "partial",
+      "method": "bounded-report-manager-tables",
+      "publishedAt": "2026-07-20"
+    }
+  },
+  "internal-six-page-cap": {
+    "report": {
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly"
+    },
+    "managers": [
+      {
+        "name": "张明",
+        "startDate": "2020-01-01",
+        "endDate": null,
+        "role": "本基金基金经理",
+        "periodStart": "2026-04-01",
+        "periodEnd": "2026-06-30",
+        "activeAtPeriodEnd": true,
+        "evidence": {
+          "sourceUrl": "https://example.org/manager-report.pdf",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "tablePage": 1,
+          "section": "4.1",
+          "text": "张明 本基金基金经理 2020年1月1日 -",
+          "method": "explicit-report-manager-table",
+          "periodEnd": "2026-06-30"
+        }
+      }
+    ],
+    "coverage": {
+      "schemaVersion": 1,
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "periodStart": "2026-04-01",
+      "sourceTextHash": "c53e5880fe172357505232645ef43efa7c749aca9560d553d880e2d4b38bdf4a",
+      "tables": [
+        {
+          "section": "4.1",
+          "startPage": 1,
+          "endPage": 6,
+          "endSection": null,
+          "heading": "4.1 基金经理（或基金经理小组）简介",
+          "endHeading": null,
+          "sectionBounded": false,
+          "pageNumbersVerified": true,
+          "pageLimitReached": true,
+          "ignoredRoles": [],
+          "candidateRows": 2,
+          "parsedRows": 1,
+          "ignoredKnownRoleRows": 0,
+          "excludedRows": 1,
+          "outsidePeriodRows": 0,
+          "duplicateRows": 0
+        }
+      ],
+      "candidateRows": 2,
+      "parsedRows": 1,
+      "ignoredKnownRoleRows": 0,
+      "excludedRows": 1,
+      "outsidePeriodRows": 0,
+      "duplicateRows": 0,
+      "outputManagerCount": 1,
+      "managerKeys": [
+        "[\"张明\",\"2020-01-01\",null,\"本基金基金经理\"]"
+      ],
+      "complete": false,
+      "status": "partial",
+      "method": "bounded-report-manager-tables",
+      "publishedAt": "2026-07-20"
+    }
+  },
+  "unsupported-name": {
+    "report": {
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly"
+    },
+    "managers": [
+      {
+        "name": "张明",
+        "startDate": "2020-01-01",
+        "endDate": null,
+        "role": "本基金基金经理",
+        "periodStart": "2026-04-01",
+        "periodEnd": "2026-06-30",
+        "activeAtPeriodEnd": true,
+        "evidence": {
+          "sourceUrl": "https://example.org/manager-report.pdf",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "tablePage": 1,
+          "section": "4.1",
+          "text": "张明 本基金基金经理 2020年1月1日 -",
+          "method": "explicit-report-manager-table",
+          "periodEnd": "2026-06-30"
+        }
+      }
+    ],
+    "coverage": {
+      "schemaVersion": 1,
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "periodStart": "2026-04-01",
+      "sourceTextHash": "3333f586fd953d4df768d31e0baefbf4781b3493b1f89c6a817c0d0938c51b1a",
+      "tables": [
+        {
+          "section": "4.1",
+          "startPage": 1,
+          "endPage": 1,
+          "endSection": "4.2",
+          "heading": "4.1 基金经理（或基金经理小组）简介",
+          "endHeading": "4.2 运作说明",
+          "sectionBounded": true,
+          "pageNumbersVerified": true,
+          "pageLimitReached": false,
+          "ignoredRoles": [],
+          "candidateRows": 2,
+          "parsedRows": 1,
+          "ignoredKnownRoleRows": 0,
+          "excludedRows": 1,
+          "outsidePeriodRows": 0,
+          "duplicateRows": 0
+        }
+      ],
+      "candidateRows": 2,
+      "parsedRows": 1,
+      "ignoredKnownRoleRows": 0,
+      "excludedRows": 1,
+      "outsidePeriodRows": 0,
+      "duplicateRows": 0,
+      "outputManagerCount": 1,
+      "managerKeys": [
+        "[\"张明\",\"2020-01-01\",null,\"本基金基金经理\"]"
+      ],
+      "complete": false,
+      "status": "partial",
+      "method": "bounded-report-manager-tables",
+      "publishedAt": "2026-07-20"
+    }
+  },
+  "other-partial": {
+    "report": {
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly"
+    },
+    "managers": [
+      {
+        "name": "李华",
+        "startDate": "2026-04-01",
+        "endDate": null,
+        "role": "本基金基金经理",
+        "periodStart": "2026-04-01",
+        "periodEnd": "2026-06-30",
+        "activeAtPeriodEnd": true,
+        "evidence": {
+          "sourceUrl": "https://example.org/manager-report.pdf",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "tablePage": 1,
+          "section": "4.1",
+          "text": "李华 本基金基金经理 2026年4月1日 -",
+          "method": "explicit-report-manager-table",
+          "periodEnd": "2026-06-30"
+        }
+      }
+    ],
+    "coverage": {
+      "schemaVersion": 1,
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "periodStart": "2026-04-01",
+      "sourceTextHash": "b451537761cf454e1f61b9836392053999742265c9a906a84020f4dd4c25448d",
+      "tables": [
+        {
+          "section": "4.1",
+          "startPage": 1,
+          "endPage": 1,
+          "endSection": "4.2",
+          "heading": "4.1 基金经理（或基金经理小组）简介",
+          "endHeading": "4.2 运作说明",
+          "sectionBounded": true,
+          "pageNumbersVerified": true,
+          "pageLimitReached": false,
+          "ignoredRoles": [],
+          "candidateRows": 2,
+          "parsedRows": 1,
+          "ignoredKnownRoleRows": 0,
+          "excludedRows": 1,
+          "outsidePeriodRows": 0,
+          "duplicateRows": 0
+        }
+      ],
+      "candidateRows": 2,
+      "parsedRows": 1,
+      "ignoredKnownRoleRows": 0,
+      "excludedRows": 1,
+      "outsidePeriodRows": 0,
+      "duplicateRows": 0,
+      "outputManagerCount": 1,
+      "managerKeys": [
+        "[\"李华\",\"2026-04-01\",null,\"本基金基金经理\"]"
+      ],
+      "complete": false,
+      "status": "partial",
+      "method": "bounded-report-manager-tables",
+      "publishedAt": "2026-07-20"
+    }
+  },
+  "interim": {
+    "report": {
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "semiannual"
+    },
+    "managers": [
+      {
+        "name": "张明",
+        "startDate": "2020-01-01",
+        "endDate": "2026-03-31",
+        "role": "本基金基金经理",
+        "periodStart": "2026-01-01",
+        "periodEnd": "2026-06-30",
+        "activeAtPeriodEnd": false,
+        "evidence": {
+          "sourceUrl": "https://example.org/manager-report.pdf",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "tablePage": 1,
+          "section": "4.1",
+          "text": "张明 本基金基金经理 2020年1月1日 2026年3月31日",
+          "method": "explicit-report-manager-table",
+          "periodEnd": "2026-06-30"
+        }
+      },
+      {
+        "name": "李华",
+        "startDate": "2026-04-01",
+        "endDate": null,
+        "role": "本基金基金经理",
+        "periodStart": "2026-01-01",
+        "periodEnd": "2026-06-30",
+        "activeAtPeriodEnd": true,
+        "evidence": {
+          "sourceUrl": "https://example.org/manager-report.pdf",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "tablePage": 1,
+          "section": "4.1",
+          "text": "李华 本基金基金经理 2026年4月1日 -",
+          "method": "explicit-report-manager-table",
+          "periodEnd": "2026-06-30"
+        }
+      }
+    ],
+    "coverage": {
+      "schemaVersion": 1,
+      "sourceUrl": "https://example.org/manager-report.pdf",
+      "periodEnd": "2026-06-30",
+      "kind": "semiannual",
+      "periodStart": "2026-01-01",
+      "sourceTextHash": "3b167e5a7f7fbda77586b077e8e6275ed0ec048bc7dc3ee824102d80ad1cbec9",
+      "tables": [
+        {
+          "section": "4.1",
+          "startPage": 1,
+          "endPage": 1,
+          "endSection": "4.2",
+          "heading": "4.1 基金经理（或基金经理小组）简介",
+          "endHeading": "4.2 运作说明",
+          "sectionBounded": true,
+          "pageNumbersVerified": true,
+          "pageLimitReached": false,
+          "ignoredRoles": [],
+          "candidateRows": 2,
+          "parsedRows": 2,
+          "ignoredKnownRoleRows": 0,
+          "excludedRows": 0,
+          "outsidePeriodRows": 0,
+          "duplicateRows": 0
+        }
+      ],
+      "candidateRows": 2,
+      "parsedRows": 2,
+      "ignoredKnownRoleRows": 0,
+      "excludedRows": 0,
+      "outsidePeriodRows": 0,
+      "duplicateRows": 0,
+      "outputManagerCount": 2,
+      "managerKeys": [
+        "[\"张明\",\"2020-01-01\",\"2026-03-31\",\"本基金基金经理\"]",
+        "[\"李华\",\"2026-04-01\",null,\"本基金基金经理\"]"
+      ],
+      "complete": true,
+      "status": "complete",
+      "method": "bounded-report-manager-tables",
+      "publishedAt": "2026-08-28"
+    }
+  }
+}

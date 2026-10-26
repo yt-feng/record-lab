@@ -107,7 +107,10 @@
         const row = element('tr'); const first = element('td'); const button = element('button', `${stock.stockName} ${stock.stockCode}`, 'text-button');
         button.addEventListener('click', () => showStock(stock)); first.append(button, element('small', stock.market, 'cell-sub')); row.append(first);
         const prices = stock.priceRange;
-        const interval = prices?.status === 'observed' && finite(prices.low) && finite(prices.high) ? `${prices.low} — ${prices.high} ${prices.currency}` : '未取得可比较区间';
+        const priceCoverage = prices?.coverageVersion === 2 && prices?.completeness === 'complete'
+          ? '交易日完整' : '已观测，完整区间待补全';
+        const interval = prices?.status === 'observed' && finite(prices.low) && finite(prices.high)
+          ? `${prices.low} — ${prices.high} ${prices.currency} · ${priceCoverage}` : '未取得可比较区间';
         [`${stock.currentPortfolioCount} / ${stock.identityUnresolvedCount}`, money(stock.disclosedValueYuan), money(stock.navWeightEstimateYuan),
           `${stock.changes.increase || 0} / ${stock.changes.decrease || 0}`, `${stock.changes.enteredDisclosure || 0} / ${stock.changes.leftDisclosure || 0}`, interval].forEach(value => row.append(element('td', value)));
         body.append(row);
@@ -155,11 +158,14 @@
           detail.append(element('p', `披露市值 ${money(item.disclosedValueYuan)} · 规模乘比重 ${money(item.navWeightEstimateYuan)} · ${item.aggregationEligible ? '身份可归并' : '身份待核验，金额未合计'}`));
           const number = value => finite(value) ? new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 4 }).format(value) : '未披露';
           detail.append(element('p', `本期持股 ${number(item.current?.shares)} · 上期持股 ${number(item.previous?.shares)} · 股数差 ${number(item.sharesDelta)} · 本期净资产占比 ${finite(item.current?.weightPct) ? number(item.current.weightPct) + '%' : '未披露'}`));
-          const attribution = { report: '报告经理表已核验', 'tenure-overlap': '任期重叠，报告经理表尚未核验', 'current-profile': '当前公开资料，非报告期确认' }[portfolio.managerAttribution] || '待核验';
+          const attribution = { report: portfolio.managerCoverageStatus === 'complete' ? '报告期内经理，经理表完整' : '报告期内已核验经理，经理表待补',
+            'tenure-overlap': '任期重叠，报告经理表尚未核验', 'current-profile': '当前公开资料，非报告期确认' }[portfolio.managerAttribution] || '待核验';
           detail.append(element('p', `报告期 ${report.periodEnd || '待核验'} · 净资产 ${money(report.navYuan)} · 经理归属：${attribution}`, 'narrative-meta'));
+          if (portfolio.managerAttribution === 'report') detail.append(element('p', '报告期内名单可能包含已离任经理，不能将每位经理都视为期末组合的管理人。', 'narrative-meta'));
           for (const manager of managerList) {
             if (!manager || typeof manager === 'string' || portfolio.managerAttribution !== 'report' || !manager.evidence) continue;
-            detail.append(element('p', `${manager.name} · 任职 ${manager.startDate || '待核验'} 至 ${manager.endDate || '报告期末仍任职'}`, 'narrative-meta'));
+            const term = manager.endDate && manager.endDate <= report.periodEnd ? '期内离任' : '期末在任';
+            detail.append(element('p', `${manager.name} · 任职 ${manager.startDate || '待核验'} 至 ${manager.endDate || '未披露离任日'} · ${term}`, 'narrative-meta'));
             detail.append(link(`经理表原文 · 第 ${manager.evidence.page} 页 ↗`, manager.evidence.sourceUrl));
           }
           detail.append(link('持仓报告 ↗', report.sourceUrl));
@@ -184,7 +190,7 @@
         const value = validate(await read('analysis.json', controller.signal, selected), selected);
         if (current !== request) return;
         data = value;
-        $('analysis-status').textContent = `${selected} · ${data.stocks.length.toLocaleString()} 只证券已建立分析索引 · 观察截至 ${data.asOf || data.retrievedAt || '见来源'}。报告经理表已取得 ${data.coverage.reportManagerRecords || 0} 条组合记录，待补 ${data.coverage.managerEvidenceMissingRecords || 0} 条。当前为已采集样本，完整度以本季度覆盖清单为准。金额以人民币计，价格保留原币种。`;
+        $('analysis-status').textContent = `${selected} · ${data.stocks.length.toLocaleString()} 只证券已建立分析索引 · 观察截至 ${data.asOf || data.retrievedAt || '见来源'}。经理表完整 ${data.coverage.reportManagerRecords || 0} 条组合记录，部分 ${data.coverage.reportManagerPartialRecords || 0} 条，待补总计 ${data.coverage.managerEvidenceMissingRecords || 0} 条。当前为已采集样本，完整度以本季度覆盖清单为准。金额以人民币计，价格保留原币种。`;
         const themes = $('analysis-themes'); themes.replaceChildren(element('h3', '基金报告中的策略主题'));
         themes.append(element('p', '主题按本季度报告原文规则归类；计数为有对应表述的组合，不能解释为全行业结论或单只股票交易动机。', 'filter-tip'));
         const list = element('div', undefined, 'analysis-theme-list');

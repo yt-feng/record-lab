@@ -236,7 +236,7 @@ class CampaignTests(unittest.TestCase):
                 self.assertEqual(run.call_args.args[0][-1], str(period / 'analysis.json'))
                 (period / 'analysis.json').write_text(json.dumps({**latest, 'kind': 'quarter-analysis'}))
                 run.reset_mock(); self.assertEqual(site.ensure_analyses(root), 1); run.assert_called_once()
-                (period / 'analysis.json').write_text(json.dumps({**latest, 'kind': 'quarter-analysis', 'analysisVersion': 2}))
+                (period / 'analysis.json').write_text(json.dumps({**latest, 'kind': 'quarter-analysis', 'analysisVersion': 3}))
                 run.reset_mock(); self.assertEqual(site.ensure_analyses(root), 0); run.assert_not_called()
 
     def test_staging_rejects_missing_part_and_excessive_bytes(self):

@@ -32,7 +32,7 @@ def ensure_analyses(source='web'):
         latest = json.loads((folder / 'latest.json').read_text())
         destination = folder / 'analysis.json'
         previous = json.loads(destination.read_text()) if destination.exists() else {}
-        if (previous.get('kind') == 'quarter-analysis' and previous.get('analysisVersion') == 2
+        if (previous.get('kind') == 'quarter-analysis' and previous.get('analysisVersion') == 3
                 and previous.get('retrievedAt') == latest.get('retrievedAt')
                 and previous.get('targetPeriodEnd') == latest.get('targetPeriodEnd')
                 and previous.get('baselinePeriodEnd') == latest.get('baselinePeriodEnd')):

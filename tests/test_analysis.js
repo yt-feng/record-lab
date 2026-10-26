@@ -169,7 +169,7 @@ test('observed quotes stay in native currency and only the exact quarter window 
   assert.equal(first.low, 8);
   assert.equal(first.high, 12);
   assert.equal(first.isCost, false);
-  assert.equal(first.completeness, 'not-verified');
+  assert.equal(first.completeness, 'partial');
   fund.rows[0].priceRange.rangeStart = '2026-01-01';
   assert.equal(fixture([fund]).result.stocks[0].priceRange.status, 'missing');
   fund.rows[0].priceRange.rangeStart = '2026-04-01';

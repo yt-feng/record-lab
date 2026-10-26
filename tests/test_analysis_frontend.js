@@ -84,6 +84,7 @@ test('real generated stock index, contribution parts and evidence render report 
   const result=view.nodes.get('analysis-detail').textContent;
   assert.match(result,/报告经理/);assert.doesNotMatch(result,/当前经理/);
   assert.match(result,/经理表原文 · 第 5 页/);assert.match(result,/任职 2025-01-01/);
+  assert.match(result,/经理表待补/);assert.match(result,/期末在任/);
   assert.match(result,/持股数增加/);assert.match(result,/本期持股 100.*上期持股 50.*股数差 50/);
   assert.match(result,/2026Q2组合按估值调整行业配置/);assert.match(result,/第 7 页/);
   assert.equal(bundle.index.generation,[...bundle.parts.values()][0].generation);

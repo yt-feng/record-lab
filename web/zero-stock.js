@@ -12,7 +12,7 @@
       || evidence.kind !== (evidence.periodEnd.endsWith('06-30') ? 'semiannual' : 'annual')) return false;
     const [year, month, day] = evidence.periodEnd.split('-').map(Number);
     const text = evidence.text, compact = text.replace(/\s+/g, '');
-    const current = `${year}年0?${month}月0?${day}日`, prior = `${year - 1}年12月31日`;
+    const current = `${year}年${month < 10 ? '0?' : ''}${month}月${day}日`, prior = `${year - 1}年12月31日`;
     const zero = '(?:[-—－–]|0(?:\\.0+)?)';
     const rows = [...text.matchAll(new RegExp('^[ \\t]*其中[：:][ \\t]*股票投资[ \\t]+' + zero + '[ \\t]+' + zero + '[ \\t]*$', 'gm'))];
     return /^\d+\.\d+资产负债表/.test(compact)

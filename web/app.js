@@ -214,7 +214,8 @@
         reportEvidence.strategyThemes.some(theme => typeof theme !== 'string' || theme.length > 30))) fail();
       if (fund.status === 'no-equities') {
         const evidence = fund.noEquitiesEvidence || fund.selectedReport?.noEquitiesEvidence;
-        if (!isRecord(evidence) || evidence.confirmed !== true || !safeHttpUrl(evidence.sourceUrl) || evidence.periodEnd !== fund.selectedReport.periodEnd || fund.rows.length) fail();
+        if (!isRecord(evidence) || evidence.confirmed !== true || !safeHttpUrl(evidence.sourceUrl) || evidence.periodEnd !== fund.selectedReport.periodEnd
+          || fund.rows.some(row => row.current != null || !row.previous) || (fund.rows.length && !isRecord(fund.previousReport))) fail();
         if (['empty-stock-detail-section', 'zero-stock-balance-sheet', 'explicit-no-stock-detail'].includes(evidence.evidenceType)) {
           if (!validEmptyStockEvidence(evidence, fund.selectedReport, data.asOf)) fail();
         } else {
@@ -362,9 +363,15 @@
     return managers.map(manager => typeof manager === 'string' ? manager : manager.name).filter(Boolean);
   }
   function managerAttributionLabel(fund) {
-    if (fund.managerAttribution === 'report' && fund.reportManagers?.length) return '报告披露经理';
-    if (fund.managerAttribution === 'tenure-overlap' && fund.reportManagers?.length) return '任期覆盖报告期';
+    if (fund.managerAttribution === 'report' && fund.reportManagers?.length) return fund.managerCoverageStatus === 'complete'
+      ? '报告期内经理（经理表完整）' : '报告期内已核验经理（经理表待补）';
+    if (fund.managerAttribution === 'tenure-overlap' && fund.reportManagers?.length) return '任期与报告期重叠（经理表待核验）';
     return '当前经理概况';
+  }
+  function managerTermLabel(manager, periodEnd) {
+    if (!manager || typeof manager === 'string' || !dateOnly(manager.startDate) || !dateOnly(periodEnd)
+      || manager.startDate > periodEnd || manager.endDate && (!dateOnly(manager.endDate) || manager.endDate < manager.startDate)) return '任期待核验';
+    return `任职 ${manager.startDate} 至 ${manager.endDate || '未披露离任日'} · ${manager.endDate && manager.endDate <= periodEnd ? '期内离任' : '期末在任'}`;
   }
   function reportPeriod(fund) { return fund.selectedReport && textValue(fund.selectedReport.periodEnd) || ''; }
   function changeGroup(row) { return CHANGE_GROUPS[row.change.kind] || 'unknown'; }
@@ -420,8 +427,19 @@
     if (!range || range.status !== 'observed' || !isFiniteNumber(range.low) || !isFiniteNumber(range.high)) {
       return { value: '价格区间缺失', note: range && textValue(range.label) || '尚无可用行情', observed: false };
     }
+    const complete = range.coverageVersion === 2 && range.calendarId === 'exchange-sessions-2026-q2-q3-v1'
+      && range.sessionScope === 'regular-trading-session' && range.priceBasis === 'unadjusted'
+      && range.currency === { CN: 'CNY', HK: 'HKD', US: 'USD' }[range.market]
+      && range.low > 0 && range.high >= range.low && range.completeness === 'complete'
+      && Number.isInteger(range.expectedSessionCount) && range.expectedSessionCount > 0
+      && range.expectedSessionCount === range.observedCount && range.missingSessionCount === 0
+      && range.rejectedRowCount === 0 && range.unexpectedSessionCount === 0 && range.conflictingDateCount === 0
+      && typeof range.expectedDateSetHash === 'string' && /^[a-f0-9]{64}$/.test(range.expectedDateSetHash)
+      && range.observedDateSetHash === range.expectedDateSetHash;
+    const coverage = complete ? '交易日完整' : Number.isInteger(range.missingSessionCount) && range.missingSessionCount > 0
+      ? `仍缺 ${range.missingSessionCount} 个交易日或上市/停牌证据` : '完整交易日覆盖未核验';
     return { value: `${formatNumber(range.low, 3)} – ${formatNumber(range.high, 3)} ${textValue(range.currency)}`.trim(),
-      note: `${range.observedStart || '日期未提供'} → ${range.observedEnd || '日期未提供'} · ${isFiniteNumber(range.observedCount) ? range.observedCount : '—'} 条行情`, observed: true };
+      note: `${range.observedStart || '日期未提供'} → ${range.observedEnd || '日期未提供'} · ${isFiniteNumber(range.observedCount) ? range.observedCount : '—'} 条行情 · ${coverage}`, observed: true, complete };
   }
 
   function csvCell(value) {
@@ -435,7 +453,8 @@
       '报告披露市值(人民币元)', '净资产乘占比估算(人民币元)', '期间最低价', '期间最高价', '行情状态', '价格口径', '观察窗口起始', '观察窗口结束',
       '实际行情起始', '实际行情结束', '行情条数', '实际持有成本', '持仓报告来源', '行情来源', '运作说明期间', '运作说明来源',
       '持仓数据来源', '净资产数据来源', '经理归属观测日', '经理归属口径', '经理概况来源',
-      '该基金观察截至', '该基金采集时间', '该基金数据状态', '行情采集时间', '行情数据状态']];
+      '该基金观察截至', '该基金采集时间', '该基金数据状态', '行情采集时间', '行情数据状态',
+      '价格区间完整性', '应有交易日数', '缺失交易日数', '异常行情行数', '应有日期集合哈希', '观测日期集合哈希']];
     for (const fund of funds) for (const row of fund.visibleRows || fund.rows) {
       const price = row.priceRange || {};
       const validPrice = priceDescription(price).observed;
@@ -448,7 +467,9 @@
         fund.narrative ? `${fund.narrative.periodStart || ''} / ${fund.narrative.periodEnd || ''}` : '', safeHttpUrl(fund.narrative?.sourceUrl),
         safeHttpUrl(fund.selectedReport?.holdingsSourceUrl), safeHttpUrl(fund.selectedReport?.navSourceUrl), fund.managersAsOf,
         managerAttributionLabel(fund), safeHttpUrl(fund.managerSourceUrl || fund.metadataSourceUrl),
-        fund.asOf, fund.retrievedAt, fund.dataStatus, price.fetchedAt, price.dataStatus]);
+        fund.asOf, fund.retrievedAt, fund.dataStatus, price.fetchedAt, price.dataStatus,
+        priceDescription(price).complete ? '完整交易日区间' : '待补全', price.expectedSessionCount, price.missingSessionCount,
+        price.rejectedRowCount, price.expectedDateSetHash, price.observedDateSetHash]);
     }
     return '\ufeff' + lines.map(line => line.map(csvCell).join(',')).join('\r\n');
   }
@@ -591,8 +612,8 @@
       const global = state.manifest?.coverage;
       if (global) {
         $('stat-period').textContent = state.manifest.targetPeriodEnd || global.targetPeriodEnd || global.latestPeriod || state.period?.targetPeriodEnd || '未提供';
-        $('stat-prices').textContent = `${formatNumber(global.priceAvailable || 0, 0)} / ${formatNumber(global.holdingCount || 0, 0)}`;
-        $('stat-prices-note').textContent = '全局已有行情 / 持仓条目；缺失保留';
+        $('stat-prices').textContent = `${formatNumber(global.priceComplete || 0, 0)} / ${formatNumber(global.holdingCount || 0, 0)}`;
+        $('stat-prices-note').textContent = `完整交易日区间 / 当前持仓；另有 ${formatNumber(global.priceAvailable || 0, 0)} 条已有观测`;
       }
     }
     function renderDirectory() {
@@ -615,7 +636,7 @@
         const retry = retryState(state.progress);
         const managerAudited = countValue(research.fieldCoverage.managers);
         quality.append(el('strong', '', `${managerAudited ? '七项研究字段齐全' : '原六项研究字段齐全'} ${formatNumber(research.completeFunds, 0)} / ${formatNumber(research.applicableFunds, 0)} 只适用份额 · ${retry.label}`));
-        if (countValue(research.sixFieldsCompleteFunds)) quality.append(el('p', '', `原六项齐全 ${formatNumber(research.sixFieldsCompleteFunds, 0)}；七项口径另要求报告中的经理任职证据。`));
+        if (countValue(research.sixFieldsCompleteFunds)) quality.append(el('p', '', `六项基础字段齐全 ${formatNumber(research.sixFieldsCompleteFunds, 0)}（按当前校验）；七项口径另要求完整的报告经理表证据。`));
         if (!managerAudited) quality.append(el('p', '', '报告经理证据尚未纳入这一版完整度，仍待回补核验。'));
         quality.append(el('span', '', `待补 ${formatNumber(research.pendingFunds, 0)} · 本轮重试已用完 ${formatNumber(research.exhaustedFunds, 0)}`));
         if (retry.detail) quality.append(el('p', '', retry.detail));
@@ -705,8 +726,8 @@
       updateStatistics();
       if (!state.manifest) {
         $('stat-period').textContent = state.data.targetPeriodEnd || current.map(reportPeriod).filter(Boolean).sort().at(-1) || '暂无报告';
-        $('stat-prices').textContent = `${rows.filter(row => priceDescription(row.priceRange).observed).length} / ${rows.length}`;
-        $('stat-prices-note').textContent = '本期披露条目 · 行情覆盖未核验完整性';
+        $('stat-prices').textContent = `${rows.filter(row => priceDescription(row.priceRange).complete).length} / ${rows.length}`;
+        $('stat-prices-note').textContent = `完整交易日区间 / 披露证券；${rows.filter(row => priceDescription(row.priceRange).observed).length} 条已有观测`;
       }
       const notes = $('coverage-notes'); notes.replaceChildren();
       const scope = el('p'); scope.append(el('strong', '', '覆盖范围：'), doc.createTextNode(state.data.coverage.scope)); notes.append(scope);
@@ -736,7 +757,7 @@
       const price = priceDescription(row.priceRange);
       const priceCell = el('td'); priceCell.append(el('span', price.observed ? 'price-value' : 'missing', price.value),
         el('span', 'cell-sub', `窗口 ${row.priceRange.rangeStart || '未提供'} → ${row.priceRange.rangeEnd || '未提供'}`), el('span', 'cell-sub', price.note));
-      if (price.observed) priceCell.append(el('span', 'cell-sub', `口径 ${row.priceRange.priceBasis || '未提供'} · 完整性未核验`));
+      if (price.observed) priceCell.append(el('span', 'cell-sub', `口径 ${row.priceRange.priceBasis || '未提供'} · ${price.complete ? '已核对完整交易日' : '区间极值尚未完整'} · 非实际持仓成本`));
       if (row.priceRange.fetchedAt) priceCell.append(el('span', 'cell-sub', `${row.priceRange.dataStatus === 'cached' ? '保留行情 · ' : ''}采集 ${row.priceRange.fetchedAt}`));
       const priceSource = el('span', 'cell-sub'); if (addLink(priceSource, '行情来源 ↗', row.priceRange.sourceUrl)) priceCell.append(priceSource);
       tr.append(priceCell); return tr;
@@ -774,7 +795,7 @@
       addMetadata(metadata, '期末净资产', formatMoney(fund.selectedReport?.navYuan));
       addMetadata(metadata, '公告日', fund.selectedReport?.publishedAt);
       addMetadata(metadata, '报告范围', { top10: '前十大重仓股', full: '完整持仓', unknown: '未提供' }[fund.selectedReport?.coverage]);
-      addMetadata(metadata, '经理归属观测日', fund.managersAsOf || fund.managerObservedAt || fund.managerAsOf || fund.managerSource?.observedAt);
+      addMetadata(metadata, '经理归属观测日', fund.managerEvidenceRetrievedAt || fund.managersAsOf || fund.managerObservedAt || fund.managerAsOf || fund.managerSource?.observedAt);
       addMetadata(metadata, '经理归属口径', `${managerAttributionLabel(fund)}${managerAttributionLabel(fund) === '当前经理概况' ? '，历史归属须查对应报告' : ''}`);
       if (fund.interval) addMetadata(metadata, '比较窗口', fund.interval.label || `${fund.interval.start || '—'} → ${fund.interval.end || '—'}`);
       if (fund.shareClassCodes?.length > 1) addMetadata(metadata, '份额类别', fund.shareClassCodes.join(' / '));
@@ -782,6 +803,14 @@
       addLink(metadata, '持仓数据来源 ↗', fund.selectedReport?.holdingsSourceUrl); addLink(metadata, '净资产数据来源 ↗', fund.selectedReport?.navSourceUrl);
       addLink(metadata, '经理归属来源 ↗', fund.managerSourceUrl || fund.metadataSourceUrl);
       body.append(metadata);
+      if (fund.managerAttribution === 'report' && fund.reportManagers?.length) {
+        const appointments = el('div', 'fund-metadata');
+        for (const manager of fund.reportManagers) {
+          addMetadata(appointments, typeof manager === 'string' ? manager : manager.name, managerTermLabel(manager, fund.selectedReport?.periodEnd));
+          if (manager?.evidence?.page) addLink(appointments, `经理表第 ${manager.evidence.page} 页 ↗`, manager.evidence.sourceUrl);
+        }
+        body.append(appointments, el('p', 'narrative-meta', '名单覆盖报告期内任职；期内离任者不自动归为期末组合管理人。'));
+      }
       const quality = fundQuality(state.progress, fund);
       if (quality?.fields) {
         const labels = { holdings: '持仓披露表', pdf: 'PDF', strategy: '季报策略', nav: '净资产', baseline: '上期基准', prices: '行情', managers: '报告经理' };
@@ -820,8 +849,10 @@
             el('p', 'narrative-text', evidence.assetAllocationText));
         } else if (evidence?.page) note.append(el('p', 'narrative-meta', `原报告第 ${evidence.page} 页`));
         addLink(note, '无股票持仓披露来源 ↗', evidence?.sourceUrl || fund.selectedReport?.sourceUrl); body.append(note);
-      } else if (!fund.visibleRows.length) body.append(emptyState('暂无可展示持仓', '这只基金尚无可用的持仓披露明细；报告与经理信息仅按已提供字段展示。', true));
-      else {
+      }
+      if (!fund.notApplicableEvidence && !fund.visibleRows.length && fund.status !== 'no-equities') body.append(emptyState('暂无可展示持仓', '这只基金尚无可用的持仓披露明细；报告与经理信息仅按已提供字段展示。', true));
+      else if (!fund.notApplicableEvidence && fund.visibleRows.length) {
+        if (fund.status === 'no-equities') body.append(el('p', 'narrative-meta', '下表保留上期披露股票及本期未见明细的状态，不据此确定卖出时间或交易原因。'));
         const scroll = el('div', 'table-scroll'); scroll.tabIndex = 0; scroll.setAttribute('role', 'region'); scroll.setAttribute('aria-label', `${fund.name}持仓表，可横向滚动`);
         const table = el('table', 'holdings-table'); const thead = el('thead'); const head = el('tr');
         const labels = ['证券', '披露变化 / 股数差', '本期 / 上期持股数', '净资产占比 / 变动', '本期披露市值', '持仓体量估算', '期间最低 — 最高价 · 非成本'];
@@ -1065,6 +1096,6 @@
     initializePeriods();
   }
 
-  return { validateDataset, validateCatalog, validateProgress, validatePeriods, selectQuarter, periodDataPath, validatePeriodDataset, responseText, researchOverview, notApplicableBreakdown, retryState, formatRetryAt, fundQuality, catalogComplete, catalogFreshness, companyDirectoryLabel, safeCompanyPath, companyPages, companyRecordSummaries, catalogIndex, companyCoverage, coverageOverview, safeHttpUrl, validEmptyStockEvidence, managerNames, managerAttributionLabel, reportPeriod, changeGroup, latestFunds, filterFunds,
+  return { validateDataset, validateCatalog, validateProgress, validatePeriods, selectQuarter, periodDataPath, validatePeriodDataset, responseText, researchOverview, notApplicableBreakdown, retryState, formatRetryAt, fundQuality, catalogComplete, catalogFreshness, companyDirectoryLabel, safeCompanyPath, companyPages, companyRecordSummaries, catalogIndex, companyCoverage, coverageOverview, safeHttpUrl, validEmptyStockEvidence, managerNames, managerAttributionLabel, managerTermLabel, reportPeriod, changeGroup, latestFunds, filterFunds,
     formatNumber, formatMoney, signed, holdingValue, priceDescription, csvCell, exportCsv, observationState, mount };
 });

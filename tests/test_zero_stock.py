@@ -30,6 +30,7 @@ class ZeroStockTests(unittest.TestCase):
                      self.evidence['text'].replace('- -', '12.00 -'),
                      self.evidence['text'].replace('股票投资', '股票投资收益'),
                      self.evidence['text'].replace('2026年6月30日', '2025年6月30日'),
+                     self.evidence['text'].replace('6月30日', '6月030日'),
                      self.evidence['text'].replace('本期末', '上期末'),
                      self.evidence['text'].replace('单位：人民币元', '单位：港元'),
                      self.evidence['text'].split('其中：')[1],

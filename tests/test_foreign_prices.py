@@ -34,8 +34,9 @@ class ForeignPricesTests(unittest.TestCase):
 
     def test_new_york_session_date_and_raw_ohlc(self):
         rows = parse_us_yahoo_prices(payload(), "AAPL", "2026-04-01", "2026-04-02")
-        self.assertEqual(rows, [{"date": "2026-04-01", "low": 11.0, "high": 14.0, "close": 13.0},
+        self.assertEqual(rows, [{"date": "2026-04-01", "low": 10.0, "high": 13.0, "close": 12.0},
                                 {"date": "2026-04-02", "low": 12.0, "high": 15.0, "close": 14.0}])
+        self.assertEqual(rows.rejected_rows, 1)
 
     def test_metadata_and_later_split_never_silently_accepted(self):
         changes = {"symbol": "OTHER", "currency": "HKD", "instrumentType": "ETF", "exchangeName": "HKG",

@@ -223,10 +223,12 @@ class PriceTests(unittest.TestCase):
         self.assertEqual(result["provider"], "yahoo")
         self.assertEqual(result["priceBasis"], "unadjusted")
         self.assertEqual(result["currency"], "CNY")
-        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual(len(provider.calls), 3)
         self.assertTrue(all(call[1]["attempts_override"] == 1 for call in provider.calls))
         self.assertTrue(all(call[1]["timeout_seconds"] <= 4 for call in provider.calls))
-        self.assertEqual(result["providerErrors"], [{"provider": "eastmoney", "errorCode": "TIMEOUT"}])
+        self.assertEqual(result["coverage"]["completeness"], "partial")
+        self.assertEqual(result["providerErrors"], [{"provider": "eastmoney", "errorCode": "TIMEOUT"},
+                                                  {"provider": "tencent", "errorCode": "PRICE_IDENTITY_MISMATCH"}])
 
 
 class CheckpointTests(unittest.TestCase):

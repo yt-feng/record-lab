@@ -42,16 +42,29 @@ def stock_identifiers(code, market):
     raise DataError("UNSUPPORTED_MARKET")
 
 
+class PriceRows(list):
+    def __init__(self, values, rejected_rows=0):
+        super().__init__(values)
+        self.rejected_rows = rejected_rows
+
+
 def checked_price_rows(values, start, end):
-    rows = {}
+    rows, rejected = {}, 0
     for value in values:
         date = iso_date(value.get("date"))
+        if date and not start <= date <= end:
+            continue
         low, high, close = (number(value.get(key)) for key in ("low", "high", "close"))
         if date and start <= date <= end and all(x is not None and x > 0 for x in (low, high, close)) and low <= close <= high:
+            if date in rows:
+                rejected += 1
+                continue
             rows[date] = {"date": date, "low": low, "high": high, "close": close}
+        else:
+            rejected += 1
     if not rows:
         raise DataError("NO_PRICE_DATA")
-    return [rows[date] for date in sorted(rows)]
+    return PriceRows([rows[date] for date in sorted(rows)], rejected)
 
 
 def parse_eastmoney_prices(payload, code, start, end):
@@ -66,6 +79,8 @@ def parse_eastmoney_prices(payload, code, start, end):
         cells = value.split(",")
         if len(cells) >= 5:
             rows.append({"date": cells[0], "close": cells[2], "high": cells[3], "low": cells[4]})
+        else:
+            rows.append({"date": cells[0] if cells else None})
     return checked_price_rows(rows, start, end)
 
 
@@ -101,6 +116,7 @@ def parse_yahoo_prices(payload, symbol, currency, venue, start, end):
     rows = []
     for index, timestamp in enumerate(timestamps):
         if not isinstance(timestamp, (int, float)):
+            rows.append({"date": None})
             continue
         date = dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc).astimezone(timezone).date().isoformat()
         rows.append({"date": date, "low": quote["low"][index], "high": quote["high"][index], "close": quote["close"][index]})
@@ -120,7 +136,8 @@ def parse_tencent_prices(payload, symbol, code, start, end):
         if "qfqday" in data or "hfqday" in data:
             raise DataError("ADJUSTED_PRICE_REJECTED")
         raise DataError("INVALID_PRICE_FORMAT")
-    rows = [{"date": row[0], "close": row[2], "high": row[3], "low": row[4]} for row in values if isinstance(row, list) and len(row) >= 5]
+    rows = [{"date": row[0], "close": row[2], "high": row[3], "low": row[4]}
+            if isinstance(row, list) and len(row) >= 5 else {"date": None} for row in values]
     return checked_price_rows(rows, start, end)
 
 
@@ -644,7 +661,7 @@ class PublicProvider:
             result = extract_report(data, report["sourceUrl"], report["periodEnd"], report["kind"],
                                     parse_pages=parse_pdf_pages, filename=report.get("title", "report.pdf"),
                                     max_pages=max_pages,
-                                    enrich_pages=enrich)
+                                    enrich_pages=enrich, published_at=report.get("publishedAt"))
         except Exception as error:
             code = getattr(error, "code", "PDF_PARSE_FAILED")
             raise DataError(code if re.fullmatch(r"[A-Z0-9_]+", str(code)) else "PDF_PARSE_FAILED") from None
@@ -695,7 +712,8 @@ class PublicProvider:
              lambda data: parse_tencent_prices(data, tencent_symbol, code, start, end)),
         ]
         deadline = time.monotonic() + 24
-        failures = []
+        failures, candidates = [], []
+        from price_coverage import price_series, merge_price_series
         for provider_name, base, query, parse in sources:
             remaining = deadline - time.monotonic()
             if remaining <= 1:
@@ -704,13 +722,16 @@ class PublicProvider:
             try:
                 payload = json.loads(self.get(base, params=query, timeout_seconds=min(4, remaining / 2), attempts_override=1))
                 rows = parse(payload)
-                return {"currency": currency, "priceBasis": "unadjusted", "market": market, "stockCode": code,
-                        "provider": provider_name, "sourceUrl": base + "?" + urlencode(query), "rows": rows,
-                        "providerErrors": failures}
+                candidates.append(price_series(code, market, currency, provider_name, base + "?" + urlencode(query), rows, start, end))
+                combined = merge_price_series(candidates, start, end)
+                if combined["coverage"]["completeness"] == "complete":
+                    return {**combined, "providerErrors": failures}
             except DataError as error:
                 failures.append({"provider": provider_name, "errorCode": error.code})
             except (ValueError, TypeError, KeyError, IndexError, OverflowError, AttributeError):
                 failures.append({"provider": provider_name, "errorCode": "INVALID_PRICE_FORMAT"})
+        if candidates:
+            return {**merge_price_series(candidates, start, end), "providerErrors": failures}
         error = DataError("PRICE_SOURCES_UNAVAILABLE")
         error.provider_errors = failures
         raise error

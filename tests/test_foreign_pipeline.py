@@ -51,7 +51,8 @@ class ForeignPipelineTests(unittest.TestCase):
         self.assertEqual((coverage['holdingCount'], coverage['priceAvailable']), (3, 1))
         self.assertTrue(valid_price_coverage(coverage))
         checkpoint = compact_enrichment(coverage)
-        self.assertEqual(checkpoint['missingStockKeys'], ['US:GOOGL', 'US:NVDA'])
+        self.assertEqual(coverage['priceComplete'], 0)
+        self.assertEqual(checkpoint['missingStockKeys'], ['US:GOOG', 'US:GOOGL', 'US:NVDA'])
         self.assertEqual(missing_stock_objects(checkpoint), coverage['missingStocks'])
 
     def test_provider_attaches_original_pdf_geometry_and_dispatches_us_prices(self):

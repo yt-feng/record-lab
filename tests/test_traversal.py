@@ -17,6 +17,19 @@ CONFIG = {"targetPeriodEnd": "2026-06-30", "baselinePeriodEnd": "2026-03-31", "m
 PHASE = traversal.phase_for(CONFIG)
 
 
+def complete_price(code='600001', market='CN'):
+    from price_coverage import CALENDAR, expected_sessions, date_set_hash
+    days = expected_sessions(market, '2026-04-01', '2026-06-30')
+    return {'status': 'observed', 'priceBasis': 'unadjusted', 'sourceUrl': 'https://example.org/prices',
+            'market': market, 'stockCode': code, 'currency': CALENDAR['markets'][market]['currency'], 'low': 1, 'high': 2,
+            'rangeStart': '2026-04-01', 'rangeEnd': '2026-06-30', 'observedStart': days[0], 'observedEnd': days[-1],
+            'coverageVersion': 2, 'calendarId': CALENDAR['id'], 'sessionScope': CALENDAR['sessionScope'],
+            'expectedSessionCount': len(days), 'observedCount': len(days), 'expectedDateSetHash': date_set_hash(days),
+            'observedDateSetHash': date_set_hash(days), 'missingSessionCount': 0, 'missingSessionDates': [],
+            'unexpectedSessionCount': 0, 'unexpectedSessionDates': [], 'rejectedRowCount': 0,
+            'conflictingDateCount': 0, 'completeness': 'complete'}
+
+
 def catalog(incomplete=False):
     return {"schemaVersion": 1, "retrievedAt": "2026-09-29T09:00:00Z", "companies": [
         {"code": "co1", "name": "测试甲", "fundCount": 2, "directoryStatus": "complete"},
@@ -68,17 +81,18 @@ class TraversalTests(unittest.TestCase):
 
     def coverage(self, available=0):
         stocks = [{"stockCode": "600001", "market": "CN"}, {"stockCode": "600002", "market": "CN"}]
-        return {"holdingCount": 2, "priceAvailable": available, "missingStocks": stocks[available:],
+        return {"coverageVersion": 2, "calendarId": traversal.CALENDAR['id'], "priceComplete": available,
+                "holdingCount": 2, "priceAvailable": available, "missingStocks": stocks[available:],
                 "holdingsIdentity": "a" * 64}
 
     def retained_fund(self):
+        from report_managers import parse_report_managers
+        manager_rows = parse_report_managers(["", "", "4.1.2 基金经理及基金经理助理简介\n姓名 职务 任本基金的基金经理期限 证券从业年限 说明 任职日期 离任日期\n张甲 基金经理 2020年1月1日 - 20年\n4.2 运作说明"],
+            {"sourceUrl": "https://example.org/manager-report.pdf", "periodEnd": "2026-06-30", "kind": "quarterly", "publishedAt": "2026-07-20"})
         return {"code": "000001", "companyId": "co1", "status": "ok", "dataStatus": "fresh",
                 "retrievedAt": "2026-09-29T10:00:00Z", "shareClassCodes": ["000001"],
                 "managerAttribution": "report", "managerSourceUrl": "https://example.org/manager-report.pdf",
-                "reportManagers": [{"name": "张甲", "role": "基金经理", "startDate": "2020-01-01", "endDate": None,
-                    "periodStart": "2026-04-01", "periodEnd": "2026-06-30", "evidence": {
-                        "sourceUrl": "https://example.org/manager-report.pdf", "page": 3, "pages": [3], "tablePage": 3,
-                        "section": "4.1.2", "text": "张甲 基金经理 2020年1月1日 -", "method": "explicit-report-manager-table", "periodEnd": "2026-06-30"}}],
+                "reportManagers": manager_rows, "managerTableCoverage": manager_rows.coverage,
                 "selectedReport": {**evidence(), "fundCode": "000001", "navYuan": 1000,
                     "parseMethod": "pypdf", "sourceTextHash": "a" * 64,
                     "pageStats": {"pageCount": 10, "totalPages": 10, "processedPages": 10,
@@ -88,8 +102,7 @@ class TraversalTests(unittest.TestCase):
                                    "sourceUrl": "https://example.org/baseline.pdf", "holdings": [{"stockCode": "600001"}]},
                 "narrative": {"text": "合成季度原文摘录", "sourceUrl": "https://example.org/report.pdf",
                               "periodStart": "2026-04-01", "periodEnd": "2026-06-30", "page": None},
-                "rows": [{"stockCode": "600001", "market": "CN", "priceRange": {"status": "observed",
-                    "priceBasis": "unadjusted", "sourceUrl": "https://example.org/prices", "currency": "CNY", "low": 1, "high": 2}}]}
+                "rows": [{"stockCode": "600001", "market": "CN", "priceRange": complete_price()}]}
 
     def test_quality_requires_full_text_quarter_strategy_nav_exact_baseline_and_prices(self):
         fund = self.retained_fund()
@@ -146,6 +159,7 @@ class TraversalTests(unittest.TestCase):
             retry = event(status="failed", at=f"2026-09-29T11:{minute:02}:00Z")
             retry["funds"][0]["qualityAttempt"] = True
             retry["funds"][0]["managerAttempt"] = False
+            retry["funds"][0]["managerTableCoverageVersion"] = 1
             progress = traversal.merge_progress(catalog(), progress, config, [retry], now=NOW)
             replay = traversal.merge_progress(catalog(), progress, config, [retry], now=NOW)
             self.assertEqual(progress["funds"][0]["quality"]["attempts"], replay["funds"][0]["quality"]["attempts"])
@@ -186,7 +200,7 @@ class TraversalTests(unittest.TestCase):
         fund.update({"status": "no-equities", "previousReport": None, "rows": []})
         fund["selectedReport"]["holdings"] = []
         quality = traversal.report_quality(fund, PHASE, traversal.utc_now(NOW))
-        self.assertEqual(quality["fields"]["baseline"], "not-applicable")
+        self.assertEqual(quality["fields"]["baseline"], "missing")
         self.assertEqual(quality["fields"]["prices"], "not-applicable")
         fund["narrative"] = None
         self.assertEqual(traversal.report_quality(fund, PHASE, traversal.utc_now(NOW))["fields"]["strategy"], "missing")
@@ -284,7 +298,8 @@ class TraversalTests(unittest.TestCase):
 
     def test_compact_coverage_validates_keys_and_substantially_reduces_checkpoint_size(self):
         stocks = [{"market": "CN", "stockCode": str(600000 + index)} for index in range(300)]
-        full = {"holdingCount": 300, "priceAvailable": 0, "missingStocks": stocks, "holdingsIdentity": "a" * 64}
+        full = {"coverageVersion": 2, "calendarId": traversal.CALENDAR['id'], "priceComplete": 0,
+                "holdingCount": 300, "priceAvailable": 0, "missingStocks": stocks, "holdingsIdentity": "a" * 64}
         compact = traversal.compact_enrichment(full)
         self.assertTrue(traversal.valid_price_coverage(compact))
         self.assertEqual(traversal.missing_stock_objects(compact), stocks)
@@ -634,7 +649,7 @@ class TraversalTests(unittest.TestCase):
     def test_missing_pdf_quality_reopens_but_truncated_parser_does_not(self):
         directory, previous, config = self.retry_fixture()
         fund = previous["funds"][0]
-        fund.update({"status": "complete", "quality": {"attempts": 3, "lastAttemptAt": fund["lastAttemptAt"],
+        fund.update({"status": "complete", "quality": {"attempts": 3, "lastAttemptAt": fund["lastAttemptAt"], "managerTableCoverageVersion": 1, "priceCoverageVersion": 2,
                      "fields": {key: "missing" if key == "pdf" else "complete" for key in traversal.QUALITY_FIELDS}},
                      "enrichment": self.coverage(2)})
         opened = traversal.merge_progress(directory, previous, config, now="2026-10-27T07:00:00Z")
@@ -722,7 +737,7 @@ class TraversalTests(unittest.TestCase):
         self.assertFalse(blocked["complete"])
         fund = previous["funds"][0]
         fund.update({"status": "complete", "errorCode": None,
-                     "quality": {"attempts": 3, "lastAttemptAt": fund["lastAttemptAt"],
+                     "quality": {"attempts": 3, "lastAttemptAt": fund["lastAttemptAt"], "managerTableCoverageVersion": 1, "priceCoverageVersion": 2,
                          "fields": {key: "missing" if key in {"nav", "strategy"} else "complete" for key in traversal.QUALITY_FIELDS}},
                      "enrichment": self.coverage(2)})
         incomplete = traversal.merge_progress(directory, previous, config, now="2026-10-26T07:00:00Z")["completionAudit"]

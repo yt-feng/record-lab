@@ -139,7 +139,7 @@ test('unadjusted prices are bounded inclusively and missing days stay unverified
   assert.equal(result.rejectedRowCount, 3);
   assert.equal(result.observedStart, '2026-04-01');
   assert.equal(result.observedEnd, '2026-06-30');
-  assert.equal(result.completeness, 'not-verified');
+  assert.equal(result.completeness, 'partial');
   assert.equal(result.isCost, false);
 });
 

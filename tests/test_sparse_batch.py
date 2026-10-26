@@ -17,7 +17,7 @@ class SparseBatchTests(unittest.TestCase):
         patterns = '\n'.join(line.strip() for line in match[1].splitlines()) + '\n'
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for directory in ('scripts', 'lib'):
+            for directory in ('scripts', 'lib', 'config'):
                 shutil.copytree(source / directory, root / directory, ignore=shutil.ignore_patterns('__pycache__'))
             (root / 'web/data').mkdir(parents=True)
             (root / 'web/data/large.json').write_text('{}')

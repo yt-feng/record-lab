@@ -6,7 +6,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { buildSnapshot, catalogDetails, deduplicatePortfolios, publicUrl } = require('./build-data');
 const { validDate } = require('../lib/fund-analysis');
-const { verifiedReportManagers } = require('../lib/report-managers');
+const { verifiedReportManagers, normalizeManagers, evidenceFor, managerKey, managerCoverageFor, completeManagerCoverage } = require('../lib/report-managers');
+const { VERSION: PRICE_COVERAGE_VERSION, calendar, validCompletePrice, validCompleteQuarterPrice, retainedCoverage } = require('../lib/price-coverage');
 
 const CODE = /^\d{6}$/;
 const COMPANY = /^[A-Za-z0-9_-]{1,40}$/;
@@ -42,13 +43,16 @@ function recoverPrice(row, supplied, retrievedAt) {
     || supplied.high < supplied.low || !Number.isInteger(supplied.observedCount) || supplied.observedCount < 1
     || !validDate(supplied.observedStart) || !validDate(supplied.observedEnd)
     || supplied.observedStart < supplied.rangeStart || supplied.observedEnd > supplied.rangeEnd
-    || supplied.observedStart > supplied.observedEnd) return false;
+    || supplied.observedStart > supplied.observedEnd
+    || Array.isArray(supplied.sourceUrls) && supplied.sourceUrls.some(url => !publicUrl(url))) return false;
   const fetchedAt = supplied.fetchedAt || retrievedAt;
   if (!timestamp(fetchedAt) || Date.parse(fetchedAt) > Date.parse(retrievedAt)) return false;
-  row.priceRange = { ...row.priceRange, status: 'observed',
-    label: '已观测区间价格（非持仓成本；完整性未核验）', low: supplied.low, high: supplied.high,
+  const coverage = retainedCoverage(supplied, row.market, row.stockCode, row.priceRange.rangeStart, row.priceRange.rangeEnd);
+  row.priceRange = { ...row.priceRange, ...coverage, status: 'observed',
+    label: coverage.completeness === 'complete' ? '完整交易日区间价格（非持仓成本）' : '已观测区间价格（非持仓成本；交易日覆盖未完整）', low: supplied.low, high: supplied.high,
     priceBasis: 'unadjusted', observedStart: supplied.observedStart, observedEnd: supplied.observedEnd,
     observedCount: supplied.observedCount, sourceUrl: supplied.sourceUrl, fetchedAt,
+    sourceUrls: Array.isArray(supplied.sourceUrls) ? [...new Set(supplied.sourceUrls)].slice(0, 8) : [supplied.sourceUrl],
     dataStatus: supplied.dataStatus === 'cached' ? 'cached' : 'fresh' };
   return true;
 }
@@ -131,8 +135,9 @@ function retainPrices(candidate, old) {
   if (!old?.selectedReport || !candidate.selectedReport || old.selectedReport.periodEnd !== candidate.selectedReport.periodEnd) return;
   const rows = new Map(old.rows.map(row => [`${row.market}:${row.stockCode}`, row]));
   for (const row of candidate.rows) {
-    if (row.priceRange.status !== 'observed') {
-      const prior = rows.get(`${row.market}:${row.stockCode}`)?.priceRange;
+    const prior = rows.get(`${row.market}:${row.stockCode}`)?.priceRange;
+    const complete = value => validCompletePrice(value, row.market, row.stockCode, row.priceRange.rangeStart, row.priceRange.rangeEnd);
+    if (row.priceRange.status !== 'observed' || !complete(row.priceRange) && complete(prior)) {
       if (prior && recoverPrice(row, prior, candidate.retrievedAt)) row.priceRange.dataStatus = 'cached';
     }
   }
@@ -149,12 +154,24 @@ function retainReportEvidence(target, source) {
   const quarterStart = `${to.periodEnd.slice(0, 4)}-${String(Math.floor((month - 1) / 3) * 3 + 1).padStart(2, '0')}-01`;
   const oldManagers = verifiedReportManagers(target.reportManagers?.length ? target.reportManagers : to.managers, quarterStart, to.periodEnd);
   const newManagers = verifiedReportManagers(source.reportManagers?.length ? source.reportManagers : from.managers, quarterStart, to.periodEnd);
-  if (newManagers.length && (!oldManagers.length || newManagers.length > oldManagers.length
-    && newManagers[0].evidence.sourceUrl === oldManagers[0].evidence.sourceUrl)) {
-    to.managers = clone(newManagers); to.managerSourceUrl = newManagers[0].evidence.sourceUrl;
-    target.reportManagers = clone(newManagers); target.managerAttribution = 'report';
-    target.managerSourceUrl = newManagers[0].evidence.sourceUrl; changed = true;
-    to.managerEvidenceRetrievedAt = from.managerEvidenceRetrievedAt || source.retrievedAt;
+  const oldComplete = completeManagerCoverage(target, to.periodEnd), newComplete = completeManagerCoverage(source, to.periodEnd);
+  const preferComplete = newComplete && (!oldComplete || source.managerTableCoverage.kind === 'quarterly'
+    && target.managerTableCoverage.kind !== 'quarterly');
+  const partialUnion = !oldComplete && !newComplete && newManagers.length > 0;
+  const united = partialUnion ? [...new Map([...oldManagers, ...newManagers].map(item => [managerKey(item), item])).values()] : newManagers;
+  if (newManagers.length && (preferComplete || !oldManagers.length || partialUnion && united.length > oldManagers.length)) {
+    const managerReport = [from, ...(source.reports || [])].find(report => report.periodEnd === to.periodEnd
+      && report.managerTableCoverage?.sourceUrl === source.managerTableCoverage?.sourceUrl
+      && report.managerTableCoverage?.sourceTextHash === source.managerTableCoverage?.sourceTextHash
+      && managerCoverageFor(report.managerTableCoverage, normalizeManagers(report.managers, to.periodEnd), to.periodEnd)?.complete);
+    const allRows = preferComplete ? normalizeManagers((managerReport || from).managers, to.periodEnd).filter(item => evidenceFor(item, to.periodEnd)) : united;
+    to.managers = clone(allRows); to.managerSourceUrl = united[0].evidence.sourceUrl;
+    to.managerTableCoverage = managerCoverageFor(source.managerTableCoverage || from.managerTableCoverage, allRows, to.periodEnd);
+    target.reportManagers = clone(united); target.managerAttribution = 'report';
+    target.managerSourceUrl = united[0].evidence.sourceUrl;
+    target.managerTableCoverage = clone(to.managerTableCoverage);
+    target.managerCoverageStatus = to.managerTableCoverage?.complete ? 'complete' : 'partial'; changed = true;
+    to.managerEvidenceRetrievedAt = (managerReport || from).managerEvidenceRetrievedAt || source.managerEvidenceRetrievedAt || source.retrievedAt;
     target.managerEvidenceRetrievedAt = to.managerEvidenceRetrievedAt;
   }
   if (Date.parse(source.retrievedAt) > Date.parse(target.retrievedAt) && from.holdingsIncomplete === true) {
@@ -194,6 +211,8 @@ function coverageFor(funds, directory, config, expectedCount = directory.fundCou
     requestedFundCount: expectedCount, catalogFundCount: directory.fundCount, catalogCompanyCount: directory.companyCount,
     holdingCount: funds.reduce((sum, fund) => sum + fund.rows.filter(row => row.current).length, 0),
     priceAvailable: funds.reduce((sum, fund) => sum + fund.rows.filter(row => row.current && row.priceRange.status === 'observed').length, 0),
+    priceComplete: funds.reduce((sum, fund) => sum + fund.rows.filter(row => row.current && validCompleteQuarterPrice(row.priceRange,
+      row.market, row.stockCode, config.targetPeriodEnd || fund.selectedReport?.periodEnd)).length, 0),
     narrativeCount: funds.filter(fund => fund.narrative?.text).length,
     noEquitiesFundCount: funds.filter(fund => fund.status === 'no-equities').length,
     notApplicableFundCount: funds.filter(fund => fund.notApplicableEvidence).length,
@@ -240,15 +259,25 @@ function finalObservation(fund) {
   };
   const stocks = new Map(fund.selectedReport.holdings.map(item => [`${item.market}:${item.stockCode}`,
     { stockCode: item.stockCode, market: item.market }]));
-  const observed = new Set(fund.rows.filter(row => row.current && row.priceRange.status === 'observed')
+  const period = fund.selectedReport.periodEnd;
+  const start = `${period.slice(0, 4)}-${String(Math.floor((Number(period.slice(5, 7)) - 1) / 3) * 3 + 1).padStart(2, '0')}-01`;
+  const baseline = new Date(Date.parse(`${start}T00:00:00Z`) - 86400000).toISOString().slice(0, 10);
+  if (fund.previousReport?.periodEnd === baseline && publicUrl(fund.previousReport.sourceUrl)) {
+    for (const row of fund.rows) if (row.previous) stocks.set(`${row.market}:${row.stockCode}`, { stockCode: row.stockCode, market: row.market });
+  }
+  const observed = new Set(fund.rows.filter(row => stocks.has(`${row.market}:${row.stockCode}`) && row.priceRange.status === 'observed'
+    && row.priceRange.rangeStart === start && row.priceRange.rangeEnd === period)
     .map(row => `${row.market}:${row.stockCode}`));
-  const missingStocks = [...stocks.keys()].sort().filter(key => !observed.has(key)).map(key => stocks.get(key));
+  const complete = new Set(fund.rows.filter(row => stocks.has(`${row.market}:${row.stockCode}`) && validCompletePrice(row.priceRange, row.market, row.stockCode, start, period))
+    .map(row => `${row.market}:${row.stockCode}`));
+  const missingStocks = [...stocks.keys()].sort().filter(key => !complete.has(key)).map(key => stocks.get(key));
   const reportEvidence = { sourceUrl: fund.selectedReport.sourceUrl, periodEnd: fund.selectedReport.periodEnd,
     publishedAt: fund.selectedReport.publishedAt, observedAt: fund.retrievedAt };
   if (fund.status === 'no-equities') reportEvidence.noEquities = clone(fund.noEquitiesEvidence);
   return { representativeCode: fund.code, companyCode: fund.companyId,
     status: fund.status === 'no-equities' ? 'no-equities' : fund.status === 'ok' ? 'complete' : 'failed', reportEvidence,
-    priceCoverage: { holdingCount: stocks.size, priceAvailable: stocks.size - missingStocks.length, missingStocks,
+    priceCoverage: { coverageVersion: PRICE_COVERAGE_VERSION, calendarId: calendar.id,
+      holdingCount: stocks.size, priceAvailable: observed.size, priceComplete: complete.size, missingStocks,
       holdingsIdentity: crypto.createHash('sha256').update([...stocks.keys()].sort().join('|')).digest('hex') },
     sourcePortfolioCode: fund.sourcePortfolioCode, portfolioSourceUrl: fund.portfolioSourceUrl,
     shareClassCodes: fund.sourcePortfolioCode && publicUrl(fund.portfolioSourceUrl) ? fund.shareClassCodes : [fund.code] };

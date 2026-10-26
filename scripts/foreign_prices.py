@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from providers import DataError, checked_price_rows, iso_date
+from price_coverage import price_series, merge_price_series
 
 
 _EXCHANGES = {"NMS": "NasdaqGS", "NGM": "NasdaqGM", "NCM": "NasdaqCM", "NYQ": "NYSE", "ASE": "NYSE American"}
@@ -65,10 +66,12 @@ def parse_us_yahoo_prices(payload, code, start, end):
     rows = []
     for index, timestamp in enumerate(timestamps):
         if isinstance(timestamp, bool) or not isinstance(timestamp, (float, int)) or not math.isfinite(timestamp):
+            rows.append({'date': None})
             continue
         try:
             date = dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc).astimezone(_NEW_YORK).date().isoformat()
         except (OverflowError, OSError, ValueError):
+            rows.append({'date': None})
             continue
         rows.append({"date": date, **{field: quote[field][index] for field in ("low", "high", "close")}})
     return checked_price_rows(rows, start, end)
@@ -83,18 +86,22 @@ def us_price_bars(provider, code, start, end, retrieval_day=None):
     query = {"period1": int(dt.datetime.combine(dt.date.fromisoformat(start), dt.time.min, tzinfo=dt.timezone.utc).timestamp()),
              "period2": int(dt.datetime.combine(events_end, dt.time.min, tzinfo=dt.timezone.utc).timestamp()),
              "interval": "1d", "events": "splits", "includeAdjustedClose": "false"}
-    failures = []
+    failures, candidates = [], []
     for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
         base = f"https://{host}/v8/finance/chart/{identity['yahooSymbol']}"
         try:
             payload = json.loads(provider.get(base, params=query, timeout_seconds=4, attempts_override=1))
             rows = parse_us_yahoo_prices(payload, identity["stockCode"], start, end)
-            return {"stockCode": identity["stockCode"], "currency": "USD", "market": "US", "priceBasis": "unadjusted",
-                    "provider": "yahoo", "sourceUrl": base + "?" + urlencode(query), "rows": rows, "providerErrors": failures}
+            candidates.append(price_series(identity['stockCode'], 'US', 'USD', 'yahoo', base + '?' + urlencode(query), rows, start, end))
+            combined = merge_price_series(candidates, start, end)
+            if combined['coverage']['completeness'] == 'complete':
+                return {**combined, 'providerErrors': failures}
         except DataError as error:
             failures.append({"provider": host, "errorCode": error.code})
         except (ValueError, TypeError, KeyError, IndexError, OverflowError, AttributeError):
             failures.append({"provider": host, "errorCode": "INVALID_PRICE_FORMAT"})
+    if candidates:
+        return {**merge_price_series(candidates, start, end), 'providerErrors': failures}
     error = DataError("PRICE_SOURCES_UNAVAILABLE")
     error.provider_errors = failures
     raise error

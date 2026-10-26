@@ -12,6 +12,7 @@ import time
 
 from providers import DataError, PublicProvider, HOLDINGS_TOPLINE
 from lifecycle import normalize_lifecycle_evidence, should_check_lifecycle
+from report_managers import normalize_manager_table_coverage
 
 
 def safe_error(code, stage, error):
@@ -160,8 +161,11 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
 
     def attach_details(report, details, document):
         report.update({key: details.get(key) for key in ("navYuan", "narrative")})
+        if isinstance(details.get("managerTableCoverage"), dict):
+            report["managerTableCoverage"] = details["managerTableCoverage"]
         if details.get("reportManagers"):
             report["managers"] = details["reportManagers"]
+            report["managerTableCoverage"] = details.get("managerTableCoverage")
             report["managerSourceUrl"] = document["sourceUrl"]
             report["managerEvidenceRetrievedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
         for key in extraction_keys:
@@ -253,8 +257,19 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
                 if not identity_matches(quarter_details):
                     raise DataError("REPORT_IDENTITY_MISMATCH")
                 report["narrative"] = quarter_details.get("narrative")
-                if quarter_details.get("reportManagers"):
-                    report["managers"] = quarter_details["reportManagers"]
+                if quarter_details.get("reportManagers") and (not report.get("managers")
+                        or not (report.get("managerTableCoverage") or {}).get("complete")
+                        or (quarter_details.get("managerTableCoverage") or {}).get("complete")):
+                    new_managers = quarter_details["reportManagers"]
+                    if report.get("managers") and not (quarter_details.get("managerTableCoverage") or {}).get("complete"):
+                        # Independent partial extracts can each contain a valid
+                        # appointment. Keep both, without claiming either table
+                        # established the whole combined roster.
+                        key = lambda row: tuple(row.get(field) for field in ("name", "startDate", "endDate", "role"))
+                        new_managers = list({key(row): row for row in [*report["managers"], *new_managers]}.values())
+                    report["managers"] = new_managers
+                    report["managerTableCoverage"] = normalize_manager_table_coverage(
+                        quarter_details.get("managerTableCoverage"), new_managers, period)
                     report["managerSourceUrl"] = quarterly["sourceUrl"]
                     report["managerEvidenceRetrievedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
                 if report["narrative"]:
@@ -293,7 +308,8 @@ def collect(config, as_of, checkpoint=None):
     def snapshot(stage):
         comparable = sum(len(f["reports"]) >= 2 for f in funds)
         no_equities = sum(bool(f.get("noEquitiesEvidence", {}).get("confirmed")) for f in funds)
-        complete = stage == "finished" and comparable + no_equities == len(items) and not errors and len(bars) == len(requested_prices)
+        prices_complete = sum(value.get("coverage", {}).get("completeness") == "complete" for value in bars.values())
+        complete = stage == "finished" and comparable + no_equities == len(items) and not errors and prices_complete == len(requested_prices)
         payload = {"asOf": as_of, "targetPeriodEnd": config.get("targetPeriodEnd"), "baselinePeriodEnd": config.get("baselinePeriodEnd"),
                    "retrievedAt": dt.datetime.now(dt.timezone.utc).isoformat(), "funds": funds, "barsByStock": bars, "errors": errors,
                    "coverage": {"requested": len(items), "completedFundRequests": len(funds),
@@ -303,6 +319,7 @@ def collect(config, as_of, checkpoint=None):
                                 "withNarrative": sum(any(r["narrative"] for r in f["reports"]) for f in funds),
                                 "noEquities": no_equities, "priceSymbolsRequested": len(requested_prices),
                                 "priceSymbolsAttempted": price_attempted, "priceSymbolsFetched": len(bars),
+                                "priceSymbolsComplete": prices_complete,
                                 "collectionStage": stage, "status": "complete" if complete else "partial"}}
         if checkpoint:
             checkpoint(payload)

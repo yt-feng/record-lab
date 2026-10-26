@@ -5,12 +5,21 @@ const { buildSnapshot } = require('../scripts/build-data');
 const { analyzeQuarter } = require('../scripts/analyze-data');
 const { mergeSnapshots } = require('../scripts/merge-parts');
 const { evidenceFor } = require('../lib/report-managers');
+const ui = require('../web/app');
 
 const now = '2026-10-26T12:00:00Z', target = '2026-06-30', baseline = '2026-03-31';
 const config = { targetPeriodEnd: target, baselinePeriodEnd: baseline, funds: [{ code: '000001' }] };
 const manager = (name = '季度经理', changes = {}) => ({ name, role: '本基金基金经理', startDate: '2025-01-01', endDate: null,
   periodStart: '2026-04-01', periodEnd: target, evidence: { sourceUrl: 'https://example.org/quarter.pdf', page: 5, pages: [5],
     tablePage: 5, section: '4.1', text: `${name} 本基金基金经理 2025年1月1日 -`, method: 'explicit-report-manager-table', periodEnd: target }, ...changes });
+function coverage(managers, changes = {}) {
+  const counts = { candidateRows: managers.length, parsedRows: managers.length, ignoredKnownRoleRows: 0, excludedRows: 0, outsidePeriodRows: 0, duplicateRows: 0 };
+  return { schemaVersion: 1, method: 'bounded-report-manager-tables', sourceUrl: 'https://example.org/quarter.pdf',
+    periodStart: '2026-04-01', periodEnd: target, publishedAt: '2026-07-20', kind: 'quarterly', sourceTextHash: 'a'.repeat(64), ...counts,
+    outputManagerCount: managers.length, managerKeys: managers.map(item => JSON.stringify([item.name, item.startDate, item.endDate, item.role])),
+    tables: [{ section: '4.1', startPage: 5, endPage: 5, endSection: '4.2', heading: '4.1 基金经理简介', endHeading: '4.2 运作说明',
+      sectionBounded: true, pageNumbersVerified: true, pageLimitReached: false, ignoredRoles: [], ...counts }], complete: true, status: 'complete', ...changes };
+}
 const holding = { stockCode: '600001', stockName: '合成股票', market: 'CN', currency: 'CNY', shares: 100, weightPct: 5, marketValueYuan: 500 };
 const report = changes => ({ fundCode: '000001', kind: 'quarterly', coverage: 'top10', sourceUrl: 'https://example.org/quarter.pdf',
   periodEnd: target, publishedAt: '2026-07-20', navYuan: 10000, holdings: [holding], ...changes });
@@ -29,7 +38,7 @@ function analysis(value, progress = null) {
 
 test('Q2 keeps full interim holdings but prefers exact quarterly manager PDF and source evidence', () => {
   const value = snapshot([report({ kind: 'semiannual', coverage: 'full', publishedAt: '2026-08-28', sourceUrl: 'https://example.org/interim.pdf',
-    managers: [manager('中报经理', { periodStart: '2026-01-01' })] }), report({ managers: [manager()], managerEvidenceRetrievedAt: now })]);
+    managers: [manager('中报经理', { periodStart: '2026-01-01' })] }), report({ managers: [manager()], managerTableCoverage: coverage([manager()]), managerEvidenceRetrievedAt: now })]);
   const fund = value.funds[0];
   assert.equal(fund.selectedReport.sourceUrl, 'https://example.org/interim.pdf');
   assert.deepEqual(fund.reportManagers.map(item => item.name), ['季度经理']);
@@ -39,6 +48,7 @@ test('Q2 keeps full interim holdings but prefers exact quarterly manager PDF and
   assert.equal(result.result.coverage.reportManagerRecords, 1);
   assert.equal(result.portfolio.reportManagers[0].evidence.page, 5);
   assert.equal(result.portfolio.managerSourceUrl, 'https://example.org/quarter.pdf');
+  assert.equal(result.portfolio.managerCoverageStatus, 'complete');
 });
 
 test('interim fallback excludes managers who left before Q2 and retains incoming and departed quarter managers', () => {
@@ -61,6 +71,40 @@ test('current profile or overlapping tenure never satisfies PDF manager coverage
   assert.equal(result.coverage.tenureOverlapManagerRecords, 1);
   assert.equal(result.coverage.managerEvidenceMissingRecords, 1);
   assert.equal(result.coverage.complete, false);
+});
+
+test('valid partial manager names remain visible without manufacturing complete table coverage', () => {
+  const one = manager();
+  const value = snapshot([report({ managers: [one], managerTableCoverage: coverage([one], { complete: false, status: 'partial' }) })]);
+  const { result, portfolio } = analysis(value, { phase: config, completionStatus: 'complete', research: { completeFunds: 1, applicableFunds: 1 } });
+  assert.equal(portfolio.reportManagers[0].name, one.name);
+  assert.equal(portfolio.managerCoverageStatus, 'partial');
+  assert.equal(result.coverage.reportManagerRecords, 0);
+  assert.equal(result.coverage.reportManagerPartialRecords, 1);
+  assert.equal(result.coverage.managerEvidenceMissingRecords, 1);
+  assert.equal(result.stocks[0].reportManagerCount, 0);
+  assert.equal(result.stocks[0].partialReportManagerCount, 1);
+  assert.equal(result.coverage.complete, false);
+});
+
+test('complete flag cannot hide an absent co-manager or a stale-quarter table', () => {
+  const one = manager(), two = manager('第二经理');
+  for (const proof of [coverage([one, two]), coverage([one], { periodEnd: baseline })]) {
+    const value = snapshot([report({ managers: [one], managerTableCoverage: proof })]);
+    const { result } = analysis(value);
+    assert.equal(result.coverage.reportManagerRecords, 0);
+    assert.equal(result.coverage.managerEvidenceMissingRecords, 1);
+  }
+});
+
+test('manager UI distinguishes report-period attribution, incomplete tables and departure dates', () => {
+  const fund = { managerAttribution: 'report', reportManagers: [manager()] };
+  assert.equal(ui.managerAttributionLabel(fund), '报告期内已核验经理（经理表待补）');
+  assert.equal(ui.managerAttributionLabel({ ...fund, managerCoverageStatus: 'complete' }), '报告期内经理（经理表完整）');
+  assert.match(ui.managerTermLabel(manager(), target), /期末在任/);
+  assert.match(ui.managerTermLabel(manager('期内离任', { endDate: '2026-05-01' }), target), /期内离任/);
+  assert.match(ui.managerTermLabel(manager('最后一日离任', { endDate: target }), target), /期内离任/);
+  assert.equal(ui.managerTermLabel(manager('错误日期', { endDate: '2026-02-30' }), target), '任期待核验');
 });
 
 test('stale quarter, invalid pages, role, source and copied person evidence are rejected', () => {

@@ -4,6 +4,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { analyzeFund, normalizeReport, normalizeLifecycleEvidence, validDate, validHoldingIdentity } = require('../lib/fund-analysis');
+const { validCompletePrice, validCompleteQuarterPrice } = require('../lib/price-coverage');
 
 const BUILD_CODES = new Set([
   'INVALID_INPUT', 'INVALID_AS_OF', 'FUTURE_AS_OF', 'INVALID_RETRIEVED_AT', 'INVALID_CONFIG',
@@ -182,8 +183,19 @@ function cleanBars(rawBars, addError) {
       || (market && value.market !== undefined && value.market !== market)) {
       addError('PRICE_IDENTITY_MISMATCH', null, 'prices'); continue;
     }
+    if (Array.isArray(value.sourceUrls) && value.sourceUrls.some(url => !publicUrl(url))) {
+      addError('INVALID_PRICE_SOURCE', null, 'prices'); continue;
+    }
     result[key] = {
       currency: value.currency, priceBasis: value.priceBasis, sourceUrl: value.sourceUrl,
+      market: value.market ?? market, stockCode: value.stockCode ?? stock,
+      requestedStart: validDate(value.requestedStart) ? value.requestedStart : null,
+      requestedEnd: validDate(value.requestedEnd) ? value.requestedEnd : null,
+      sourceUrls: Array.isArray(value.sourceUrls) ? [...new Set(value.sourceUrls)].slice(0, 8) : [value.sourceUrl],
+      sourceValidation: value.sourceValidation && typeof value.sourceValidation === 'object'
+        ? Object.fromEntries(['rejectedRowCount', 'conflictingDateCount'].map(field => [field,
+          Number.isInteger(value.sourceValidation[field]) && value.sourceValidation[field] >= 0 ? value.sourceValidation[field] : 1]))
+        : null,
       rows: Array.isArray(value.rows) ? value.rows.map(row => row && ({ date: row.date, low: row.low,
         high: row.high, close: row.close })) : [],
     };
@@ -204,12 +216,15 @@ function preservePrices(current, previous, retrievedAt) {
   const priorRows = new Map((previous && previous.rows || []).map(row => [`${row.market}:${row.stockCode}`, row]));
   for (const row of current.rows) {
     const price = row.priceRange;
-    if (price.status === 'observed') {
-      price.dataStatus = 'fresh'; price.fetchedAt = retrievedAt; continue;
-    }
     const priorRow = priorRows.get(`${row.market}:${row.stockCode}`);
     const prior = priorRow && priorRow.priceRange;
-    if (price.status === 'missing' && previous && previous.selectedReport
+    const currentComplete = validCompletePrice(price, row.market, row.stockCode, price.rangeStart, price.rangeEnd);
+    const priorComplete = prior && sameWindow(price, prior)
+      && validCompletePrice(prior, row.market, row.stockCode, price.rangeStart, price.rangeEnd);
+    if (price.status === 'observed' && (currentComplete || !priorComplete)) {
+      price.dataStatus = 'fresh'; price.fetchedAt = retrievedAt; continue;
+    }
+    if ((price.status === 'missing' || price.status === 'observed' && priorComplete) && previous && previous.selectedReport
       && previous.selectedReport.periodEnd === current.selectedReport.periodEnd
       && prior && prior.status === 'observed' && prior.priceBasis === 'unadjusted'
       && (price.priceBasis === null || price.priceBasis === 'unadjusted') && sameWindow(price, prior)
@@ -531,13 +546,11 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
     if (finalFund.selectedReport.noEquitiesConfirmed) {
       finalFund.status = 'no-equities';
       finalFund.noEquitiesEvidence = finalFund.selectedReport.noEquitiesEvidence;
-      finalFund.rows = [];
+      // Preserve prior-period disclosures. An explicit current zero-stock
+      // report does not erase the previous observation or prove a trade.
       finalFund.summary.currentHoldingCount = 0;
       finalFund.summary.knownPositionCount = 0;
       finalFund.summary.knownPositionYuan = 0;
-      for (const key of ['increasedCount', 'decreasedCount', 'enteredDisclosureCount', 'leftDisclosureCount']) {
-        finalFund.summary[key] = 0;
-      }
       batchNoEquitiesFundCount += 1;
     }
     preservePrices(finalFund, old, raw.retrievedAt);
@@ -569,7 +582,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
   const limitations = [
     '目录规模与已处理数据分别统计；公司和基金覆盖以当前有效披露数据为准。',
     '按最近已披露报告比较，披露名单进出不等于买入或清仓，股数变化也可能包含公司行为。',
-    '区间行情仅反映已获取交易日，完整性未核验，不能视为实际持仓成本。',
+    '价格区间按官方交易日逐日核验；缺日数据保留为待补全，区间价格不能视为实际持仓成本。',
     '持仓金额仅汇总已披露证券；仅凭公开主代码及份额证据去重同组合，份额金额不叠加。',
   ];
   if (failedFundCount) limitations.push('部分基金沿用上次有效数据或暂缺，原始观测日期保留。');
@@ -583,6 +596,8 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
       scope: typeof config.scope === 'string' ? config.scope : '按公开基金目录逐家处理，展示已取得的有效报告', limitations,
       holdingCount: publishedFunds.reduce((sum, item) => sum + item.rows.filter(row => row.current).length, 0),
       priceAvailable: publishedFunds.reduce((sum, item) => sum + item.rows.filter(row => row.current && row.priceRange.status === 'observed').length, 0),
+      priceComplete: publishedFunds.reduce((sum, item) => sum + item.rows.filter(row => row.current && validCompleteQuarterPrice(row.priceRange,
+        row.market, row.stockCode, config.targetPeriodEnd || item.selectedReport?.periodEnd)).length, 0),
       narrativeCount: publishedFunds.filter(item => item.narrative && item.narrative.text).length,
       requestedFundCount: directory.known ? directory.fundCount : preserveOthers ? null : requested.length,
       catalogFundCount: directory.fundCount, catalogCompanyCount: directory.companyCount,

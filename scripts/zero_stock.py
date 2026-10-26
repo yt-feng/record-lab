@@ -22,7 +22,8 @@ def valid_zero_stock(evidence):
     if evidence['kind'] != ('semiannual' if end.month == 6 else 'annual'):
         return False
     compact = re.sub(r'\s+', '', text)
-    current = rf'{end.year}年0?{end.month}月0?{end.day}日'
+    month = rf'0?{end.month}' if end.month < 10 else str(end.month)
+    current = rf'{end.year}年{month}月{end.day}日'
     prior = rf'{end.year - 1}年12月31日'
     rows = list(ROW.finditer(text))
     return bool(re.match(r'^\d+\.\d+资产负债表', compact)

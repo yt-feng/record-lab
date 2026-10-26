@@ -77,10 +77,10 @@ test('historical manager attribution uses disclosed or tenure-supported names an
   assert.equal(ui.managerAttributionLabel(current), '当前经理概况');
   const report = fixtureFund({ managerAttribution: 'report', reportManagers: [{ name: '乙经理' }] });
   assert.deepEqual(ui.managerNames(report), ['乙经理']);
-  assert.equal(ui.managerAttributionLabel(report), '报告披露经理');
+  assert.equal(ui.managerAttributionLabel(report), '报告期内已核验经理（经理表待补）');
   assert.equal(ui.filterFunds([report], { manager: '甲经理' }).length, 0);
   assert.equal(ui.filterFunds([report], { manager: '乙经理' }).length, 1);
-  assert.equal(ui.managerAttributionLabel({ ...report, managerAttribution: 'tenure-overlap' }), '任期覆盖报告期');
+  assert.equal(ui.managerAttributionLabel({ ...report, managerAttribution: 'tenure-overlap' }), '任期与报告期重叠（经理表待核验）');
 });
 
 test('latest selection is computed per fund, while historical periods remain accessible', () => {

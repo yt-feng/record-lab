@@ -10,6 +10,8 @@ from pathlib import Path
 import re
 from urllib.parse import urlparse, parse_qsl
 from lifecycle import normalize_lifecycle_evidence
+from report_managers import normalize_manager_table_coverage, manager_key
+from price_coverage import CALENDAR, VERSION as PRICE_COVERAGE_VERSION, valid_complete_price
 
 FUND_CODE = re.compile(r"\d{6}\Z")
 COMPANY_CODE = re.compile(r"[A-Za-z0-9_-]{1,40}\Z")
@@ -21,6 +23,7 @@ QUALITY_VALUES = {"complete", "missing", "partial", "truncated", "wrong-period",
 QUALITY_ACCEPTED = {"complete", "not-applicable"}
 QUALITY_MAX_ATTEMPTS = 3
 MANAGER_MAX_ATTEMPTS = 3
+MANAGER_TABLE_COVERAGE_VERSION = 1
 ERROR_CODES = {
     "BATCH_FAILED", "FUND_FAILED", "NO_VALID_REPORTS", "TARGET_REPORT_MISSING", "FUND_NOT_COLLECTED",
     "NO_VALID_FRESH_FUNDS", "NO_REPORTS", "NO_DATED_HOLDINGS", "EMPTY_HOLDINGS", "OLDER_REPORT",
@@ -202,7 +205,7 @@ def apply_retry_policy(states, config, now):
         fields = quality["fields"]
         missing_report = fields["pdf"] == "missing" and quality.get("pdfRetryable", True)
         retry_lane(quality, QUALITY_MAX_ATTEMPTS, state["status"] in SUCCESS and missing_report, config, now)
-        retry_lane(state["enrichment"], 3, state["status"] == "complete" and state["enrichment"]["status"] == "exhausted",
+        retry_lane(state["enrichment"], 3, state["status"] in SUCCESS and state["enrichment"]["status"] == "exhausted",
                    config, now, daily=False)
         times = [state.get("deferredUntil"), state["retry"]["nextRetryAt"],
                  quality["retry"]["nextRetryAt"], state["enrichment"]["retry"]["nextRetryAt"]]
@@ -316,34 +319,64 @@ def compact_enrichment(value):
 def valid_price_coverage(value):
     if not isinstance(value, dict):
         return False
-    count, available = value.get("holdingCount"), value.get("priceAvailable")
+    count, available, complete = value.get("holdingCount"), value.get("priceAvailable"), value.get("priceComplete")
     missing = missing_stock_objects(value)
     fingerprint = value.get("holdingsIdentity")
-    return (isinstance(count, int) and not isinstance(count, bool) and count >= 0
+    return (value.get("coverageVersion") == PRICE_COVERAGE_VERSION and value.get("calendarId") == CALENDAR["id"]
+            and isinstance(count, int) and not isinstance(count, bool) and count >= 0
             and isinstance(available, int) and not isinstance(available, bool) and 0 <= available <= count
-            and isinstance(missing, list) and len(missing) == count - available
+            and isinstance(complete, int) and not isinstance(complete, bool) and 0 <= complete <= available
+            and isinstance(missing, list) and len(missing) == count - complete
             and all(stock_key(item) for item in missing)
             and len({stock_key(item) for item in missing}) == len(missing)
             and isinstance(fingerprint, str) and bool(re.fullmatch(r"[a-f0-9]{64}", fingerprint)))
+
+
+def readable_legacy_price_coverage(value):
+    """Read old source receipts without granting their availability a v2 proof."""
+    if not isinstance(value, dict) or value.get('coverageVersion') not in (None, 1):
+        return False
+    count, available, missing = value.get('holdingCount'), value.get('priceAvailable'), missing_stock_objects(value)
+    return (type(count) is int and type(available) is int and 0 <= available <= count
+            and isinstance(missing, list) and len(missing) == count - available
+            and all(stock_key(item) for item in missing) and len({stock_key(item) for item in missing}) == len(missing)
+            and isinstance(value.get('holdingsIdentity'), str) and bool(re.fullmatch(r'[a-f0-9]{64}', value['holdingsIdentity'])))
 
 
 def price_coverage(fund):
     holdings = fund.get("selectedReport", {}).get("holdings", [])
     if not isinstance(holdings, list) or any(not stock_key(item) for item in holdings):
         return None
+    end = fund.get("selectedReport", {}).get("periodEnd")
+    if not date(end):
+        return None
+    start = quarter_start(end)
     stocks = {stock_key(item): {"stockCode": item["stockCode"], "market": item["market"]} for item in holdings}
-    observed = set()
+    baseline = fund.get("previousReport") or {}
+    expected_baseline = (date(start) - dt.timedelta(days=1)).isoformat()
+    if public_url(baseline.get("sourceUrl")) and baseline.get("periodEnd") == expected_baseline:
+        for row in fund.get("rows", []):
+            if isinstance(row, dict) and row.get("previous") is not None and stock_key(row):
+                stocks[stock_key(row)] = {"stockCode": row["stockCode"], "market": row["market"]}
+    observed, complete = set(), set()
     for row in fund.get("rows", []):
         key = stock_key(row)
         price = row.get("priceRange", {}) if isinstance(row, dict) else {}
         low, high = price.get("low"), price.get("high")
         if (key in stocks and price.get("status") == "observed" and price.get("priceBasis") == "unadjusted"
                 and public_url(price.get("sourceUrl")) and isinstance(low, (int, float)) and not isinstance(low, bool)
-                and isinstance(high, (int, float)) and not isinstance(high, bool) and 0 < low <= high
-                and price.get("currency") == {"CN": "CNY", "HK": "HKD", "US": "USD"}[stocks[key]["market"]]):
+                and isinstance(high, (int, float)) and not isinstance(high, bool) and 0 < low <= high < float('inf')
+                and price.get("currency") == {"CN": "CNY", "HK": "HKD", "US": "USD"}[stocks[key]["market"]]
+                and price.get("rangeStart") == start and price.get("rangeEnd") == end
+                and type(price.get("observedCount")) is int and price["observedCount"] > 0
+                and date(price.get("observedStart")) and date(price.get("observedEnd"))
+                and start <= price["observedStart"] <= price["observedEnd"] <= end):
             observed.add(key)
-    missing = [stocks[key] for key in sorted(set(stocks) - observed)]
-    return {"holdingCount": len(stocks), "priceAvailable": len(observed), "missingStocks": missing,
+            if valid_complete_price(price, stocks[key]["market"], stocks[key]["stockCode"], start, end):
+                complete.add(key)
+    missing = [stocks[key] for key in sorted(set(stocks) - complete)]
+    return {"coverageVersion": PRICE_COVERAGE_VERSION, "calendarId": CALENDAR["id"],
+            "holdingCount": len(stocks), "priceAvailable": len(observed), "priceComplete": len(complete), "missingStocks": missing,
             "holdingsIdentity": hashlib.sha256("|".join(sorted(stocks)).encode()).hexdigest()}
 
 
@@ -351,27 +384,30 @@ def normalize_enrichment(previous, status, now):
     previous = previous if isinstance(previous, dict) else {}
     attempts = previous.get("attempts", 0)
     attempts = max(0, min(3, attempts)) if isinstance(attempts, int) and not isinstance(attempts, bool) else 0
+    previous_attempts = attempts
+    migrated = previous.get("coverageVersion") != PRICE_COVERAGE_VERSION or previous.get("calendarId") != CALENDAR["id"]
+    if migrated:
+        attempts = 0
     last = previous.get("lastAttemptAt")
-    if not instant(last) or instant(last) > now + dt.timedelta(minutes=5):
+    if migrated or not instant(last) or instant(last) > now + dt.timedelta(minutes=5):
         last = None
     result = {"status": "not-applicable", "attempts": attempts, "lastAttemptAt": last,
-              "totalAttempts": counter(previous.get("totalAttempts"), attempts), "retry": retry_state(previous.get("retry"), last, now),
-              "holdingCount": None, "priceAvailable": None, "missingStocks": [], "holdingsIdentity": None,
+              "totalAttempts": counter(previous.get("totalAttempts"), previous_attempts), "retry": retry_state(None if migrated else previous.get("retry"), last, now),
+              "coverageVersion": PRICE_COVERAGE_VERSION, "calendarId": CALENDAR["id"],
+              "holdingCount": None, "priceAvailable": None, "priceComplete": None, "missingStocks": [], "holdingsIdentity": None,
               "errorCode": None}
-    if status == "no-equities":
-        result.update({"holdingCount": 0, "priceAvailable": 0})
-    elif status == "complete":
+    if status in SUCCESS:
         if valid_price_coverage(previous):
-            result.update({key: previous[key] for key in ("holdingCount", "priceAvailable", "holdingsIdentity")})
+            result.update({key: previous[key] for key in ("holdingCount", "priceAvailable", "priceComplete", "holdingsIdentity")})
             result["missingStocks"] = missing_stock_objects(previous)
-        full = result["holdingCount"] is not None and result["priceAvailable"] == result["holdingCount"]
-        result["status"] = "complete" if full else "exhausted" if attempts >= 3 else "pending"
+        full = result["holdingCount"] is not None and result["priceComplete"] == result["holdingCount"]
+        result["status"] = "not-applicable" if status == "no-equities" and result['holdingCount'] == 0 else "complete" if full else "exhausted" if attempts >= 3 else "pending"
         result["errorCode"] = None if full else "PRICE_COVERAGE_INCOMPLETE"
     return result
 
 
 def enrichment_eligible(states):
-    return [code for code, state in states.items() if state["status"] == "complete"
+    return [code for code, state in states.items() if state["status"] in SUCCESS
             and not state.get("deferredUntil")
             and state["attribution"] != "portfolio-evidence" and state.get("representativeCode", code) == code
             and state["enrichment"]["status"] == "pending"
@@ -383,12 +419,15 @@ def apply_coverage(state, coverage):
     if not valid_price_coverage(coverage):
         return
     missing = missing_stock_objects(coverage)
+    available = coverage["priceAvailable"]
     if valid_price_coverage(current) and current["holdingsIdentity"] == coverage["holdingsIdentity"]:
         still_missing = {stock_key(item) for item in missing_stock_objects(current)}
         missing = [item for item in missing if stock_key(item) in still_missing]
-    current.update({key: coverage[key] for key in ("holdingCount", "holdingsIdentity")})
-    current.update({"missingStocks": missing, "priceAvailable": coverage["holdingCount"] - len(missing)})
-    current["status"] = "complete" if not missing else "exhausted" if current["attempts"] >= 3 else "pending"
+        available = max(available, current["priceAvailable"])
+    complete = coverage["holdingCount"] - len(missing)
+    current.update({key: coverage[key] for key in ("coverageVersion", "calendarId", "holdingCount", "holdingsIdentity")})
+    current.update({"missingStocks": missing, "priceAvailable": max(available, complete), "priceComplete": complete})
+    current["status"] = "not-applicable" if state['status'] == 'no-equities' and coverage['holdingCount'] == 0 else "complete" if not missing else "exhausted" if current["attempts"] >= 3 else "pending"
     current["errorCode"] = None if not missing else "PRICE_COVERAGE_INCOMPLETE"
 
 
@@ -399,23 +438,31 @@ def normalize_quality(previous, status, now):
         return {"fields": {key: "not-applicable" for key in QUALITY_FIELDS}, "missingFields": [],
                 "attempts": 0, "totalAttempts": counter(previous.get("totalAttempts")),
                 "managerAttempts": 0, "managerTotalAttempts": counter(previous.get("managerTotalAttempts")), "managerLastAttemptAt": None,
+                "managerTableCoverageVersion": MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2,
                 "retry": retry_state(previous.get("retry"), previous.get("lastAttemptAt"), now),
                 "lastAttemptAt": None, "status": "not-applicable"}
     fields = {key: raw_fields.get(key) if raw_fields.get(key) in QUALITY_VALUES else "missing"
               for key in QUALITY_FIELDS}
+    manager_version_changed = previous.get("managerTableCoverageVersion") != MANAGER_TABLE_COVERAGE_VERSION
+    if manager_version_changed and fields["managers"] == "complete":
+        fields["managers"] = "partial"
+    if previous.get("priceCoverageVersion") != 2 and status in SUCCESS:
+        fields["prices"] = "missing"
     if status == "no-equities":
-        fields.update({"holdings": "complete", "baseline": "not-applicable", "prices": "not-applicable"})
+        fields["holdings"] = "complete"
+        if previous.get("priceUniverseEmpty") is True:
+            fields["prices"] = "not-applicable"
     baseline_exemption = previous.get("baselineExemption")
     baseline_exempt = valid_baseline_exemption(baseline_exemption, now)
     for key in QUALITY_FIELDS:
-        if fields[key] == "not-applicable" and not ((status == "no-equities" and key in {"baseline", "prices"})
+        if fields[key] == "not-applicable" and not ((status == "no-equities" and key == "prices" and previous.get("priceUniverseEmpty") is True)
                                                     or key == "baseline" and baseline_exempt):
             fields[key] = "missing"
     attempts = previous.get("attempts", 0)
     attempts = max(0, min(QUALITY_MAX_ATTEMPTS, attempts)) if isinstance(attempts, int) and not isinstance(attempts, bool) else 0
     # The new report-manager field has its own bounded repair budget. Historical
     # six-field attempts cannot exhaust a parser that did not yet exist.
-    manager_attempts = min(MANAGER_MAX_ATTEMPTS, counter(previous.get("managerAttempts")))
+    manager_attempts = 0 if manager_version_changed else min(MANAGER_MAX_ATTEMPTS, counter(previous.get("managerAttempts")))
     manager_last = previous.get("managerLastAttemptAt")
     if not instant(manager_last) or instant(manager_last) > now + dt.timedelta(minutes=5):
         manager_last = None
@@ -424,8 +471,10 @@ def normalize_quality(previous, status, now):
         last = None
     missing = [key for key in QUALITY_FIELDS if fields[key] not in QUALITY_ACCEPTED]
     result = {"fields": fields, "missingFields": missing, "attempts": attempts, "lastAttemptAt": last,
-              "managerAttempts": manager_attempts, "managerTotalAttempts": counter(previous.get("managerTotalAttempts"), manager_attempts),
+              "managerAttempts": manager_attempts, "managerTotalAttempts": counter(previous.get("managerTotalAttempts"), counter(previous.get("managerAttempts"))),
               "managerLastAttemptAt": manager_last,
+              "managerTableCoverageVersion": MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2,
+              "priceUniverseEmpty": previous.get("priceUniverseEmpty") is True,
               "totalAttempts": counter(previous.get("totalAttempts"), attempts), "retry": retry_state(previous.get("retry"), last, now),
               "pdfRetryable": previous.get("pdfRetryable") is not False,
               "status": "complete" if not missing else "pending" if (
@@ -450,8 +499,8 @@ def quarter_start(period_end):
     return dt.date(value.year, ((value.month - 1) // 3) * 3 + 1, 1).isoformat() if value else None
 
 
-def valid_report_managers(fund, report, phase):
-    """Verify report-attributed table rows; this does not claim all rows parsed."""
+def valid_manager_rows(fund, report, phase):
+    """Verify retained report-attributed rows without asserting table coverage."""
     if fund.get("managerAttribution") != "report":
         return False
     managers = fund.get("reportManagers")
@@ -479,7 +528,7 @@ def valid_report_managers(fund, report, phase):
                 or manager.get("periodEnd") != phase["targetPeriodEnd"]
                 or not date(manager.get("periodStart")) or manager["periodStart"] > manager["periodEnd"]
                 or not isinstance(proof, dict) or proof.get("method") != "explicit-report-manager-table"
-                or proof.get("sourceUrl") != source or proof.get("periodEnd") != phase["targetPeriodEnd"]
+                or not public_url(proof.get("sourceUrl")) or proof.get("periodEnd") != phase["targetPeriodEnd"]
                 or not isinstance(proof.get("section"), str) or not re.fullmatch(r"4\.1(?:\.2)?", proof["section"])
                 or type(proof.get("page")) is not int or not 1 <= proof["page"] <= 10000
                 or type(proof.get("tablePage")) is not int or not 1 <= proof["tablePage"] <= proof["page"]
@@ -503,6 +552,25 @@ def valid_report_managers(fund, report, phase):
     return True
 
 
+def valid_report_managers(fund, report, phase):
+    """Complete requires a bounded whole-table proof, not merely one valid row."""
+    if not valid_manager_rows(fund, report, phase):
+        return False
+    proof = normalize_manager_table_coverage(fund.get("managerTableCoverage") or report.get("managerTableCoverage"),
+                                             period_end=phase["targetPeriodEnd"])
+    if not proof or not proof["complete"] or not public_url(proof["sourceUrl"]) or fund.get("managerSourceUrl") != proof["sourceUrl"]:
+        return False
+    quarter = quarter_start(phase["targetPeriodEnd"])
+    managers = fund.get("reportManagers")
+    if managers is None:
+        managers = [item for item in report.get("managers", []) if date(item.get("startDate")) and item["startDate"] <= phase["targetPeriodEnd"]
+                    and (item.get("endDate") is None or date(item.get("endDate")) and item["endDate"] >= quarter)]
+    expected = [key for key in proof["managerKeys"] if (lambda value: value[1] <= phase["targetPeriodEnd"]
+                and (value[2] is None or value[2] >= quarter))(json.loads(key))]
+    return (all(manager["evidence"]["sourceUrl"] == proof["sourceUrl"] for manager in managers)
+            and sorted(manager_key(manager) for manager in managers) == sorted(expected))
+
+
 def report_quality(fund, phase, now):
     """Measure retained source evidence, not a collector's success flag."""
     if not isinstance(fund, dict) or not is_code(fund.get("code")):
@@ -520,6 +588,8 @@ def report_quality(fund, phase, now):
     fields = {key: "missing" for key in QUALITY_FIELDS}
     if valid_report_managers(fund, report, phase):
         fields["managers"] = "complete"
+    elif valid_manager_rows(fund, report, phase):
+        fields["managers"] = "partial"
     if fund.get("status") == "no-equities":
         fields["holdings"] = "complete"
     elif fund.get("status") == "ok" and isinstance(report.get("holdings"), list) and report["holdings"]:
@@ -554,22 +624,23 @@ def report_quality(fund, phase, now):
     baseline_exemption = {"reason": "ESTABLISHED_AFTER_BASELINE", "date": fund.get("inceptionDate"),
                           "sourceUrl": fund.get("inceptionSourceUrl"), "fundCode": fund["code"],
                           "baselinePeriodEnd": phase["baselinePeriodEnd"], "periodEnd": phase["targetPeriodEnd"]}
-    if fund.get("status") == "no-equities":
-        fields.update({"baseline": "not-applicable", "prices": "not-applicable"})
-    else:
-        baseline = fund.get("previousReport")
-        if (isinstance(baseline, dict) and baseline.get("periodEnd") == phase["baselinePeriodEnd"]
-                and public_url(baseline.get("sourceUrl")) and date(baseline.get("publishedAt"))
-                and date(baseline["publishedAt"]) >= date(baseline["periodEnd"])
-                and date(baseline["publishedAt"]) <= observed.date()
-                and (baseline.get("holdings") or baseline.get("noEquitiesConfirmed") is True)):
-            fields["baseline"] = "complete"
-        elif valid_baseline_exemption(baseline_exemption, now):
-            fields["baseline"] = "not-applicable"
-        coverage = price_coverage(fund)
-        if valid_price_coverage(coverage) and coverage["holdingCount"] > 0:
-            fields["prices"] = "complete" if coverage["priceAvailable"] == coverage["holdingCount"] else "partial" if coverage["priceAvailable"] else "missing"
-    result = {"fields": fields,
+    baseline = fund.get("previousReport")
+    if (isinstance(baseline, dict) and baseline.get("periodEnd") == phase["baselinePeriodEnd"]
+            and public_url(baseline.get("sourceUrl")) and date(baseline.get("publishedAt"))
+            and date(baseline["publishedAt"]) >= date(baseline["periodEnd"])
+            and date(baseline["publishedAt"]) <= observed.date()
+            and (baseline.get("holdings") or baseline.get("noEquitiesConfirmed") is True)):
+        fields["baseline"] = "complete"
+    elif valid_baseline_exemption(baseline_exemption, now):
+        fields["baseline"] = "not-applicable"
+    coverage = price_coverage(fund)
+    if valid_price_coverage(coverage):
+        if coverage['holdingCount'] == 0 and fund.get('status') == 'no-equities':
+            fields['prices'] = 'not-applicable'
+        elif coverage['holdingCount'] > 0:
+            fields["prices"] = "complete" if coverage["priceComplete"] == coverage["holdingCount"] else "partial" if coverage["priceAvailable"] else "missing"
+    result = {"fields": fields, "managerTableCoverageVersion": MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2,
+              "priceUniverseEmpty": bool(coverage and coverage['holdingCount'] == 0),
               "pdfRetryable": not report.get("parseMethod") and report.get("parseErrorCode") in (None, *RECOVERABLE_ERRORS)}
     if fields["baseline"] == "not-applicable" and valid_baseline_exemption(baseline_exemption, now):
         result["baselineExemption"] = baseline_exemption
@@ -602,6 +673,20 @@ def valid_quality(value, phase=None):
     return valid
 
 
+def merge_quality_observation(previous, observation):
+    """Old collector flags cannot manufacture newer coverage proofs."""
+    incoming = dict(observation.get("fields", {}))
+    for field, version, expected in (("managers", "managerTableCoverageVersion", MANAGER_TABLE_COVERAGE_VERSION),
+                                      ("prices", "priceCoverageVersion", 2)):
+        if observation.get(version) != expected:
+            if previous["fields"].get(field) == "complete" or field not in incoming:
+                incoming[field] = previous["fields"].get(field, "missing")
+            elif incoming[field] == "complete":
+                incoming[field] = "partial"
+    return {**previous, **observation, "fields": incoming,
+            "managerTableCoverageVersion": MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2}
+
+
 def hydrate_quality(states, retained, phase, now):
     """Recompute quality from the merger's effective observations on every pass."""
     for fund in retained or []:
@@ -624,7 +709,7 @@ def hydrate_quality(states, retained, phase, now):
             if code != fund["code"] and (not state["companyCode"] or state["companyCode"] != fund.get("companyId")):
                 continue
             state["quality"] = normalize_quality({**state["quality"], **quality}, state["status"], now)
-            if state["status"] == "complete" and valid_price_coverage(coverage):
+            if state["status"] in SUCCESS and valid_price_coverage(coverage):
                 apply_coverage(state, coverage)
 
 
@@ -1012,6 +1097,7 @@ def build_status(config, snapshot=None, now=None):
         row["enrichmentAttempt"] = code in enrich_codes
         row["qualityAttempt"] = code in quality_codes
         row["managerAttempt"] = code in manager_codes
+        row["managerTableCoverageVersion"] = MANAGER_TABLE_COVERAGE_VERSION
         if code in qualities:
             row["reportQuality"] = qualities[code]
         rows.append(row)
@@ -1074,7 +1160,7 @@ def valid_status(document, config, now=None):
             return False
         if item.get("reportQuality") is not None and not valid_quality(item["reportQuality"], phase):
             return False
-        if item.get("priceCoverage") is not None and not valid_price_coverage(item["priceCoverage"]):
+        if item.get("priceCoverage") is not None and not (valid_price_coverage(item["priceCoverage"]) or readable_legacy_price_coverage(item["priceCoverage"])):
             return False
         if item["status"] == "deferred-budget":
             if not valid_deferred(item):
@@ -1123,7 +1209,7 @@ def reconcile_observations(statuses, receipt, config, now=None):
             continue
         if (not isinstance(item, dict) or not is_code(item.get("code")) or not is_code(item.get("representativeCode"))
                 or not valid_event_evidence(item.get("reportEvidence"), item.get("status"), phase_for(config), generated)
-                or not valid_price_coverage(item.get("priceCoverage"))):
+                or not (valid_price_coverage(item.get("priceCoverage")) or readable_legacy_price_coverage(item.get("priceCoverage")))):
             continue
         observations[item["code"]] = item
     reconciled = []
@@ -1241,8 +1327,8 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                 manager_only = item.get("managerAttempt") is True and manager_only_repair(quality)
                 if not manager_only:
                     quality["attempts"] = min(QUALITY_MAX_ATTEMPTS, quality["attempts"] + 1)
-                manager_observed = isinstance(item.get("reportQuality"), dict) and "managers" in item["reportQuality"].get("fields", {})
-                manager_attempted = "managerAttempt" in item or manager_observed
+                manager_observed = isinstance(item.get("reportQuality"), dict) and item["reportQuality"].get("managerTableCoverageVersion") == MANAGER_TABLE_COVERAGE_VERSION
+                manager_attempted = item.get("managerTableCoverageVersion") == MANAGER_TABLE_COVERAGE_VERSION or manager_observed
                 if manager_attempted and (quality["fields"]["managers"] not in QUALITY_ACCEPTED or item.get("managerAttempt") is True):
                     quality["managerAttempts"] = min(MANAGER_MAX_ATTEMPTS, quality["managerAttempts"] + 1)
                     quality["managerTotalAttempts"] += 1
@@ -1254,19 +1340,14 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                 state["lastAttemptAt"] = document["attemptedAt"]
                 state["attempted"] = True
                 if valid_quality(item.get("reportQuality"), phase):
-                    observation = item["reportQuality"]
-                    # An in-flight old collector has no opinion on the newly
-                    # added field and cannot erase a later verified manager.
-                    incoming_fields = {"managers": quality["fields"]["managers"], **observation["fields"]}
-                    quality.update({**observation, "fields": incoming_fields})
+                    quality.update(merge_quality_observation(quality, item["reportQuality"]))
                 state["quality"] = normalize_quality(quality, state["status"], current)
                 if status in SUCCESS:
-                    if status == "complete":
-                        apply_coverage(state, item.get("priceCoverage"))
+                    apply_coverage(state, item.get("priceCoverage"))
                     accepted_success.add(item["code"])
                 # Failed PDF enrichment must never erase a valid holding report.
                 continue
-            if state["status"] == "complete" and item.get("enrichmentAttempt") is True:
+            if state["status"] in SUCCESS and item.get("enrichmentAttempt") is True:
                 extra = state["enrichment"]
                 prior_extra = instant(extra["lastAttemptAt"]) or prior_attempt
                 if extra["status"] == "complete" or prior_extra and attempted <= prior_extra:
@@ -1280,7 +1361,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                 state["attempted"] = True
                 extra["status"] = "exhausted" if extra["attempts"] >= 3 else "pending"
                 extra["errorCode"] = "ENRICHMENT_FAILED"
-                if status == "complete":
+                if status in SUCCESS:
                     apply_coverage(state, item.get("priceCoverage"))
                     accepted_success.add(item["code"])
                 # Report availability is never downgraded by a price retry.
@@ -1292,7 +1373,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
             state.update({"lastAttemptAt": document["attemptedAt"], "attempted": True, "attribution": "direct",
                           "totalAttempts": state["totalAttempts"] + 1, "deferredUntil": None})
             if valid_quality(item.get("reportQuality"), phase):
-                state["quality"] = normalize_quality({**state["quality"], **item["reportQuality"]}, status, current)
+                state["quality"] = normalize_quality(merge_quality_observation(state["quality"], item["reportQuality"]), status, current)
             if status == "failed":
                 state.update({"status": "failed", "attempts": min(2, state["attempts"] + 1),
                               "errorCode": item.get("errorCode") if item.get("errorCode") in ERROR_CODES else "FUND_FAILED"})
@@ -1300,7 +1381,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                 state.update({"status": status, "errorCode": None})
                 state["enrichment"] = normalize_enrichment(state["enrichment"], status, current)
                 state["quality"] = normalize_quality(state["quality"], status, current)
-                if status == "complete":
+                if status in SUCCESS:
                     apply_coverage(state, item.get("priceCoverage"))
                 accepted_success.add(item["code"])
         for proof in document.get("portfolioAliases", []):
@@ -1335,7 +1416,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                     states[code].update({"status": status, "lastAttemptAt": document["attemptedAt"], "errorCode": None,
                                          "attribution": "portfolio-evidence"})
                     states[code]["enrichment"] = normalize_enrichment(states[code]["enrichment"], status, current)
-                if code in states and states[code]["status"] == "complete" and status == "complete":
+                if code in states and states[code]["status"] in SUCCESS and status in SUCCESS:
                     apply_coverage(states[code], proof.get("priceCoverage"))
     hydrate_quality(states, retained, phase, current)
     apply_retry_policy(states, config, current)
@@ -1376,7 +1457,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
     not_applicable = sum(state["status"] == "not-applicable" for state in all_states)
     continuing = bool(eligible(states) or enrichment_eligible(states)
                       or quality_enabled(config) and quality_eligible(states))
-    enrichment_states = [state["enrichment"] for state in all_states if state["status"] == "complete" and state["attribution"] != "portfolio-evidence" and state["representativeCode"] == state["code"]]
+    enrichment_states = [state["enrichment"] for state in all_states if state["status"] in SUCCESS and state["attribution"] != "portfolio-evidence" and state["representativeCode"] == state["code"]]
     research_complete = sum(state["status"] in SUCCESS and state["quality"]["status"] == "complete" for state in all_states)
     six_fields_complete = sum(state["status"] in SUCCESS and all(state["quality"]["fields"][key] in QUALITY_ACCEPTED for key in SIX_QUALITY_FIELDS) for state in all_states)
     research_pending = sum(state["status"] in SUCCESS and state["quality"]["status"] == "pending" for state in all_states)
