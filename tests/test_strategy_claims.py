@@ -30,6 +30,85 @@ def classified(result):
 
 
 class StrategyClaimTests(unittest.TestCase):
+    def test_verified_literal_ai_theme_viewpoint_keeps_subject_period_and_no_trade_attribution(self):
+        body = '在本报告期我们持续看好人工智能方向，包括算力基础建设和AI 应用方面的发展。'
+        result = scan(pages=['合成封面', '合成前页', '合成前页', '合成前页', '合成前页', START + body + END])
+        self.assertEqual(result['method'], 'explicit-strategy-claims-v2')
+        claim = classified(result)[0]
+        self.assertEqual(claim['subject'], {'scope': 'report-author', 'text': '我们', 'isIndividualManager': False})
+        self.assertEqual(claim['object'], {'type': 'theme', 'label': '人工智能方向'})
+        self.assertEqual((claim['kind'], claim['stance'], claim['time'], claim['negation']),
+                         ('viewpoint', 'positive', 'report-period', 'affirmed'))
+        self.assertIsNone(claim['action']); self.assertEqual(claim['direction'], 'unknown')
+        self.assertIsNone(claim['reason']); self.assertFalse(claim['provesTradeReason'])
+        evidence = next(item for item in result['evidence'] if item['id'] == claim['evidenceId'])
+        self.assertEqual(evidence['pages'], [6]); self.assertEqual(evidence['text'], body)
+        self.assertEqual(result['coverage']['classifiedClauseCount'], 1)
+        self.assertFalse(result['semanticAnalysisComplete'])
+
+    def test_exact_ai_theme_does_not_erase_negation_condition_quote_or_unknown_rotation(self):
+        denied = classified(scan('在本报告期我们不看好人工智能方向。'))[0]
+        self.assertEqual(denied['negation'], 'negated'); self.assertEqual(denied['direction'], 'unknown')
+        condition = classified(scan('如果技术兑现，我们未来看好人工智能方向。'))[0]
+        self.assertEqual((condition['kind'], condition['time'], condition['conditional']), ('outlook', 'conditional', True))
+        for body in ('报告引用：“在本报告期我们持续看好人工智能方向”。',
+                     '报告引用：“市场保持平稳，在本报告期我们持续看好人工智能方向，后续继续观察”。',
+                     '报告引用：市场保持平稳，在本报告期我们持续看好人工智能方向。',
+                     '分析师表示：市场保持平稳，在本报告期我们持续看好人工智能方向。',
+                     '我们认为其他基金看好人工智能方向。',
+                     '我们可能看好人工智能方向。',
+                     '持仓中的锂电储能方向也逐步调整为AI 算力。',
+                     '本基金增加了中国平安的配置，主要原因是估值具有吸引力。'):
+            with self.subTest(body=body):
+                result = scan(body)
+                self.assertEqual(classified(result), [])
+                self.assertTrue(all(not item['provesTradeReason'] and item['reasonStatus'] == 'unknown' for item in result['claims']))
+
+    def test_rule_version_changes_source_analysis_digest_without_refreshing_observation(self):
+        body = '在本报告期我们持续看好人工智能方向。'
+        current = scan(body)
+        with patch.object(strategy_claims, 'METHOD', 'explicit-strategy-claims-v1'):
+            old_identity = scan(body)
+        self.assertNotEqual(current['source']['digest'], old_identity['source']['digest'])
+        for key in ('retrievedAt', 'sourceTextHash', 'sectionContentHash', 'sourceUrl', 'periodStart', 'periodEnd', 'pages'):
+            self.assertEqual(current['source'][key], old_identity['source'][key])
+
+    def test_paired_quotations_keep_scope_across_sentence_and_semicolon_boundaries(self):
+        viewpoint = '在本报告期我们持续看好人工智能方向'
+        for opening, closing in [('“', '”'), ('‘', '’'), ('「', '」'), ('『', '』'), ('"', '"'), ("'", "'")]:
+            for punctuation in ('。', '；', '！', '？'):
+                with self.subTest(opening=opening, punctuation=punctuation):
+                    body = f'报告引用：{opening}市场平稳{punctuation}{viewpoint}{punctuation}后续观察{closing}。'
+                    result = scan(body)
+                    self.assertTrue(result['ruleScanComplete'])
+                    self.assertEqual(classified(result), [])
+                    middle = next(item for item in result['claims'] if item['sentenceIndex'] == 1)
+                    self.assertIn('SUBJECT_SCOPE_UNRESOLVED', middle['unknownReasons'])
+
+    def test_cross_page_quotation_keeps_original_pages_then_releases_after_close(self):
+        result = scan(pages=[START + '报告引用：“市场平稳。',
+                             '在本报告期我们持续看好人工智能方向；',
+                             '后续观察”。本基金增配科技行业。' + END], page_numbers=[6, 7, 8])
+        self.assertTrue(result['ruleScanComplete'])
+        self.assertEqual(len(classified(result)), 1)
+        self.assertEqual(classified(result)[0]['object']['label'], '科技行业')
+        middle = next(item for item in result['claims'] if item['sentenceIndex'] == 1)
+        self.assertEqual(middle['classificationStatus'], 'unknown')
+        evidence = next(item for item in result['evidence'] if item['id'] == middle['evidenceId'])
+        self.assertEqual(evidence['pages'], [7])
+        self.assertEqual(evidence['text'], '在本报告期我们持续看好人工智能方向；')
+        self.assertEqual(result['source']['retrievedAt'], REPORT['retrievedAt'])
+
+    def test_nested_or_unclosed_quotes_do_not_create_a_report_author(self):
+        for body in ('报告引用：“转引「市场平稳；在本报告期我们持续看好人工智能方向；后续观察」。仍需观察”。',
+                     '报告引用：“市场平稳。在本报告期我们持续看好人工智能方向。',
+                     '报告引用：“市场平稳」。在本报告期我们持续看好人工智能方向。'):
+            with self.subTest(body=body):
+                self.assertEqual(classified(scan(body)), [])
+        # The scanner does not invent an unquoted cross-sentence attribution.
+        result = scan('报告引用：市场平稳。在本报告期我们持续看好人工智能方向。')
+        self.assertEqual(len(classified(result)), 1)
+
     def test_later_explicit_reason_survives_first_two_generic_operations(self):
         body = '本基金增加银行行业配置。本基金增加科技行业配置。基于估值偏高，本基金降低消费行业配置。'
         result = scan(body)

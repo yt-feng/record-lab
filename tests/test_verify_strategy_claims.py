@@ -23,6 +23,7 @@ BODY = ('本季度市场震荡，消费行业估值回落。'
         '本基金降低了高估值行业的仓位。'
         '展望后市，我们将关注盈利改善的行业，警惕市场波动。')
 SECURITIES = [{'stockCode': '601318', 'market': 'CN', 'stockName': '中国平安', 'currency': 'CNY'}]
+KNOWN_VIEWPOINT_SENTENCE = '在本报告期我们持续看好人工智能方向，包括算力基础建设和AI 应用方面的发展。'
 
 
 class SyntheticProvider(verify.FixedPdfProvider):
@@ -33,9 +34,10 @@ class SyntheticProvider(verify.FixedPdfProvider):
     def report_details(self, report, max_pages=80):
         import strategy_sections
         self.get(report['sourceUrl'], binary=True)
+        known = self.sample['targetPeriod'] == '2026Q2'
         pages = [self.sample['title'], '§2 基金产品概况\n2.1 基金基本情况\n基金主代码 ' + report['fundCode'] + '\n',
-                 '§3 主要财务指标和基金净值表现\n',
-                 '4.4 报告期内基金的投资策略和运作分析\n' + BODY
+                 '§3 主要财务指标和基金净值表现\n', *(['合成前页', '合成前页'] if known else []),
+                 '4.4 报告期内基金的投资策略和运作分析\n' + BODY + (KNOWN_VIEWPOINT_SENTENCE if known else '')
                  + ('' if self.missing_end else '\n4.5 报告期内基金的业绩表现\n本基金净值表现。')]
         identity = parse_portfolio_identity(pages, report, pdf_sha256=self.pdf_sha256,
             retrieved_at=dt.datetime.now(dt.timezone.utc).isoformat())
@@ -63,6 +65,66 @@ class StrategyClaimVerificationTests(unittest.TestCase):
         try: result = call()
         except ValueError: return
         self.assertFalse(result['passed'], result.get('checks'))
+
+    def test_fixed_q2_has_known_literal_viewpoint_control_and_q3_can_have_zero(self):
+        q2 = self.run_sample()
+        self.assertTrue(q2['knownViewpointRequired'])
+        self.assertTrue(q2['checks']['knownViewpointControl'])
+        self.assertEqual(q2['strategyClaims']['source']['pages'], [6])
+        self.assertFalse(verify.known_viewpoint_control(q2['strategyClaims'], verify.SAMPLES[0], '没有该原文'))
+        self.assertFalse(verify.known_viewpoint_control(q2['strategyClaims'], verify.SAMPLES[0]))
+        with patch.object(sys.modules[__name__], 'BODY', '标的指数在本季度上涨。市场表现存在分化。'):
+            q3 = self.run_sample(verify.SAMPLES[1])
+        self.assertTrue(q3['passed']); self.assertFalse(q3['knownViewpointRequired'])
+        self.assertEqual(q3['strategyClaims']['coverage']['classifiedClauseCount'], 0)
+        self.assertNotIn('knownViewpointControl', q3['checks'])
+
+    def test_known_control_checks_exact_subject_time_stance_source_page_and_nontrade_scope(self):
+        import strategy_claims
+        original = strategy_claims.parse_strategy_claims
+        mutations = [lambda claim, evidence: claim.update(subject={'scope': 'portfolio', 'text': '本基金', 'isIndividualManager': False}),
+                     lambda claim, evidence: claim.update(time='forward-looking'),
+                     lambda claim, evidence: claim.update(stance='negative'),
+                     lambda claim, evidence: claim.update(negation='negated'),
+                     lambda claim, evidence: claim.update(conditional=True),
+                     lambda claim, evidence: claim.update(provesTradeReason=True),
+                     lambda claim, evidence: claim.update(object={'type': 'theme', 'label': 'AI算力'}),
+                     lambda claim, evidence: evidence.update(page=5, pages=[5]),
+                     lambda claim, evidence: evidence.update(sourceUrl='https://example.org/wrong.pdf')]
+        for mutation in mutations:
+            def altered(*args, **kwargs):
+                result = copy.deepcopy(original(*args, **kwargs)); value = result['strategyClaims']
+                claim = next(item for item in value['claims'] if item['object']['label'] == '人工智能方向')
+                evidence = next(item for item in value['evidence'] if item['id'] == claim['evidenceId'])
+                mutation(claim, evidence)
+                return result
+            with patch.object(strategy_claims, 'parse_strategy_claims', side_effect=altered):
+                result = self.run_sample()
+            self.assertFalse(result['checks']['knownViewpointControl']); self.assertFalse(result['passed'])
+
+    def test_old_rule_method_or_digest_cannot_inherit_new_positive_control(self):
+        import strategy_claims
+        original = strategy_claims.parse_strategy_claims
+        for change in ('method', 'digest'):
+            def altered(*args, **kwargs):
+                result = copy.deepcopy(original(*args, **kwargs))
+                if change == 'method': result['strategyClaims']['method'] = 'explicit-strategy-claims-v1'
+                else: result['strategyClaims']['source']['digest'] = '0' * 64
+                return result
+            with patch.object(strategy_claims, 'parse_strategy_claims', side_effect=altered):
+                result = self.run_sample()
+            self.assertFalse(result['checks']['currentRuleIdentity']); self.assertFalse(result['passed'])
+
+    def test_quoted_or_transferred_known_clause_is_not_the_fixed_positive_control(self):
+        for sentence in ('报告引用：“市场保持平稳，在本报告期我们持续看好人工智能方向，后续继续观察”。',
+                         '报告引用：“市场平稳。在本报告期我们持续看好人工智能方向。后续观察”。',
+                         '报告引用：“市场平稳；在本报告期我们持续看好人工智能方向；后续观察”。',
+                         f'报告引用：“市场平稳。{KNOWN_VIEWPOINT_SENTENCE}后续观察”。',
+                         '报告引用：市场保持平稳，在本报告期我们持续看好人工智能方向。'):
+            with patch.object(sys.modules[__name__], 'KNOWN_VIEWPOINT_SENTENCE', sentence):
+                result = self.run_sample()
+            self.assertFalse(result['checks']['knownViewpointControl'])
+            self.assertFalse(result['passed'])
 
     def test_actual_claim_module_both_quarters_preserve_identity_hash_and_original_time(self):
         import strategy_claims

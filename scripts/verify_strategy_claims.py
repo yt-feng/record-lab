@@ -19,6 +19,48 @@ from verify_locators import FixedPdfProvider, SAMPLES
 
 OUTPUT = Path('.cache/strategy-claims-verification/result.json')
 MAX_OUTPUT_BYTES = 40_000
+KNOWN_Q2_VIEWPOINT = '在本报告期我们持续看好人工智能方向'
+KNOWN_Q2_SENTENCE = KNOWN_Q2_VIEWPOINT + '，包括算力基础建设和AI 应用方面的发展。'
+
+
+def known_viewpoint_control(claims, sample, original_section_text=None):
+    """One independently read Q2 sentence is a semantic positive control.
+
+    Q3 has no required viewpoint. A market/index description need not become
+    a portfolio statement to make the source verification succeed.
+    """
+    if sample['targetPeriod'] != '2026Q2' or sample['codes'] != ['168401']:
+        return True
+    if not isinstance(original_section_text, str) or KNOWN_Q2_SENTENCE not in original_section_text:
+        return False
+    source = claims.get('source') or {}
+    if (source.get('sourceUrl') != sample['sourceUrl'] or source.get('periodStart') != '2026-04-01'
+            or source.get('periodEnd') != '2026-06-30' or source.get('section') != '4.4'
+            or source.get('pages') != [6]):
+        return False
+    evidence = {row.get('id'): row for row in claims.get('evidence', []) if isinstance(row, dict)}
+    for claim in claims.get('claims', []):
+        if not isinstance(claim, dict): continue
+        quote = evidence.get(claim.get('evidenceId'))
+        if not isinstance(quote, dict) or not isinstance(quote.get('text'), str): continue
+        start, end = claim.get('clauseStart'), claim.get('clauseEnd')
+        if (type(start) is not int or type(end) is not int or not 0 <= start < end <= len(quote['text'])
+                or quote['text'][start:end] != KNOWN_Q2_VIEWPOINT
+                or quote['text'] != KNOWN_Q2_SENTENCE or start != 0 or end != len(KNOWN_Q2_VIEWPOINT)
+                or quote.get('page') != 6 or quote.get('pages') != [6]
+                or quote.get('sourceUrl') != sample['sourceUrl'] or quote.get('periodStart') != '2026-04-01'
+                or quote.get('periodEnd') != '2026-06-30'):
+            continue
+        expected = {'classificationStatus': 'classified', 'kind': 'viewpoint',
+                    'subject': {'scope': 'report-author', 'text': '我们', 'isIndividualManager': False},
+                    'object': {'type': 'theme', 'label': '人工智能方向'}, 'action': None, 'stance': 'positive',
+                    'time': 'report-period', 'negation': 'affirmed', 'conditional': False, 'conditionText': None,
+                    'comparison': {'present': False, 'text': None}, 'direction': 'unknown',
+                    'reasonStatus': 'unknown', 'reason': None, 'unknownReasons': [],
+                    'provesTrade': False, 'provesTradeReason': False}
+        if all(claim.get(key) == value for key, value in expected.items()):
+            return True
+    return False
 
 
 def bounded_evidence(claims, proof):
@@ -62,7 +104,7 @@ def run_sample(sample, *, provider_factory=None):
         raise ValueError('ACTIONS_REQUIRED')
     if sample not in SAMPLES or mineru_tokens_from_env():
         raise ValueError('FIXED_SAMPLE_CONFIGURATION_INVALID')
-    from strategy_claims import parse_strategy_claims
+    from strategy_claims import parse_strategy_claims, METHOD
     import strategy_sections
 
     source = (provider_factory or FixedPdfProvider)(sample)
@@ -92,6 +134,9 @@ def run_sample(sample, *, provider_factory=None):
         section = next(iter(proof.get('sections') or []), {})
         claim_source = claims.get('source') or {}
         original_codes = [identity['sourcePortfolioCode'], *identity['shareClassCodes']]
+        expected_rule_digest = hashlib.sha256(json.dumps(
+            {**{key: value for key, value in claim_source.items() if key not in ('digest', 'retrievedAt')}, 'method': METHOD},
+            ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         checks = {
             'oneRealPdfRequest': source.pdf_requests == 1,
             'pdfIdentityMatched': document['fundCode'] in original_codes and identity['periodEnd'] == document['periodEnd']
@@ -110,9 +155,16 @@ def run_sample(sample, *, provider_factory=None):
             'scanAccountingMatched': scan_accounting(claims, proof),
             'limitedSemanticScope': claims.get('semanticAnalysisComplete') is False,
             'boundedPublicClaims': bounded_evidence(claims, proof),
+            'currentRuleIdentity': claims.get('method') == METHOD and claim_source.get('digest') == expected_rule_digest,
         }
+        known_required = sample['targetPeriod'] == '2026Q2' and sample['codes'] == ['168401']
+        if known_required:
+            private_sections = getattr(sections, 'sections', ())
+            original_text = private_sections[0].get('text') if len(private_sections) == 1 else None
+            checks['knownViewpointControl'] = known_viewpoint_control(claims, sample, original_text)
         return {'code': document['fundCode'], 'quarter': sample['targetPeriod'], 'sourceUrl': sample['sourceUrl'],
                 'pdfSha256': source.pdf_sha256, 'pdfRequestCount': source.pdf_requests,
+                'knownViewpointRequired': known_required,
                 'checks': checks, 'strategyClaims': claims, 'passed': all(checks.values())}
     finally:
         source.session.close()

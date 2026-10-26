@@ -29,6 +29,10 @@ PHASES = {'2026Q2': ('2026-04-01', '2026-06-30', '2026-03-31'),
 MAX_BYTES = 24_000_000
 MAX_KEYS, MAX_FACTS, MAX_DIGESTS = 5000, 32, 16
 MAX_PLAN_KEYS, MAX_REQUESTS, MAX_ATTEMPTS = 20, 40, 2
+LEDGER_BOOTSTRAP = {'runId': 40379996941, 'runAttempt': 1, 'artifactId': 12678181967,
+                   'sourceCommit': '43c8db4c4b9a80a0beb0b357fddd42d4536e72bf',
+                   'dataCommit': '53a62f508fb6a5966a080591a73c6c8fed5f4d3e',
+                   'archiveSha256': '1cb23aea236ca5077fb04a40e9b9f5bab645f24a099cd798e228c1421ac45475'}
 HASH = re.compile(r'[0-9a-f]{64}')
 PRICE_FIELDS = ('status', 'low', 'high', 'market', 'stockCode', 'currency', 'priceBasis', 'rangeStart', 'rangeEnd',
                 'coverageVersion', 'calendarId', 'sessionScope', 'completeness', 'observedCount', 'observedStart', 'observedEnd',
@@ -263,6 +267,62 @@ def normalize_ledger(value, quarter, now=None):
     result['entries'].sort(key=lambda row: row['key'])
     if result != value: fail('CONFLICT_LEDGER_INVALID')
     checked_bytes(result); return result
+
+
+def union_ledgers(first, second, quarter, now=None):
+    """Monotonic union, including unknown checkpoints; never drop old digests."""
+    a, b = (normalize_ledger(value, quarter, now) for value in (first, second))
+    result = empty_ledger(quarter); entries = {}
+    for ledger in (a, b):
+        for entry in ledger['entries']:
+            histories = entries.setdefault(entry['key'], {})
+            for history in entry['digests']:
+                rounds = histories.setdefault(history['digest'], {})
+                for receipt in history['rounds']:
+                    old = rounds.get(receipt['attemptId'])
+                    if old is None: rounds[receipt['attemptId']] = copy.deepcopy(receipt); continue
+                    if any(old[key] != receipt[key] for key in ('quarter', 'key', 'digest', 'attemptId', 'attemptedAt')):
+                        fail('CONFLICT_LEDGER_HISTORY_MISMATCH')
+                    merged = copy.deepcopy(old)
+                    for index, event in enumerate(receipt['requests']):
+                        if index == len(merged['requests']): merged['requests'].append(copy.deepcopy(event)); continue
+                        prior = merged['requests'][index]
+                        if any(prior[key] != event[key] for key in ('factId', 'provider', 'sourceUrl', 'startedAt', 'storedLow', 'storedHigh', 'completeSource', 'originalFetchedAt')):
+                            fail('CONFLICT_LEDGER_HISTORY_MISMATCH')
+                        if prior['outcome'] == 'unknown': merged['requests'][index] = copy.deepcopy(event)
+                        elif event['outcome'] != 'unknown' and prior != event: fail('CONFLICT_LEDGER_HISTORY_MISMATCH')
+                    merged['verificationStatus'] = verification_status(merged['requests'])
+                    rounds[receipt['attemptId']] = merged
+    if len(entries) > MAX_KEYS: fail('CONFLICT_LEDGER_LIMIT')
+    for key, histories in sorted(entries.items()):
+        if len(histories) > MAX_DIGESTS or any(len(rounds) > MAX_ATTEMPTS for rounds in histories.values()): fail('CONFLICT_LEDGER_LIMIT')
+        result['entries'].append({'key': key, 'digests': [{'digest': value, 'rounds': sorted(rounds.values(), key=lambda row: (instant(row['attemptedAt']), row['attemptId']))}
+                                                        for value, rounds in sorted(histories.items())]})
+    return normalize_ledger(result, quarter, now)
+
+
+def normalize_restored_state(value, now=None):
+    if (not isinstance(value, dict) or set(value) != {'schemaVersion', 'kind', 'repository', 'workflowPath', 'currentRun', 'currentDataCommit', 'restoredFrom', 'ledgers', 'bootstrap'}
+            or value.get('schemaVersion') != 1 or value.get('kind') != 'price-conflict-restored-state'
+            or value.get('repository') != 'yt-feng/record-lab' or value.get('workflowPath') != '.github/workflows/recheck-price-conflicts.yml'
+            or not isinstance(value.get('ledgers'), dict) or set(value['ledgers']) != set(PHASES)
+            or any(not isinstance(ledger, dict) for ledger in value['ledgers'].values()) or value.get('bootstrap') != LEDGER_BOOTSTRAP):
+        fail('CONFLICT_RESTORED_STATE_INVALID')
+    current, prior = value.get('currentRun'), value.get('restoredFrom')
+    if (not isinstance(current, dict) or set(current) != {'runId', 'runAttempt', 'sourceCommit'}
+            or not isinstance(prior, dict) or set(prior) != {'runId', 'runAttempt', 'sourceCommit', 'dataCommit', 'artifactId', 'archiveSha256', 'conclusion'}):
+        fail('CONFLICT_RESTORED_STATE_INVALID')
+    for item in (current, prior):
+        if any(type(item.get(key)) is not int or item[key] <= 0 for key in ('runId', 'runAttempt')) or not re.fullmatch(r'[a-f0-9]{40}', str(item.get('sourceCommit'))):
+            fail('CONFLICT_RESTORED_STATE_INVALID')
+    if (current['runAttempt'] != 1 or current['runId'] == prior['runId'] or type(prior['artifactId']) is not int or prior['artifactId'] <= 0
+            or not HASH.fullmatch(str(prior['archiveSha256'])) or prior['conclusion'] not in ('success', 'failure', 'cancelled', 'timed_out')
+            or not re.fullmatch(r'[a-f0-9]{40}', str(prior.get('dataCommit')))
+            or not re.fullmatch(r'[a-f0-9]{40}', str(value.get('currentDataCommit')))):
+        fail('CONFLICT_RESTORED_STATE_INVALID')
+    clean = copy.deepcopy(value)
+    clean['ledgers'] = {quarter: normalize_ledger(value['ledgers'][quarter], quarter, now) for quarter in PHASES}
+    checked_bytes(clean); return clean
 
 
 def request_choices(row, now):
@@ -534,7 +594,7 @@ def merge_receipts(registry, previous_ledger, plan, receipts, *, now=None):
     return normalize_ledger(ledger, plan['quarter'], current)
 
 
-def run(data_root, output, *, quarters='both', max_keys=8, max_requests=16, now=None, fetch=None):
+def run(data_root, output, *, quarters='both', max_keys=8, max_requests=16, now=None, fetch=None, restored_state=None):
     """Actions artifact run. The input tree is read-only, including its ledger."""
     if os.environ.get('GITHUB_ACTIONS') != 'true': fail('CONFLICT_REQUIRES_ACTIONS')
     bounded_int(max_keys, MAX_PLAN_KEYS, 'CONFLICT_LIMIT_INVALID'); bounded_int(max_requests, MAX_REQUESTS, 'CONFLICT_LIMIT_INVALID')
@@ -542,19 +602,42 @@ def run(data_root, output, *, quarters='both', max_keys=8, max_requests=16, now=
     source, destination = Path(data_root).resolve(), Path(output).resolve()
     if destination.is_relative_to(source): fail('CONFLICT_OUTPUT_INSIDE_SOURCE')
     selected = list(PHASES) if quarters == 'both' else [quarters]
+    restored = normalize_restored_state(restored_state, now) if restored_state is not None else None
+    if fetch is None and max_keys and max_requests:
+        if restored is None: fail('CONFLICT_PRIOR_LEDGER_REQUIRED')
+        current = restored['currentRun']
+        if (os.environ.get('GITHUB_REPOSITORY') != restored['repository']
+                or os.environ.get('GITHUB_RUN_ID') != str(current['runId']) or os.environ.get('GITHUB_RUN_ATTEMPT') != str(current['runAttempt'])
+                or os.environ.get('GITHUB_SHA') != current['sourceCommit']
+                or os.environ.get('PRICE_DIAGNOSTIC_DATA_COMMIT') != restored['currentDataCommit']):
+            fail('CONFLICT_CURRENT_RUN_MISMATCH')
+    if restored and selected != list(PHASES): fail('CONFLICT_RESTORED_QUARTERS_REQUIRED')
+    if (destination / 'provenance.json').exists() or any((destination / quarter / name).exists() for quarter in selected
+        for name in ('registry.json', 'plan.json', 'ledger.json', 'input-ledger.json', 'receipts.json')): fail('CONFLICT_OUTPUT_ALREADY_EXISTS')
+    inherited = {}
+    for quarter in selected:
+        published = source / quarter / 'price-conflict-ledger.json'
+        ledger = read_json(published) if published.exists() else None
+        if published.exists() and not isinstance(ledger, dict): fail('CONFLICT_LEDGER_INVALID')
+        inherited[quarter] = union_ledgers(ledger, restored['ledgers'][quarter] if restored else None, quarter, now)
+    # Save both quarters before the first scan/request. A failed first quarter
+    # must not erase the second quarter's inherited attempt history.
+    if restored:
+        write_json({'schemaVersion': 1, 'kind': 'price-conflict-provenance', 'repository': restored['repository'],
+                    'workflowPath': restored['workflowPath'], **restored['currentRun'], 'dataCommit': restored['currentDataCommit'],
+                    'restoredFrom': restored['restoredFrom'], 'bootstrap': restored['bootstrap'],
+                    'inputLedgerHashes': {q: hashlib.sha256(encoded(ledger)).hexdigest() for q, ledger in inherited.items()}}, destination / 'provenance.json')
+    for quarter, ledger in inherited.items():
+        if restored: write_json(ledger, destination / quarter / 'input-ledger.json')
+        write_json(ledger, destination / quarter / 'ledger.json')
     result = {'schemaVersion': 1, 'kind': 'price-conflict-run', 'generatedAt': clock(now).isoformat(),
               'status': 'complete', 'quarters': [], 'maxKeys': max_keys, 'maxRequests': max_requests,
               'productionDataModified': False, 'automaticResolution': False}
     remaining_keys, remaining_requests = max_keys, max_requests
     for position, quarter in enumerate(selected):
         registry = scan_registry(source, quarter, now)
-        ledger_path = source / quarter / 'price-conflict-ledger.json'
-        ledger = normalize_ledger(read_json(ledger_path) if ledger_path.exists() else None, quarter, now)
+        ledger = inherited[quarter]
         directory = destination / quarter
-        # Never discard an interrupted local artifact run. Its unknown receipts
-        # must first be merged explicitly before a new run can replace it.
-        if any((directory / name).exists() for name in ('registry.json', 'plan.json', 'ledger.json', 'receipts.json')):
-            fail('CONFLICT_OUTPUT_ALREADY_EXISTS')
         write_json(registry, directory / 'registry.json')
         left = len(selected) - position
         plan = plan_rechecks(registry, ledger, max_keys=(remaining_keys + left - 1) // left,
@@ -587,7 +670,7 @@ def run(data_root, output, *, quarters='both', max_keys=8, max_requests=16, now=
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('command', choices=('run', 'scan', 'plan', 'execute', 'merge'))
-    for field in ('data', 'quarter', 'registry', 'ledger', 'plan', 'receipts', 'output', 'checkpoint'):
+    for field in ('data', 'quarter', 'registry', 'ledger', 'plan', 'receipts', 'output', 'checkpoint', 'restore-state'):
         parser.add_argument('--' + field)
     parser.add_argument('--max-keys', type=int, default=10); parser.add_argument('--max-requests', type=int, default=20)
     parser.add_argument('--quarters', choices=('both', *PHASES), default='both')
@@ -597,10 +680,11 @@ def main(argv=None):
         if not args.output: fail('CONFLICT_ARGUMENTS_INVALID')
         targets = [args.output] + ([args.checkpoint] if args.checkpoint else [])
         if args.data and any(Path(target).resolve().is_relative_to(Path(args.data).resolve()) for target in targets): fail('CONFLICT_OUTPUT_INSIDE_SOURCE')
-        for source in (args.registry, args.ledger, args.plan, args.receipts):
+        for source in (args.registry, args.ledger, args.plan, args.receipts, args.restore_state):
             if source and any(Path(source).resolve() == Path(target).resolve() for target in targets): fail('CONFLICT_OUTPUT_OVERWRITES_INPUT')
         if args.command == 'run':
-            result = run(args.data, args.output, quarters=args.quarters, max_keys=args.max_keys, max_requests=args.max_requests)
+            result = run(args.data, args.output, quarters=args.quarters, max_keys=args.max_keys, max_requests=args.max_requests,
+                         restored_state=read_json(args.restore_state) if args.restore_state else None)
         elif args.command == 'scan': result = scan_registry(args.data, args.quarter)
         else:
             registry = normalize_registry(read_json(args.registry))

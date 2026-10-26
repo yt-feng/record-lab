@@ -14,7 +14,7 @@ from source_dates import china_date
 from strategy_sections import (parse_strategy_sections, normalize_strategy_section_coverage,
                                _clean_page, _SECTION, _heading, _boundary, _sentences, _security_mentions)
 
-METHOD = 'explicit-strategy-claims-v1'
+METHOD = 'explicit-strategy-claims-v2'
 MAX_CLAUSES = 4096
 MAX_CLAIMS = 8
 MAX_QUOTES = 8
@@ -41,6 +41,7 @@ _OBJECTS = {
                  '保险行业', '保险板块', '地产行业', '地产板块', '房地产行业', '房地产板块', '新能源行业', '新能源板块',
                  '半导体行业', '半导体板块', '人工智能行业', '人工智能板块', '制造业', '消费电子行业', '消费电子板块'],
     'style': ['高股息策略', '红利策略', '价值风格', '成长风格', '大盘风格', '小盘风格'],
+    'theme': ['人工智能方向'],
 }
 _OBJECT_RE = re.compile('|'.join(re.escape(term) for term in sorted(
     [term for terms in _OBJECTS.values() for term in terms], key=len, reverse=True)))
@@ -112,7 +113,32 @@ def _mapped_sentences(pages, numbers, result, proof):
     return sentences
 
 
-def _clause_claim(text, sentence, offset):
+def _quotation_scopes(sentences):
+    """Keep explicit quotation scope across sentence and physical-page cuts.
+
+    These are the consecutive sentences reconstructed from the same verified
+    private section. No quote text or state is added to the public evidence.
+    An unmatched opening quote stays unresolved through the section boundary;
+    an unquoted attribution does not extend beyond its original sentence.
+    """
+    pairs = {'“': '”', '‘': '’', '「': '」', '『': '』', '"': '"', "'": "'"}
+    closers = set(pairs.values())
+    stack = []
+    for sentence in sentences:
+        quoted = bool(stack)
+        for character in sentence['text']:
+            if character not in pairs and character not in closers:
+                continue
+            quoted = True
+            if stack and character == stack[-1]:
+                stack.pop()
+            elif character in pairs:
+                stack.append(pairs[character])
+            # A mismatched closer cannot prove that an open quotation ended.
+        yield quoted
+
+
+def _clause_claim(text, sentence, offset, *, quoted_scope=False):
     subject = _SUBJECT.search(text)
     actions, stances = list(_ACTION.finditer(text)), list(_STANCE.finditer(text))
     objects = list(_OBJECT_RE.finditer(text))
@@ -148,7 +174,10 @@ def _clause_claim(text, sentence, offset):
         claim['unknownReasons'].append('PREDICATE_AMBIGUOUS' if predicates else 'PREDICATE_UNRECOGNIZED')
     if not subject:
         claim['unknownReasons'].append('SUBJECT_UNRESOLVED')
-    if (len(_SUBJECT.findall(text)) > 1 or re.search(r'其他基金|其他组合|该基金|该组合|他们|他人|业内|分析师', text)
+    # A comma does not end a quotation or attribution. If the sentence's
+    # reported-speaker scope is unclear, none of its clauses becomes our voice.
+    if (quoted_scope or len(_SUBJECT.findall(text)) > 1 or re.search(r'其他基金|其他组合|该基金|该组合|他们|他人|业内|分析师', text)
+            or re.search(r'引用|转述|据称|听说|声称|表示|指出|提到|认为|[“”「」‘’\"\']', sentence)
             or subject and re.search(r'认为|指出|表示|声称|提到|听说|据称', text[subject.end():])):
         claim['unknownReasons'].append('SUBJECT_SCOPE_UNRESOLVED')
     if _UNCERTAIN_NEGATION.search(text):
@@ -247,7 +276,7 @@ def parse_strategy_claims(pages, report, *, page_numbers=None, securities=None, 
     sentences = _mapped_sentences(pages, numbers, result, proof)
     if sentences is None: return unavailable('SECTION_POSITION_MISMATCH')
     all_claims = []
-    for sentence_index, sentence in enumerate(sentences):
+    for sentence_index, (sentence, quoted_scope) in enumerate(zip(sentences, _quotation_scopes(sentences))):
         text = sentence['text']
         pieces = list(re.finditer(r'[^，,]+', text))
         output['coverage']['clauseCount'] += len(pieces)
@@ -255,7 +284,7 @@ def parse_strategy_claims(pages, report, *, page_numbers=None, securities=None, 
             return unavailable('CLAUSE_LIMIT_REACHED')
         local = []
         for clause_index, match in enumerate(pieces):
-            claim = _clause_claim(match.group(), text, match.start())
+            claim = _clause_claim(match.group(), text, match.start(), quoted_scope=quoted_scope)
             claim.update({'id': f'c{sentence_index}-{clause_index}', 'sentenceIndex': sentence_index, 'clauseIndex': clause_index,
                           'sentenceHash': _hash(text), 'clauseHash': _hash(match.group()),
                           'clauseStart': match.start(), 'clauseEnd': match.end()})

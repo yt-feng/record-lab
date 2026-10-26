@@ -241,7 +241,7 @@ class PriceConflictsTests(unittest.TestCase):
                     fetch=lambda url: payload('eastmoney' if 'eastmoney' in url else 'tencent'))
                 self.assertEqual(second['summary']['attemptedKeyCount'], 2)
                 with self.assertRaisesRegex(conflicts.ConflictError, 'CONFLICT_OUTPUT_ALREADY_EXISTS'):
-                    conflicts.run(source, output, now=NOW)
+                    conflicts.run(source, output, now=NOW, fetch=lambda url: self.fail('no request'))
                 with self.assertRaisesRegex(conflicts.ConflictError, 'CONFLICT_OUTPUT_INSIDE_SOURCE'):
                     conflicts.run(source, source / 'new', now=NOW)
 

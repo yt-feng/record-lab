@@ -6,8 +6,21 @@ on:
         description: Published data commit to inspect
         required: true
         type: string
+      prior_run_id:
+        description: Completed immediately preceding ledger workflow run
+        required: true
+        type: string
+      prior_source_commit:
+        description: Exact source commit of that prior run
+        required: true
+        type: string
+      prior_data_commit:
+        description: Exact published data commit inspected by that prior run
+        required: true
+        type: string
 permissions:
   contents: read
+  actions: read
 concurrency:
   group: recheck-price-conflicts
   cancel-in-progress: false
@@ -18,6 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
           sparse-checkout-cone-mode: false
           sparse-checkout: |
@@ -55,15 +69,30 @@ jobs:
         run: |
           node --test tests/test_price_conflict_scan.js
           python -m unittest discover -s tests -p 'test_price_conflicts.py'
+          python -m unittest discover -s tests -p 'test_restore_price_conflict_ledger.py'
+      - name: Restore explicitly bound prior ledger
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRIOR_RUN_ID: ${{ inputs.prior_run_id }}
+          PRIOR_SOURCE_COMMIT: ${{ inputs.prior_source_commit }}
+          PRIOR_DATA_COMMIT: ${{ inputs.prior_data_commit }}
+          DATA_COMMIT_INPUT: ${{ inputs.data_commit }}
+        run: |
+          data_sha="$(git -C .cache/conflict-source rev-parse HEAD)"
+          if [[ ! "$DATA_COMMIT_INPUT" =~ ^[a-f0-9]{40}$ ]] || [[ "$data_sha" != "$DATA_COMMIT_INPUT" ]]; then
+            echo '{"status":"failed","errorCode":"CONFLICT_RESTORE_DATA_MISMATCH"}'
+            exit 1
+          fi
+          python scripts/restore_price_conflict_ledger.py --prior-run-id "$PRIOR_RUN_ID" --prior-source-commit "$PRIOR_SOURCE_COMMIT" --prior-data-commit "$PRIOR_DATA_COMMIT" --data-commit "$data_sha" --output .cache/price-conflicts-restore/state.json
       - name: Scan published conflicts and recheck up to eight keys
         run: |
           export PRICE_DIAGNOSTIC_DATA_COMMIT="$(git -C .cache/conflict-source rev-parse HEAD)"
-          python scripts/price_conflicts.py run --data .cache/conflict-source/web/data/periods --output .cache/price-conflicts --quarters both --max-keys 8 --max-requests 16
+          python scripts/price_conflicts.py run --data .cache/conflict-source/web/data/periods --output .cache/price-conflicts --quarters both --max-keys 8 --max-requests 16 --restore-state .cache/price-conflicts-restore/state.json
       - name: Retain guarded conflict ledger
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: price-conflict-ledger-verification
+          name: price-conflict-ledger-verification-${{ github.run_id }}-${{ github.run_attempt }}
           path: .cache/price-conflicts/
           include-hidden-files: true
           if-no-files-found: error
