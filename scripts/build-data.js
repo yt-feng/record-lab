@@ -147,8 +147,11 @@ function cleanReport(raw, code, asOf, addError) {
     || (raw.holdingsPdfEvidence != null && !publicUrl(raw.holdingsPdfEvidence.sourceUrl))) {
     addError('INVALID_REPORT_SOURCE', code); return null;
   }
-  const report = normalizeReport(raw);
+  const report = normalizeReport(raw.sourceLocatorEvidence != null ? { ...raw, fundCode: code } : raw);
   if (!report) { addError('INVALID_REPORT', code); return null; }
+  if (raw.sourceLocatorEvidence != null && !report.sourceLocatorEvidence) {
+    addError('REPORT_IDENTITY_MISMATCH', code); return null;
+  }
   if (report.periodEnd > asOf || report.publishedAt > asOf) { addError('FUTURE_REPORT', code); return null; }
   if (!report.holdings.length) {
     if (report.reportOnly) {
@@ -433,6 +436,18 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
     if (groups.has(item.code)) { addError('DUPLICATE_FUND_CODE', item.code); groups.get(item.code).push(item); }
     else groups.set(item.code, [item]);
   }
+  const reportLocatorReceipts = [];
+  const { normalizeLocatorReceipt, canonical } = require('../lib/report-locators');
+  for (const code of requested) {
+    if (priceCodes.has(code)) continue;
+    const plans = configured.filter(item => item.code === code);
+    if (plans.length !== 1 || !plans[0].reportLocator) continue;
+    const observations = (groups.get(code) || []).filter(item => item.reportLocatorReceipt != null);
+    if (!observations.length || observations.some(item => item.collectionAttempt?.attempted === false)) continue;
+    const receipts = observations.map(item => normalizeLocatorReceipt(item.reportLocatorReceipt, plans[0], config, raw.retrievedAt, nowValue));
+    if (receipts.some(item => !item) || new Set(receipts.map(canonical)).size !== 1) continue;
+    reportLocatorReceipts.push(receipts[0]);
+  }
   const funds = [];
   const batchResults = [];
   let freshFundCount = 0;
@@ -584,7 +599,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
   const inceptionPatches = raw.funds.filter(item => item && failedCodes.has(item.code)).map(item =>
     require('../lib/historical-inception').inceptionPatch(item, config, nowValue, raw.retrievedAt)).filter(Boolean);
   // A receipt-only part is necessary to preserve explicitly unstarted products.
-  if (!freshFundCount && !deferredFundCount && !pricePatches.length && !inceptionPatches.length) throw new SafeBuildError('NO_VALID_FRESH_FUNDS');
+  if (!freshFundCount && !deferredFundCount && !pricePatches.length && !inceptionPatches.length && !reportLocatorReceipts.length) throw new SafeBuildError('NO_VALID_FRESH_FUNDS');
   let retainedFundCount = 0;
   if (preserveOthers) {
     for (const [code, old] of cached) {
@@ -612,7 +627,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
   if (failedFundCount) limitations.push('部分基金沿用上次有效数据或暂缺，原始观测日期保留。');
   const uniqueErrors = [...new Map(errors.map(issue => [JSON.stringify(issue), issue])).values()];
   return {
-    schemaVersion: 1, asOf: raw.asOf, retrievedAt: raw.retrievedAt, sourceMode: 'actions', pricePatches, inceptionPatches,
+    schemaVersion: 1, asOf: raw.asOf, retrievedAt: raw.retrievedAt, sourceMode: 'actions', pricePatches, inceptionPatches, reportLocatorReceipts,
     targetPeriodEnd: config.targetPeriodEnd || null, baselinePeriodEnd: config.baselinePeriodEnd || null,
     coverage: {
       targetPeriodEnd: config.targetPeriodEnd || null, baselinePeriodEnd: config.baselinePeriodEnd || null,

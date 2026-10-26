@@ -29,6 +29,8 @@ MANAGER_MAX_ATTEMPTS = 3
 MANAGER_TABLE_COVERAGE_VERSION = 2
 STRATEGY_SECTION_COVERAGE_VERSION = 1
 STRATEGY_MAX_ATTEMPTS = 3
+REPORT_LOCATOR_MAX_ATTEMPTS = 2
+REPORT_LOCATOR_MAX_DIGESTS = 16
 ERROR_CODES = {
     "BATCH_FAILED", "FUND_FAILED", "NO_VALID_REPORTS", "TARGET_REPORT_MISSING", "FUND_NOT_COLLECTED",
     "NO_VALID_FRESH_FUNDS", "NO_REPORTS", "NO_DATED_HOLDINGS", "EMPTY_HOLDINGS", "OLDER_REPORT",
@@ -36,6 +38,7 @@ ERROR_CODES = {
     "INVALID_REPORT", "INVALID_REPORT_SOURCE", "REPORT_IDENTITY_MISMATCH", "INVALID_NO_EQUITIES_EVIDENCE",
     "BATCH_DEADLINE_REACHED", "PRICE_BUDGET_REACHED",
     "PRICE_BINDING_INVALID", "ENRICHMENT_FAILED",
+    "REPORT_LOCATOR_NOT_ATTEMPTED",
     "TIMEOUT", "NETWORK_ERROR", "HTTP_ERROR", "TLS_FAILED", "TARGET_REPORT_UNAVAILABLE",
     "PDF_PARSE_FAILED", "PDF_TEXT_EMPTY", "INVALID_PDF", "UNSUPPORTED_MARKET", "HOLDINGS_UNRESOLVED", "INVALID_FORMAT", "PARSE_FAILED",
 }
@@ -292,6 +295,12 @@ def base_states(catalog, previous, phase, now, config=None):
                              "retry": retry_state(None, None, now)}
         states[code]["enrichment"] = normalize_enrichment(prior_enrichment, status, now)
         states[code]["quality"] = normalize_quality(prior_quality, status, now, code=code)
+        candidates = (config or {}).get("reportLocatorCandidates", {})
+        states[code]["reportLocator"] = normalized_locator(candidates.get(code) if isinstance(candidates, dict) else None,
+                                                          code, phase, now)
+        ledger, full = locator_history(prior.get("reportLocatorAttempts"), now)
+        states[code]["reportLocatorAttempts"] = ledger
+        states[code]["reportLocatorHistoryFull"] = full or prior.get("reportLocatorHistoryFull") is True
         if status == "not-applicable":
             states[code]["notApplicableEvidence"] = clean_not_applicable(exemption, code, phase, now)
     apply_retry_policy(states, config, now)
@@ -307,6 +316,60 @@ def eligible(states):
     # can be collected directly even while its owner remains unresolved.
     return [code for code, state in states.items()
             if state["status"] in {"pending", "failed"} and state["attempts"] < 2 and not state.get("deferredUntil")]
+
+
+def normalized_locator(value, code, phase, now):
+    if not isinstance(value, dict):
+        return None
+    from report_locators import normalize_locator
+    return normalize_locator(value, code, phase["targetPeriodEnd"], now=now)
+
+
+def locator_history(previous, now):
+    """Keep a bounded, version-independent ledger; old digests never reset."""
+    previous = previous if isinstance(previous, dict) else {}
+    rows = {}
+    for digest, item in previous.items():
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) or not isinstance(item, dict):
+            continue
+        count, observed = item.get("attempts"), instant(item.get("lastAttemptAt"))
+        if (not isinstance(count, int) or isinstance(count, bool) or count < 1
+                or not observed or observed > now + dt.timedelta(minutes=5)):
+            continue
+        rows[digest] = {"attempts": min(count, REPORT_LOCATOR_MAX_ATTEMPTS), "lastAttemptAt": item["lastAttemptAt"],
+                        "errorCode": item.get("errorCode") if item.get("errorCode") in ERROR_CODES else None}
+    return dict(list(rows.items())[:REPORT_LOCATOR_MAX_DIGESTS]), len(rows) >= REPORT_LOCATOR_MAX_DIGESTS
+
+
+def locator_eligible(states):
+    result = []
+    for code, state in states.items():
+        locator = state.get("reportLocator")
+        if state["status"] not in {"pending", "failed"} or not locator:
+            continue
+        ledger = state.get("reportLocatorAttempts", {})
+        digest = locator["digest"]
+        if digest not in ledger and state.get("reportLocatorHistoryFull"):
+            continue
+        if ledger.get(digest, {}).get("attempts", 0) < REPORT_LOCATOR_MAX_ATTEMPTS:
+            result.append(code)
+    return result
+
+
+def locator_receipt(value, locator, now):
+    if not locator or not isinstance(value, dict):
+        return None
+    from report_locators import normalize_receipt
+    return normalize_receipt(value, locator, now=now)
+
+
+def locator_report_matches(evidence, locator, receipt):
+    if not isinstance(evidence, dict) or not locator or not receipt:
+        return False
+    from report_locators import candidate_id
+    attempted = set(receipt["attemptedCandidateIds"])
+    return evidence.get("sourceUrl") in {candidate["sourceUrl"] for candidate in locator["candidates"]
+                                         if candidate_id(candidate) in attempted}
 
 
 def stock_key(item):
@@ -926,13 +989,17 @@ def fair_lane(codes, states):
         company = state["companyCode"] or "~unmapped"
         visits[company] = visits.get(company, 0) + state["totalAttempts"]
         visits[company] += state["quality"]["totalAttempts"] + state["enrichment"]["totalAttempts"]
+        visits[company] += sum(item["attempts"] for item in state.get("reportLocatorAttempts", {}).values())
     queues = {}
     def order(code):
         state = states[code]
         # Capacity deferrals are scheduling observations, not source attempts.
         # Rotate them behind equally attempted work without an overnight lock.
         activity = [value for value in (instant(state.get("lastAttemptAt")), instant(state.get("lastDeferredAt"))) if value]
-        return (state["totalAttempts"] + state["quality"]["totalAttempts"] + state["enrichment"]["totalAttempts"],
+        locator_rows = state.get("reportLocatorAttempts", {}).values()
+        activity.extend(value for item in locator_rows if (value := instant(item.get("lastAttemptAt"))))
+        return (state["totalAttempts"] + state["quality"]["totalAttempts"] + state["enrichment"]["totalAttempts"]
+                + sum(item["attempts"] for item in state.get("reportLocatorAttempts", {}).values()),
                 max(activity).timestamp() if activity else float('-inf'), code)
     for code in sorted(codes, key=order):
         queues.setdefault(states[code]["companyCode"] or "~unmapped", deque()).append(code)
@@ -946,20 +1013,24 @@ def fair_lane(codes, states):
     return ordered
 
 
-def fair_research_selection(states, source_codes, quality_codes, enrich_codes, capacity):
+def fair_research_selection(states, source_codes, quality_codes, enrich_codes, capacity, locator_codes=()):
     """Reserve capacity for report repair without stalling the first pass.
 
     With every lane populated, each ten slots contain six new products, two
     report repairs, one source retry and one price repair. Empty lanes yield
     their capacity to the remaining work; per-product retry limits still apply.
     """
+    locator_codes = set(locator_codes)
     lanes = {
-        "fresh": fair_lane([code for code in source_codes if states[code]["status"] == "pending"], states),
-        "retry": fair_lane([code for code in source_codes if states[code]["status"] != "pending"], states),
+        "fresh": fair_lane([code for code in source_codes if states[code]["status"] == "pending" and code not in locator_codes], states),
+        "retry": fair_lane([code for code in source_codes if states[code]["status"] != "pending" and code not in locator_codes], states),
+        "locators": fair_lane(locator_codes, states),
         "quality": fair_lane(quality_codes, states),
         "prices": fair_lane(set(enrich_codes) - set(quality_codes), states),
     }
     rotation = ("fresh", "quality", "fresh", "fresh", "retry", "fresh", "quality", "fresh", "prices", "fresh")
+    if locator_codes:
+        rotation = ("fresh", "quality", "fresh", "locators", "retry", "fresh", "quality", "fresh", "prices", "fresh")
     selected, seen = [], set()
     while len(selected) < capacity and any(lanes.values()):
         for lane in rotation:
@@ -988,7 +1059,7 @@ def eligible_work(states, config):
     quality_codes -= {code for code in quality_codes & enrich_codes
                       if states[code]["quality"]["missingFields"] == ["prices"]
                       and states[code]["enrichment"]["missingStocks"]}
-    source_codes = eligible(states)
+    source_codes = sorted(set(eligible(states)) | set(locator_eligible(states)))
     return source_codes, quality_codes, enrich_codes
 
 
@@ -1022,6 +1093,7 @@ def completion_audit(states, config, now, directory_pending=False, universe=None
     rows = list(states.values())
     applicable = [item for item in rows if item["status"] != "not-applicable"]
     source, quality, enrichment = eligible_work(states, config)
+    locators = set(locator_eligible(states))
     prices = set(enrichment) - set(quality)
     ready = set(source) | set(quality) | prices
     failed = [item for item in rows if item["status"] == "failed"]
@@ -1064,8 +1136,9 @@ def completion_audit(states, config, now, directory_pending=False, universe=None
                 "exhaustedFunds": sum(item["status"] in SUCCESS and item["quality"]["status"] == "exhausted" for item in applicable),
                 "exhaustedByMissingField": {key: sum(item["status"] in SUCCESS and item["quality"]["status"] == "exhausted"
                     and item["quality"]["fields"][key] not in QUALITY_ACCEPTED for item in applicable) for key in QUALITY_FIELDS}},
-            "work": {"readyTasks": len(ready), "freshSourceTasks": sum(states[code]["status"] == "pending" for code in source),
-                "sourceRetryTasks": sum(states[code]["status"] != "pending" for code in source),
+            "work": {"readyTasks": len(ready), "freshSourceTasks": sum(states[code]["status"] == "pending" and code not in locators for code in source),
+                "sourceRetryTasks": sum(states[code]["status"] != "pending" and code not in locators for code in source),
+                "reportLocatorTasks": len(locators),
                 "reportRepairTasks": len(quality), "priceRepairTasks": len(prices),
                 "managerRepairTasks": sum(manager_only_repair(states[code]["quality"]) for code in quality),
                 "strategyRepairTasks": sum(strategy_only_repair(states[code]["quality"]) for code in quality),
@@ -1098,6 +1171,7 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
     apply_retry_policy(states, config, current)
     selected = []
     source_codes, quality_codes, enrich_codes = eligible_work(states, config)
+    locator_codes = set(locator_eligible(states))
     # Existing quote repair state is insufficient without the exact retained
     # source/universe. Recover that source through the report lane instead.
     price_only = {}
@@ -1110,7 +1184,7 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
             if states[code]['quality']['attempts'] < QUALITY_MAX_ATTEMPTS:
                 quality_codes.add(code)
     if quality_enabled(config):
-        selected = fair_research_selection(states, source_codes, quality_codes, enrich_codes, shards * batch_size)
+        selected = fair_research_selection(states, source_codes, quality_codes, enrich_codes, shards * batch_size, locator_codes)
     else:
         for pool in (quality_codes, enrich_codes, source_codes):
             queue = fair_lane([code for code in pool if code not in selected], states)
@@ -1118,16 +1192,20 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
                 selected.append(queue.popleft())
     batches, matrix = {}, []
     for index, start in enumerate(range(0, len(selected), batch_size)):
-        batch = {key: value for key, value in config.items() if key not in {"funds", "traversal"}}
+        batch = {key: value for key, value in config.items() if key not in {"funds", "traversal", "reportLocatorCandidates",
+                                                                        "reportLocatorUniverseCodes", "reportLocatorRegistry"}}
         batch_codes = selected[start:start + batch_size]
         batch["funds"] = [{**records[code], **({"priceTargets": states[code]["enrichment"]["missingStocks"]}
                           if code in enrich_codes and code not in quality_codes and states[code]["enrichment"]["missingStocks"] else {}),
-                           **({'priceOnly': price_only[code]} if code in price_only and code not in quality_codes else {})} for code in batch_codes]
+                           **({'priceOnly': price_only[code]} if code in price_only and code not in quality_codes else {}),
+                           **({'reportLocator': states[code]['reportLocator']} if states[code].get('reportLocator') else {}),
+                           **({'reportLocatorOnly': True} if code in locator_codes else {})} for code in batch_codes]
         batch["traversal"] = {"phase": phase, "batchId": str(index), "plannedAt": current.isoformat(),
                               "enrichmentCodes": [code for code in batch_codes if code in enrich_codes and code not in quality_codes],
                               "qualityCodes": [code for code in batch_codes if code in quality_codes],
                               "managerCodes": [code for code in batch_codes if code in quality_codes and manager_only_repair(states[code]["quality"])],
-                              "strategyCodes": [code for code in batch_codes if code in quality_codes and strategy_only_repair(states[code]["quality"])]}
+                              "strategyCodes": [code for code in batch_codes if code in quality_codes and strategy_only_repair(states[code]["quality"])],
+                              "reportLocatorCodes": [code for code in batch_codes if code in locator_codes]}
         filename = f"batch-{index}.json"
         batches[filename] = batch
         matrix.append({"id": str(index), "config": filename})
@@ -1136,8 +1214,9 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
     continuing = bool(selected)
     return {"batches": batches, "matrix": matrix,
             "meta": {"hasWork": bool(selected), "continueRun": continuing, "selectedCount": len(selected),
-                     "freshCount": sum(code in source_codes and states[code]["status"] == "pending" for code in selected),
-                     "retryCount": sum(code in source_codes and states[code]["status"] != "pending" for code in selected),
+                     "freshCount": sum(code in source_codes and states[code]["status"] == "pending" and code not in locator_codes for code in selected),
+                     "retryCount": sum(code in source_codes and states[code]["status"] != "pending" and code not in locator_codes for code in selected),
+                     "reportLocatorCount": sum(code in locator_codes for code in selected),
                      "enrichmentCount": sum(code in enrich_codes and code not in quality_codes for code in selected),
                      "managerCount": sum(code in quality_codes and manager_only_repair(states[code]["quality"]) for code in selected),
                      "strategyCount": sum(code in quality_codes and strategy_only_repair(states[code]["quality"]) for code in selected),
@@ -1270,6 +1349,24 @@ def build_status(config, snapshot=None, now=None):
         row["strategySectionCoverageVersion"] = STRATEGY_SECTION_COVERAGE_VERSION
         if code in qualities:
             row["reportQuality"] = qualities[code]
+        if item.get('reportLocatorOnly') is True:
+            locator = normalized_locator(item['reportLocator'], code, phase, current)
+            supplied = next((value for value in (snapshot.get('reportLocatorReceipts', []) if snapshot_ok else [])
+                             if isinstance(value, dict) and value.get('code') == code), None)
+            receipt = locator_receipt(supplied, locator, current)
+            if receipt and (instant(receipt['attemptedAt']) > current
+                            or planned and instant(receipt['attemptedAt']) < planned):
+                receipt = None
+            row.update({'reportLocatorOnly': True, 'reportLocator': locator, 'reportLocatorReceipt': receipt,
+                        'reportLocatorAttempt': bool(receipt), 'attempted': bool(receipt)})
+            if not receipt or row['status'] == 'not-applicable' or (row['status'] in SUCCESS
+                    and not locator_report_matches(row.get('reportEvidence'), locator, receipt)):
+                row = {key: value for key, value in row.items() if key not in {'reportEvidence', 'reportQuality', 'priceCoverage', 'notApplicableEvidence'}}
+                row['status'] = 'deferred-budget' if not receipt and valid_deferred(declared) else 'failed'
+                row['errorCode'] = ('BATCH_DEADLINE_REACHED' if row['status'] == 'deferred-budget'
+                                    else 'REPORT_LOCATOR_NOT_ATTEMPTED' if not receipt else 'REPORT_IDENTITY_MISMATCH')
+            elif row['status'] == 'deferred-budget':
+                row.update({'status': 'failed', 'errorCode': 'FUND_FAILED'})
         rows.append(row)
     return {"schemaVersion": 1, "phase": phase, "attemptedAt": current.isoformat(), "funds": rows, "portfolioAliases": aliases}
 
@@ -1315,13 +1412,19 @@ def valid_status(document, config, now=None):
     quality_codes = set(config.get("traversal", {}).get("qualityCodes", []))
     manager_codes = set(config.get("traversal", {}).get("managerCodes", []))
     strategy_codes = set(config.get("traversal", {}).get("strategyCodes", []))
+    locator_codes = set(config.get("traversal", {}).get("reportLocatorCodes", []))
     if not manager_codes.issubset(quality_codes) or not strategy_codes.issubset(quality_codes):
+        return False
+    if (not locator_codes.issubset(wanted) or locator_codes.intersection(enrich_codes | quality_codes | manager_codes | strategy_codes)
+            or locator_codes != {item['code'] for item in config['funds'] if item.get('reportLocatorOnly') is True}):
         return False
     for item in rows:
         if not isinstance(item, dict) or item.get("code") not in wanted or item["code"] in seen:
             return False
         seen.add(item["code"])
         planned_item = next(row for row in config['funds'] if row['code'] == item['code'])
+        if planned_item.get('reportLocatorOnly') is True and 'priceOnly' in planned_item:
+            return False
         if 'priceOnly' in planned_item:
             if (item.get('priceOnly') is not True or item.get('status') != 'failed'
                     or item.get('companyCode') != wanted[item['code']]
@@ -1337,6 +1440,27 @@ def valid_status(document, config, now=None):
                          or len(set(keys)) != len(keys)): return False
             if not keys and item.get('errorCode') not in ('PRICE_BUDGET_REACHED', 'PRICE_BINDING_INVALID'): return False
             continue
+        if planned_item.get('reportLocatorOnly') is True:
+            locator = normalized_locator(planned_item['reportLocator'], item['code'], phase, current)
+            receipt = locator_receipt(item.get('reportLocatorReceipt'), locator, current)
+            if (not locator or item.get('reportLocatorOnly') is not True or item.get('reportLocator') != locator
+                    or item.get('reportLocatorAttempt') is not bool(receipt) or item.get('attempted') is not bool(receipt)
+                    or item.get('reportLocatorReceipt') != receipt or item.get('companyCode') != wanted[item['code']]
+                    or any(item.get(key) is not False for key in ('qualityAttempt', 'managerAttempt', 'strategyAttempt', 'enrichmentAttempt'))):
+                return False
+            if receipt and (instant(receipt['attemptedAt']) > attempted or planned and instant(receipt['attemptedAt']) < planned):
+                return False
+            if not receipt:
+                if not (valid_deferred(item) or item.get('status') == 'failed' and item.get('errorCode') == 'REPORT_LOCATOR_NOT_ATTEMPTED'):
+                    return False
+                if any(key in item for key in ('reportEvidence', 'reportQuality', 'priceCoverage', 'notApplicableEvidence')):
+                    return False
+                continue
+            if item.get('status') == 'not-applicable' or (item.get('status') in SUCCESS
+                    and not locator_report_matches(item.get('reportEvidence'), locator, receipt)):
+                return False
+        elif item.get('reportLocatorOnly') or item.get('reportLocatorReceipt') or item.get('reportLocatorAttempt'):
+            return False
         if item.get("companyCode") != wanted[item["code"]] or item.get("status") not in TERMINAL | {"failed", "deferred-budget"}:
             return False
         if bool(item.get("enrichmentAttempt")) != (item["code"] in enrich_codes):
@@ -1414,6 +1538,11 @@ def reconcile_observations(statuses, receipt, config, now=None):
                 continue
             row = dict(original)
             observation = observations.get(row.get("code"))
+            if row.get('reportLocatorOnly') is True and row.get('reportLocatorAttempt') is not True:
+                # No started PDF request exists to reconcile. Missing merger
+                # output cannot turn a capacity deferral into an attempt.
+                result['funds'].append(row)
+                continue
             if row.get('priceOnly') is True:
                 proof = patch_receipts.get(row.get('code'))
                 identity_ok = (valid_price_binding(row.get('priceBinding'), phase, row.get('code'))
@@ -1515,6 +1644,45 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                         and valid_event_evidence(item.get('reportEvidence'), status, phase, attempted)
                         and item['priceBinding']['holdingsIdentity'] == extra.get('holdingsIdentity')):
                     apply_coverage(state, item.get('priceCoverage'))
+                continue
+            if item.get('reportLocatorOnly') is True or 'reportLocatorReceipt' in item or 'reportLocator' in item:
+                locator = normalized_locator(item.get('reportLocator'), item['code'], phase, current)
+                receipt = locator_receipt(item.get('reportLocatorReceipt'), locator, current)
+                if (not locator or item.get('reportLocatorOnly') is not True
+                        or any(item.get(key) is not False for key in ('qualityAttempt', 'managerAttempt', 'strategyAttempt', 'enrichmentAttempt'))):
+                    continue
+                if not receipt:
+                    if valid_deferred(item) and (not instant(state.get('lastDeferredAt')) or attempted > instant(state['lastDeferredAt'])):
+                        state['lastDeferredAt'] = document['attemptedAt']
+                    continue
+                began = instant(receipt['attemptedAt'])
+                if (item.get('reportLocatorAttempt') is not True or item.get('attempted') is not True
+                        or not began or began > attempted):
+                    continue
+                ledger = state['reportLocatorAttempts']
+                prior = ledger.get(locator['digest'], {})
+                if (prior.get('attempts', 0) >= REPORT_LOCATOR_MAX_ATTEMPTS
+                        or instant(prior.get('lastAttemptAt')) and began <= instant(prior['lastAttemptAt'])
+                        or locator['digest'] not in ledger and state.get('reportLocatorHistoryFull')):
+                    continue
+                success = (status in SUCCESS and valid_event_evidence(item.get('reportEvidence'), status, phase, attempted)
+                           and locator_report_matches(item.get('reportEvidence'), locator, receipt))
+                ledger[locator['digest']] = {'attempts': prior.get('attempts', 0) + 1, 'lastAttemptAt': receipt['attemptedAt'],
+                                             'errorCode': None if success else item.get('errorCode') if item.get('errorCode') in ERROR_CODES else 'FUND_FAILED'}
+                state['reportLocatorHistoryFull'] = state.get('reportLocatorHistoryFull') or len(ledger) >= REPORT_LOCATOR_MAX_DIGESTS
+                # This is a separate actual-PDF request budget. A failed locator
+                # must not advance/reset any legacy lane or refresh its time.
+                if not success or state['status'] in TERMINAL:
+                    continue
+                state.update({'status': status, 'errorCode': None, 'attempted': True,
+                              'lastAttemptAt': item['reportEvidence']['observedAt'], 'attribution': 'direct', 'deferredUntil': None})
+                if valid_quality(item.get('reportQuality'), phase):
+                    state['quality'] = normalize_quality(merge_quality_observation(state['quality'], item['reportQuality']), status, current, code=item['code'])
+                else:
+                    state['quality'] = normalize_quality(state['quality'], status, current, code=item['code'])
+                state['enrichment'] = normalize_enrichment(state['enrichment'], status, current)
+                apply_coverage(state, item.get('priceCoverage'))
+                accepted_success.add(item['code'])
                 continue
             if status == "deferred-budget":
                 prior_deferred = instant(state.get("lastDeferredAt"))
@@ -1697,7 +1865,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
     processed = sum(state["status"] in SUCCESS for state in all_states)
     failed = sum(state["status"] == "failed" for state in all_states)
     not_applicable = sum(state["status"] == "not-applicable" for state in all_states)
-    continuing = bool(eligible(states) or enrichment_eligible(states)
+    continuing = bool(eligible(states) or locator_eligible(states) or enrichment_eligible(states)
                       or quality_enabled(config) and quality_eligible(states))
     enrichment_states = [state["enrichment"] for state in all_states if state["status"] in SUCCESS and state["attribution"] != "portfolio-evidence" and state["representativeCode"] == state["code"]]
     research_complete = sum(state["status"] in SUCCESS and state["quality"]["status"] == "complete" for state in all_states)
@@ -1720,6 +1888,11 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
             "deferredFunds": sum(bool(state.get("deferredUntil")) for state in all_states),
             "nextRetryAt": next_retry, "directoryNextRetryAt": directory_retry,
             "retryableFailedFunds": sum(state["status"] == "failed" and state["attempts"] < 2 for state in all_states),
+            "reportLocators": {"readyFunds": len(locator_eligible(states)),
+                               "attemptedFunds": sum(bool(state['reportLocatorAttempts']) for state in all_states),
+                               "attempts": sum(item['attempts'] for state in all_states for item in state['reportLocatorAttempts'].values()),
+                               "maxAttemptsPerDigest": REPORT_LOCATOR_MAX_ATTEMPTS,
+                               "maxTrackedDigests": REPORT_LOCATOR_MAX_DIGESTS},
             "unmappedFunds": sum(state["companyCode"] is None for state in all_states),
             "completionStatus": "complete" if completed else "incomplete-running" if continuing else "incomplete-exhausted",
             "completionAudit": audit, "quarterUniverse": universe,
@@ -1737,7 +1910,10 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                            "attemptedFunds": sum(item["attempts"] > 0 for item in enrichment_states),
                            "attempts": sum(item["attempts"] for item in enrichment_states), "maxAttempts": 3},
             "companies": company_rows,
-            "funds": [{**state, "enrichment": compact_enrichment(state["enrichment"])} for state in all_states],
+            # Candidate metadata lives once in the frozen registry. Progress
+            # retains only its independent attempt ledger, not per-share copies.
+            "funds": [{**{key: value for key, value in state.items() if key != 'reportLocator'},
+                       "enrichment": compact_enrichment(state["enrichment"])} for state in all_states],
             "directoryPasses": passes,
             "lastDirectoryObservedAt": directory_observed, "continueRun": continuing}
 
@@ -1790,6 +1966,9 @@ def main(argv=None):
     merge.add_argument("--data-root", help="Quarter directory containing the merger's effective snapshot.")
     args = parser.parse_args(argv)
     config = read_json(args.config)
+    if args.command in {'plan', 'merge'} and any(key in config for key in ('reportLocatorRegistry', 'reportLocatorUniverseCodes')):
+        from report_locators import expand_config
+        config = expand_config(config)
     if args.command == "plan":
         result = plan_batches(read_json(args.catalog), read_json(args.progress, optional=True), config, args.shards, args.batch_size,
                               retained=load_retained_funds(args.data_root))

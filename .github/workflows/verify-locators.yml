@@ -1,0 +1,46 @@
+name: Verify two report locator PDFs
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: verify-report-locators
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /requirements.txt
+            /scripts/*.py
+            /scripts/*.js
+            /lib/*.js
+            /web/*.js
+            /config/*.json
+            /tests/test_verify_locators.py
+            /.github/workflows/verify-locators.yml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Validate the isolated verification chain without network
+        run: python -m unittest discover -s tests -p 'test_verify_locators.py'
+      - name: Verify two fixed public PDFs and cached negative cases
+        run: python scripts/verify_locators.py
+      - name: Retain compact guarded verification only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-locator-verification
+          path: .cache/locator-verification/result.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7

@@ -17,6 +17,8 @@ from quarter_catalog import (compose_quarter_catalog, freeze_catalog, validate_c
                              normalize_overlay, recover_historical_overlay, combine_historical_overlays,
                              historical_candidate_codes, report_candidate_codes, copy_frozen_catalog)
 from report_identity_catalog import supplement_catalog
+from report_locators import (refresh_registries, registry_locators, freeze_registry, validate_registry_lock,
+                             normalize_locator, MAX_BYTES as LOCATOR_MAX_BYTES)
 from source_dates import china_today
 
 PERIODS = {
@@ -38,6 +40,7 @@ def quarter_config(base, quarter, as_of):
     return {**base, 'funds': [], 'quarter': quarter, 'asOf': as_of,
             'targetPeriodEnd': target, 'baselinePeriodEnd': baseline,
             'collectorVersion': 5, 'requireReportQuality': True, 'requireHistoricalUniverse': True,
+            'reportLocatorEnabled': base.get('reportLocatorEnabled') is True,
             'retryPolicy': {'dailyUntil': '2026-11-30' if quarter == '2026Q3' else None,
                             'intervalDays': 7, 'maxScheduledCycles': 4},
             'scope': f'{quarter} 全目录产品与报告逐项补齐'}
@@ -182,6 +185,7 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
     catalog = read_json(root / 'catalog.json')
     base = read_json('config/universe.json')
     configs = {name: quarter_config(base, name, as_of) for name in selected}
+    locator_registries = refresh_registries(root, selected, as_of, allow_fetch=refresh)
     scoped_catalogs, identity_parts = {}, {}
     for name in selected:
         overlay, status = quarter_history(root, name, explicit=historical_overlays)
@@ -190,11 +194,15 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
         scoped_catalogs[name]['quarterUniverse']['historicalRefresh'] = status
         scoped_catalogs[name], identity_parts[name] = supplement_catalog(
             scoped_catalogs[name], root / 'periods' / name, name)
-    matrix, catalogs = [], {}
+    matrix, catalogs, locator_locks = [], {}, {}
     for name in selected:
         output = seed_quarter(root, name)
         config = configs[name]
         scoped_catalog = scoped_catalogs[name]
+        locator_locks[name] = freeze_registry(locator_registries[name], name)
+        config['reportLocatorRegistry'] = locator_locks[name]
+        known_codes = {row['code'] for row in scoped_catalog['funds']}
+        config['reportLocatorUniverseCodes'] = sorted({code for value in locator_registries[name]['records'] for code in value['codes']} & known_codes)
         binding = freeze_catalog(scoped_catalog, name, identity_parts=identity_parts[name])
         catalogs[name] = binding
         config.update(catalogLockVersion=1, catalogDigest=binding['sha256'], catalogPath=binding['path'])
@@ -219,7 +227,8 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
     atomic_json('.cache/plan/matrix.json', matrix)
     atomic_json('.cache/plan/meta.json', {'quarters': selected, 'asOf': as_of, 'hasWork': bool(matrix), 'directoryRefresh': directory_status})
     atomic_json('.cache/campaign/selection.json', {'quarters': selected, 'asOf': as_of, 'selection': quarter,
-                'directoryRefresh': directory_status, 'catalogLockVersion': 1, 'catalogs': catalogs})
+                'directoryRefresh': directory_status, 'catalogLockVersion': 1, 'catalogs': catalogs,
+                'reportLocators': locator_locks})
     scan_campaign_files()
     return {'batchCount': len(matrix), 'quarters': selected, 'directoryRefresh': directory_status}
 
@@ -234,10 +243,11 @@ def scan_campaign_files():
         relative = file.relative_to(root).as_posix()
         match = re.fullmatch(r'catalogs/(2026Q[23])\.json', relative)
         identity = re.fullmatch(r'catalogs/(2026Q[23])-identities/part-[a-f0-9]{64}\.json', relative)
-        if file.suffix != '.json' or file.parent.is_symlink() or '/' in relative and not (match or identity):
+        locator = re.fullmatch(r'locators/(2026Q[23])\.json', relative)
+        if file.suffix != '.json' or file.parent.is_symlink() or '/' in relative and not (match or identity or locator):
             raise ValueError('PLAN_PUBLICATION_REJECTED')
         policy_name = f'web/data/periods/{match[1]}/catalog.json' if match else f'config/{file.name}'
-        maximum = 5_000_000 if identity else content_limit(policy_name)
+        maximum = LOCATOR_MAX_BYTES if locator else 5_000_000 if identity else content_limit(policy_name)
         if file.stat().st_size > maximum or inspect_content(file.read_bytes(), maximum):
             raise ValueError('PLAN_PUBLICATION_REJECTED')
         if identity:
@@ -304,10 +314,45 @@ def frozen_catalogs_for_publish(selection, matrix, root):
     return paths
 
 
+def frozen_locators_for_publish(selection, matrix):
+    bindings = selection.get('reportLocators')
+    if bindings is None:
+        # Previously queued campaigns have no supplemental source registry.
+        if any('reportLocatorRegistry' in read_json(Path('.cache/campaign') / (q + '.json')) for q in selection.get('quarters', [])):
+            raise ValueError('INVALID_LOCATOR_LOCK')
+        return {}
+    if not isinstance(bindings, dict) or set(bindings) != set(selection.get('quarters', [])): raise ValueError('INVALID_LOCATOR_LOCK')
+    if not isinstance(selection.get('catalogs'), dict) or set(selection['catalogs']) != set(bindings): raise ValueError('INVALID_CATALOG_LOCK')
+    paths, locators = {}, {}
+    for quarter, binding in bindings.items():
+        file, registry = validate_registry_lock(binding, quarter)
+        config = read_json(Path('.cache/campaign') / (quarter + '.json'))
+        if config.get('reportLocatorRegistry') != binding: raise ValueError('INVALID_LOCATOR_LOCK')
+        codes = config.get('reportLocatorUniverseCodes')
+        if not isinstance(codes, list) or 'reportLocatorCandidates' in config: raise ValueError('INVALID_LOCATOR_LOCK')
+        catalog_path = validate_catalog_lock(quarter, config, selection['catalogs'][quarter])
+        catalog = read_json(catalog_path)
+        known_codes = {row['code'] for row in catalog['funds']}
+        expected_codes = sorted({code for value in registry['records'] for code in value['codes']} & known_codes)
+        if codes != expected_codes: raise ValueError('INVALID_LOCATOR_LOCK')
+        expected = registry_locators(registry, codes, as_of=config.get('asOf')) if config.get('reportLocatorEnabled') is True else {}
+        paths[quarter], locators[quarter] = file, expected
+    for item in matrix:
+        batch = read_json(Path('.cache/plan') / item['config']); quarter = item['quarter']
+        if ('reportLocatorRegistry' in batch or 'reportLocatorCandidates' in batch
+                or 'reportLocatorUniverseCodes' in batch): raise ValueError('INVALID_LOCATOR_LOCK')
+        for fund in batch.get('funds', []):
+            value = fund.get('reportLocator')
+            if value is not None and (normalize_locator(value, fund.get('code'), PERIODS[quarter][0]) != value
+                                      or value != locators[quarter].get(fund.get('code'))): raise ValueError('INVALID_LOCATOR_LOCK')
+    return paths
+
+
 def publish(data='web/data', parts='.cache/parts'):
     root, part_root = Path(data), Path(parts)
     selection = read_json('.cache/campaign/selection.json')
     matrix = read_json('.cache/plan/matrix.json')
+    locator_paths = frozen_locators_for_publish(selection, matrix)
     catalogs = frozen_catalogs_for_publish(selection, matrix, root)
     from importlib.util import spec_from_file_location, module_from_spec
     spec = spec_from_file_location('complete_status', 'scripts/complete-status.py')
@@ -317,6 +362,8 @@ def publish(data='web/data', parts='.cache/parts'):
     for quarter in selection['quarters']:
         if quarter not in PERIODS: raise ValueError('INVALID_PERIOD')
         output = seed_quarter(root, quarter)
+        if quarter in locator_paths:
+            shutil.copy2(locator_paths[quarter], output / 'report-locators.json')
         copy_frozen_catalog(catalogs[quarter], output, quarter)
         scoped_parts = Path('.cache') / ('parts-' + quarter)
         scoped_parts.mkdir(parents=True, exist_ok=True)

@@ -65,7 +65,7 @@ def pdf_holdings_evidence(details, document, holdings):
             "documentTruncated": stats.get("truncated"), "pageNumbersVerified": stats.get("pageNumbersVerified")}
 
 
-def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, target_period=None, baseline_period=None, deadline=None):
+def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, target_period=None, baseline_period=None, deadline=None, locator_checkpoint=None):
     code = item["code"]
     errors = []
     fund = {"code": code, "name": item.get("name", code), "company": item.get("companyName") or item.get("company") or "",
@@ -143,6 +143,7 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         return fund, errors
     if expired():
         return fund, errors
+    reports = []; announcement_missing = False
     try:
         reports = source.announcements(code, as_of)
         if getattr(source, "announcement_error_code", None):
@@ -150,9 +151,47 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         if not reports:
             raise DataError("NO_REPORTS")
     except Exception as error:
-        if isinstance(error, DataError) and error.code == "NO_REPORTS" and check_missing_target_lifecycle():
-            return fund, errors
+        announcement_missing = isinstance(error, DataError) and error.code == 'NO_REPORTS'
         errors.append(safe_error(code, "announcements", error))
+    # A list association only locates a PDF. Independently verified original
+    # report identity is required before any fallback can become a report.
+    from report_locators import normalize_locator
+    from portfolio_identity import normalize_portfolio_identity
+    locator = normalize_locator(item.get('reportLocator'), code, target_period) if target_period else None
+    if locator and any(candidate['publishedAt'] > as_of for candidate in locator['candidates']): locator = None
+    supplemental_details = {}
+    supplemental_report = None
+    needs_locator = locator and (item.get('reportLocatorOnly') is True or not any(
+        report.get('periodEnd') == target_period and report.get('kind') == 'quarterly' for report in reports))
+    if needs_locator:
+        for candidate in locator['candidates']:
+            if expired(): return fund, errors
+            document = {key: candidate[key] for key in ('title', 'publishedAt', 'sourceUrl')}
+            document.update(periodEnd=target_period, kind='quarterly', fundCode=code, sourceLocatorEvidence=candidate)
+            receipt = fund.setdefault('reportLocatorReceipt', {'schemaVersion': 1, 'code': code,
+                'targetPeriodEnd': target_period, 'digest': locator['digest'],
+                'attemptedAt': dt.datetime.now(dt.timezone.utc).isoformat(), 'attemptedCandidateIds': []})
+            receipt['attemptedCandidateIds'].append(candidate['candidateId'])
+            if callable(locator_checkpoint): locator_checkpoint(fund)
+            try:
+                details = source.report_details(document)
+                identity = normalize_portfolio_identity(details.get('portfolioIdentityEvidence'), document)
+                if not identity:
+                    raise DataError('REPORT_IDENTITY_MISMATCH')
+                # Use the original PDF receipt, not the announcement observation.
+                details['portfolioIdentityEvidence'] = identity
+                details['portfolioCode'] = identity['sourcePortfolioCode']
+                details['shareClassCodes'] = identity['shareClassCodes']
+                supplemental_details[document['sourceUrl']] = details
+                supplemental_report = document
+                reports = [report for report in reports if report['sourceUrl'] != document['sourceUrl']] + [document]
+                break
+            except Exception as error:
+                errors.append(safe_error(code, 'report-locator', error))
+    if not reports:
+        if announcement_missing and check_missing_target_lifecycle():
+            errors = [item for item in errors if item.get('stage') != 'announcements' or item.get('errorCode') != 'NO_REPORTS']
+            return fund, errors
         return fund, errors
     allowed_periods = {p for p in (target_period, baseline_period) if p}
     if allowed_periods:
@@ -192,6 +231,8 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         identity = normalize_portfolio_identity(details.get("portfolioIdentityEvidence"), report)
         if identity:
             report["portfolioIdentityEvidence"] = identity
+        if identity and document.get('sourceLocatorEvidence'):
+            report['sourceLocatorEvidence'] = document['sourceLocatorEvidence']
         report.update({key: details.get(key) for key in ("navYuan", "narrative")})
         if isinstance(details.get("managerTableCoverage"), dict):
             report["managerTableCoverage"] = details["managerTableCoverage"]
@@ -209,6 +250,8 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
             report.update({"reportPdfSourceUrl": document["sourceUrl"],
                            "reportPdfPeriodEnd": document["periodEnd"], "reportPdfKind": document["kind"],
                            "evidenceRetrievedAt": dt.datetime.now(dt.timezone.utc).isoformat()})
+            if identity and document.get('sourceLocatorEvidence'):
+                report['evidenceRetrievedAt'] = identity['retrievedAt']
         if details.get("navYuan") is not None:
             report["navRetrievedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
         # Legacy fund-level aliases describe the target observation. Baseline
@@ -224,11 +267,18 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
 
     # A missing structured table must not prevent reading the product's PDF.
     selected_periods = sorted({r["periodEnd"] for r in reports}, reverse=True)[:max(2, min(max_reports, 4))]
+    selections = []
     for period in selected_periods:
+        alternatives = [r for r in reports if r['periodEnd'] == period]
+        selected = supplemental_report if item.get('reportLocatorOnly') is True and period == target_period and supplemental_report else max(alternatives, key=lambda r: r['publishedAt'])
+        selections.append((period, alternatives, selected))
+        # Keep the source-bound quarterly PDF as its own report when a later
+        # interim supplies holdings. Never copy its identity onto the interim.
+        if period == target_period and supplemental_report and selected != supplemental_report:
+            selections.append((period, [], supplemental_report))
+    for period, alternatives, selected in selections:
         if expired():
             return fund, errors
-        alternatives = [r for r in reports if r["periodEnd"] == period]
-        selected = max(alternatives, key=lambda r: r["publishedAt"])
         report = {k: selected[k] for k in ("title", "periodEnd", "kind", "publishedAt", "sourceUrl")}
         report["fundCode"] = code
         if selected.get("sourceFundCode"):
@@ -245,8 +295,9 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
                        "holdingsIncompleteReason": "UNSUPPORTED_OR_INVALID_SECURITY_ROWS" if getattr(holdings, "excluded_rows", 0) else None})
         details = {}
         try:
-            details = source.report_details(selected)
-            if not identity_matches(details):
+            details = supplemental_details.get(selected['sourceUrl']) or source.report_details(selected)
+            locator_identity = normalize_portfolio_identity(details.get('portfolioIdentityEvidence'), {**selected, 'fundCode': code}) if selected.get('sourceLocatorEvidence') else None
+            if selected.get('sourceLocatorEvidence') and not locator_identity or not selected.get('sourceLocatorEvidence') and not identity_matches(details):
                 errors.append({"code": code, "stage": "report", "errorCode": "REPORT_IDENTITY_MISMATCH"})
                 continue
             attach_details(report, details, selected)
@@ -272,6 +323,8 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
                     report["holdingsPdfEvidence"] = stock_proof
         except Exception as error:
             errors.append(safe_error(code, "report", error))
+            if selected.get('sourceLocatorEvidence'):
+                continue
         evidence = details.get("noEquitiesEvidence")
         if evidence and (holdings or report["holdingsExcludedRowCount"]):
             errors.append({"code": code, "stage": "report", "errorCode": "CONTRADICTORY_NO_EQUITIES"})
@@ -292,8 +345,9 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         quarterly = next((r for r in alternatives if r["kind"] == "quarterly" and r != selected), None)
         if quarterly and not (deadline is not None and time.monotonic() >= deadline):
             try:
-                quarter_details = source.report_details(quarterly)
-                if not identity_matches(quarter_details):
+                quarter_details = supplemental_details.get(quarterly['sourceUrl']) or source.report_details(quarterly)
+                quarter_identity = normalize_portfolio_identity(quarter_details.get('portfolioIdentityEvidence'), {**quarterly, 'fundCode': code}) if quarterly.get('sourceLocatorEvidence') else None
+                if quarterly.get('sourceLocatorEvidence') and not quarter_identity or not quarterly.get('sourceLocatorEvidence') and not identity_matches(quarter_details):
                     raise DataError("REPORT_IDENTITY_MISMATCH")
                 report["narrative"] = quarter_details.get("narrative")
                 if quarter_details.get("reportManagers") and (not report.get("managers")
@@ -361,19 +415,22 @@ def collect(config, as_of, checkpoint=None):
     patch_lock = threading.RLock()
     workers = int(bounded(config.get("maxWorkers", 2), 2, 2, 1))
     funds, errors = [], []
+    locator_started = {}
     bars, requested_prices = {}, {}
     price_attempted = 0
     deadline = time.monotonic() + bounded(config.get("maxBatchSeconds", 1500), 1500, 1800)
-    def snapshot(stage):
+    def snapshot_payload(stage):
+        completed_codes = {fund['code'] for fund in funds}
+        observed_funds = [*funds, *(fund for code, fund in locator_started.items() if code not in completed_codes)]
         comparable = sum(len(f["reports"]) >= 2 for f in funds)
         no_equities = sum(bool(f.get("noEquitiesEvidence", {}).get("confirmed")) for f in funds)
         prices_complete = sum(value.get("coverage", {}).get("completeness") == "complete" for value in bars.values())
         complete = stage == "finished" and comparable + no_equities == len(items) and not errors and prices_complete == len(requested_prices)
         payload = {"asOf": as_of, "targetPeriodEnd": config.get("targetPeriodEnd"), "baselinePeriodEnd": config.get("baselinePeriodEnd"),
-                   "retrievedAt": dt.datetime.now(dt.timezone.utc).isoformat(), "funds": funds, "barsByStock": bars, "errors": errors,
+                   "retrievedAt": dt.datetime.now(dt.timezone.utc).isoformat(), "funds": observed_funds, "barsByStock": bars, "errors": errors,
                    "pricePatches": price_patches,
                    "coverage": {"requested": len(items), "completedFundRequests": len(funds),
-                                "attemptedFundRequests": sum(f.get("collectionAttempt", {}).get("attempted") is not False for f in funds),
+                                "attemptedFundRequests": sum(f.get("collectionAttempt", {}).get("attempted") is not False for f in observed_funds),
                                 "deferredFundRequests": sum(f.get("collectionAttempt", {}).get("attempted") is False for f in funds),
                                 "withHoldings": sum(bool(f["reports"]) for f in funds), "comparable": comparable,
                                 "withNarrative": sum(any(r["narrative"] for r in f["reports"]) for f in funds),
@@ -384,15 +441,26 @@ def collect(config, as_of, checkpoint=None):
         if checkpoint:
             checkpoint(payload)
         return payload
+    def snapshot(stage):
+        # A slower earlier checkpoint cannot overwrite a newly persisted attempt.
+        with patch_lock: return snapshot_payload(stage)
+    def locator_checkpoint(fund):
+        with patch_lock:
+            value = {key: fund[key] for key in ('code', 'name', 'company', 'companyId', 'metadataSourceUrl',
+                     'collectionAttempt', 'reportLocatorReceipt') if key in fund}
+            locator_started[fund['code']] = json.loads(json.dumps({**value, 'reports': []}))
+            snapshot('funds')
     snapshot("funds")
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(collect_fund, x, as_of, config.get("historyYears", 2), config.get("maxReportsPerFund", 4),
-                               target_period=config.get("targetPeriodEnd"), baseline_period=config.get("baselinePeriodEnd"), deadline=deadline) for x in source_items]
+                               target_period=config.get("targetPeriodEnd"), baseline_period=config.get("baselinePeriodEnd"), deadline=deadline,
+                               locator_checkpoint=locator_checkpoint) for x in source_items]
         for future in concurrent.futures.as_completed(futures):
             fund, issues = future.result()
-            funds.append(fund)
-            errors.extend(issues)
-            snapshot("funds")
+            with patch_lock:
+                funds.append(fund)
+                errors.extend(issues)
+                snapshot("funds")
     order = {item["code"]: index for index, item in enumerate(items)}
     funds.sort(key=lambda fund: order[fund["code"]])
     item_by_code = {item["code"]: item for item in items}
