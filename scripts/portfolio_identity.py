@@ -111,11 +111,17 @@ def normalize_portfolio_identity(raw, report=None, *, now=None):
             'eligibleForShareClassExpansion': bool(classes), 'shareClassUniverseComplete': False, 'shareClassSpecificMetricsProvided': False}
 
 
-def parse_portfolio_identity(pages, report, *, page_numbers=None, retrieved_at=None, pdf_sha256=None, now=None):
+def parse_portfolio_identity(pages, report, *, page_numbers=None, retrieved_at=None, pdf_sha256=None, now=None, diagnostics=None):
     """Only bounded identity-section rows from known physical PDF pages."""
-    if not isinstance(pages, list) or not isinstance(report, dict): return None
+    def reject(reason, field=None):
+        # Optional verifier-only sink: fixed branch identifiers, never raw text.
+        # Recording a rejection must not alter the existing acceptance rules.
+        if isinstance(diagnostics, dict):
+            diagnostics.update(branch=reason, field=field)
+        return None
+    if not isinstance(pages, list) or not isinstance(report, dict): return reject('INVALID_INPUT')
     numbers = list(range(1, len(pages)+1)) if page_numbers is None else page_numbers
-    if not isinstance(numbers, list) or len(numbers) != len(pages): return None
+    if not isinstance(numbers, list) or len(numbers) != len(pages): return reject('PAGE_MAPPING_LENGTH_MISMATCH')
     chunks, positions = [], []
     for text, number in zip(pages[:12], numbers[:12]):
         value = str(text or '') + '\n'; chunks.append(value); positions.extend([number] * len(value))
@@ -127,28 +133,29 @@ def parse_portfolio_identity(pages, report, *, page_numbers=None, retrieved_at=N
             if len(line) > 180: continue
             for match in PERIOD.finditer(line): periods.append((match[0], number))
     expected = (report.get('kind'), report.get('periodEnd'))
-    if not periods or any(_period(value) != expected for value, _ in periods): return None
+    if not periods: return reject('PERIOD_TITLE_NOT_FOUND')
+    if any(_period(value) != expected for value, _ in periods): return reject('PERIOD_TITLE_MISMATCH')
     title = next(({'text': value, 'page': page} for value, page in periods if _page(page)), None)
-    if not title: return None
+    if not title: return reject('PERIOD_TITLE_PAGE_UNKNOWN')
     headings = list(HEADINGS.finditer(text))
     starts = [item for item in headings if re.sub(r'\s+', '', item['text']) in {'§2基金产品概况', '2.1基金基本情况'}]
     # A normal report has one product identity section. Duplicated real tables
     # require review instead of pairing one product's main code with another.
-    if len(starts) != 1: return None
+    if len(starts) != 1: return reject('IDENTITY_SECTION_START_COUNT')
     start = starts[0]; is_quarter = re.sub(r'\s+', '', start['text']) == '§2基金产品概况'
     closing = next((item for item in headings if item.start() > start.end()
                     and re.sub(r'\s+', '', item['text']).startswith('§3' if is_quarter else '2.2')), None)
-    if not closing: return None
+    if not closing: return reject('IDENTITY_SECTION_END_NOT_FOUND')
     section_pages = list(dict.fromkeys(positions[start.start():closing.end()]))
     if (not section_pages or not all(_page(page) for page in section_pages) or len(section_pages) > 5
-            or section_pages != list(range(section_pages[0], section_pages[-1]+1))): return None
+            or section_pages != list(range(section_pages[0], section_pages[-1]+1))): return reject('IDENTITY_SECTION_PAGE_MAPPING_INVALID')
     body = text[start.end():closing.start()]; rows = []
     for field, labels in LABELS.items():
         pattern = re.compile(r'(?m)^[ \t|]*(?:' + '|'.join(_spaced(label) for label in labels) + r')[ \t|：:]*')
         matches = list(pattern.finditer(body))
-        if len(matches) > 1: return None
+        if len(matches) > 1: return reject('DUPLICATE_CODE_LABEL', field)
         if not matches:
-            if field == 'mainCode': return None
+            if field == 'mainCode': return reject('MAIN_CODE_LABEL_NOT_FOUND', field)
             continue
         match = matches[0]; cursor = match.end(); end = cursor
         candidate_lines = body[cursor:].splitlines(keepends=True)
@@ -158,9 +165,9 @@ def parse_portfolio_identity(pages, report, *, page_numbers=None, retrieved_at=N
             if not re.fullmatch(r'[ \t|]*\d{6}(?:[ \t|]+\d{6})*[ \t|]*(?:\r?\n)?', line): break
             end += len(line)
         if end >= cursor + sum(len(line) for line in candidate_lines[:8]) and len(candidate_lines) > 8:
-            if re.fullmatch(r'[\s|]*\d{6}(?:[\s|]+\d{6})*[\s|]*', candidate_lines[8]): return None
+            if re.fullmatch(r'[\s|]*\d{6}(?:[\s|]+\d{6})*[\s|]*', candidate_lines[8]): return reject('CODE_ROWS_EXCEED_BOUND', field)
         quote = body[match.start():end].strip(); codes = _row_values(quote, field)
-        if not codes: return None
+        if not codes: return reject('CODE_ROW_INVALID', field)
         offset = start.end() + match.start(); last = start.end() + end
         row_pages = list(dict.fromkeys(positions[offset:last]))
         rows.append({'field': field, 'text': quote, 'codes': codes, 'page': row_pages[0], 'pages': row_pages})
@@ -176,4 +183,7 @@ def parse_portfolio_identity(pages, report, *, page_numbers=None, retrieved_at=N
                  'sectionBounded': True, 'pageNumbersVerified': True},
              'rows': rows, 'sourcePortfolioCode': main, 'shareClassCodes': classes,
              'shareClassUniverseComplete': False, 'shareClassSpecificMetricsProvided': False}
-    return normalize_portfolio_identity(proof, report, now=now)
+    clean = normalize_portfolio_identity(proof, report, now=now)
+    if clean is None: return reject('PROOF_VALIDATION_REJECTED')
+    if isinstance(diagnostics, dict): diagnostics.update(branch='VERIFIED', field=None)
+    return clean

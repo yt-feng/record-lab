@@ -30,6 +30,22 @@ def proof(pages=None, report=None, **kwargs):
 
 
 class PortfolioIdentityTests(unittest.TestCase):
+    def test_optional_branch_diagnostics_do_not_change_identity_acceptance(self):
+        diagnostics = {}
+        self.assertEqual(proof(diagnostics=diagnostics), proof())
+        self.assertEqual(diagnostics, {'branch': 'VERIFIED', 'field': None})
+        cases = [([PAGES[0].replace('第2', '第3'), *PAGES[1:]], None, 'PERIOD_TITLE_MISMATCH'),
+                 ([PAGES[0], PAGES[1].replace('基金主代码', '基金代码'), PAGES[2]], None, 'MAIN_CODE_LABEL_NOT_FOUND'),
+                 (PAGES[:2], None, 'IDENTITY_SECTION_END_NOT_FOUND'),
+                 (PAGES, [1, 2, 4], 'IDENTITY_SECTION_PAGE_MAPPING_INVALID'),
+                 ([PAGES[0], PAGES[1].replace('基金主代码 000001', '基金主代码 待定'), PAGES[2]], None, 'CODE_ROW_INVALID')]
+        for pages, numbers, reason in cases:
+            diagnostics = {}
+            self.assertIsNone(proof(pages, page_numbers=numbers, diagnostics=diagnostics))
+            self.assertIsNone(proof(pages, page_numbers=numbers))
+            self.assertEqual(diagnostics['branch'], reason)
+            self.assertNotIn('基金', json.dumps(diagnostics, ensure_ascii=False))
+
     def test_explicit_rows_and_independent_physical_pages(self):
         value = proof()
         self.assertEqual(value["shareClassCodes"], ["000001", "000002"])

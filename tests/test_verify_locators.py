@@ -47,6 +47,41 @@ class VerifyLocatorTests(unittest.TestCase):
         self.http = patch('requests.sessions.Session.request', side_effect=AssertionError('HTTP forbidden in unit tests'))
         self.http.start(); self.addCleanup(self.http.stop)
 
+    def test_original_parser_diagnostic_uses_same_extraction_and_no_second_download(self):
+        import portfolio_identity
+        from report_extract import PDFPages
+        sample = verify.SAMPLES[1]
+        report = {'sourceUrl': sample['sourceUrl'], 'periodEnd': '2026-09-30', 'kind': 'quarterly',
+                  'publishedAt': sample['publishedAt'], 'fundCode': sample['codes'][0], 'title': sample['title']}
+        pages = PDFPages([sample['title'], '§2 基金产品概况\n基金代码 159366\n',
+                          '§3 主要财务指标和基金净值表现\n' + '合成正文不得完整输出。' * 60], 3)
+        original = portfolio_identity.parse_portfolio_identity
+        source = verify.FixedPdfProvider(sample); self.addCleanup(source.session.close)
+        with patch.object(PublicProvider, 'get', return_value=b'%PDF-synthetic') as get, \
+                patch('report_extract._pypdf_pages', return_value=pages) as parse, patch('manager_cells.enrich_manager_details'):
+            details = source.report_details(report)
+        self.assertIsNone(details['portfolioIdentityEvidence'])
+        self.assertEqual(source.identity_diagnostic['branch'], 'MAIN_CODE_LABEL_NOT_FOUND')
+        self.assertEqual(source.identity_diagnostic['requestedCodeOccurrences'], [{'code': '159366', 'page': 2}])
+        self.assertEqual(source.identity_diagnostic['pdfSha256'], source.pdf_sha256)
+        self.assertEqual(source.identity_diagnostic['inspectedPhysicalPages'], [1, 2, 3])
+        self.assertLessEqual(source.identity_diagnostic['contextCharacters'], 300)
+        self.assertEqual(get.call_count, 1); self.assertEqual(parse.call_count, 1)
+        self.assertIs(portfolio_identity.parse_portfolio_identity, original)
+
+    def test_identity_context_budget_and_unknown_physical_pages_are_explicit(self):
+        sample = verify.SAMPLES[1]
+        document = {'sourceUrl': sample['sourceUrl'], 'periodEnd': '2026-09-30', 'fundCode': sample['codes'][0]}
+        pages = [('基金主代码 159366\n' * 200) + '不得输出末尾正文'] * 20
+        result = verify.identity_diagnostic(pages, document, None, {'branch': 'CODE_ROW_INVALID'},
+            page_numbers=[None] * 20, retrieved_at='2026-10-27T00:00:00Z', pdf_sha256='a' * 64)
+        self.assertEqual(result['contextCharacters'], sum(len(row['text']) for row in result['contexts']))
+        self.assertLessEqual(result['contextCharacters'], 300)
+        self.assertLessEqual(len(result['contexts']), 6)
+        self.assertEqual(result['inspectedPhysicalPages'], [None] * 12)
+        self.assertNotIn('不得输出末尾正文', json.dumps(result, ensure_ascii=False))
+        self.assertFalse(result['identityParsed']); self.assertFalse(result['requestedCodeMatched'])
+
     def test_both_quarters_use_production_chain_and_cached_missing_identity_is_receipt_only(self):
         for sample in verify.SAMPLES:
             with self.subTest(period=sample['targetPeriod']):
