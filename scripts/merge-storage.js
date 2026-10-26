@@ -7,6 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
+const { checkpoint: mergeCheckpoint } = require('../lib/merge-diagnostics');
 const { createPriceIndex, addPriceSources, applyPriceIndex } = require('../lib/reuse-prices');
 const CODE = /^\d{6}$/;
 const COMPANY_FILE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -113,6 +114,7 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
   const newFiles = [];
   let committed = false;
   try {
+    mergeCheckpoint('inputs', 0);
     const references = Array.isArray(previousManifest?.companyFiles)
       ? previousManifest.companyFiles.map(item => item?.path?.match(/^\.\/data\/companies\/([A-Za-z0-9_-]{1,64})\.json$/)?.[1]) : null;
     if (references?.some(value => !value)) throw failure('MERGE_READ_FAILED');
@@ -147,7 +149,9 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
     const counts = { acceptedFreshFundCount: 0, acceptedPricePatchCount: 0, acceptedInceptionPatchCount: 0,
       migratedBootstrapFundCount: 0, reusedPriceRowCount: 0, reusedPriceFundCount: 0, partialConflictRowCount: 0,
       conflictMarkedRowCount: 0, conflictMarkedFundCount: 0, conflictingPriceRowCount: 0 };
+    let completedComponents = 0;
     for (const group of groups.values()) {
+      mergeCheckpoint('components', completedComponents++);
       // Each component is bounded before any of its records are parsed.
       const records = [];
       for (const code of group.codes) {
@@ -201,7 +205,9 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
         managers: [...new Set(page.flatMap(fund => (fund.reportManagers?.length ? fund.reportManagers : fund.managers).map(manager => manager.name)))].sort() });
       page = [];
     };
+    let completedPriceFunds = 0;
     for (const entry of funds.sort((a, b) => a.companyId.localeCompare(b.companyId) || a.code.localeCompare(b.code))) {
+      mergeCheckpoint('prices', completedPriceFunds++);
       const fund = readJson(entry.file);
       const applied = applyPriceIndex(priceIndex, [fund], recoverPrice);
       for (const key of ['reusedPriceRowCount', 'reusedPriceFundCount', 'partialConflictRowCount', 'conflictMarkedRowCount', 'conflictMarkedFundCount', 'conflictingPriceRowCount']) counts[key] += applied[key];
@@ -251,6 +257,7 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
     // Rebuild receipts after global price reuse from already staged, bounded
     // pages, without keeping their holdings/manager/strategy arrays resident.
     const observations = new Map();
+    mergeCheckpoint('receipts', 0);
     for (const file of companyFiles) {
       const envelope = readJson(path.join(outputRoot, path.basename(file.path)));
       for (const fund of envelope.funds) {
@@ -270,6 +277,7 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
     // Content-addressed company filenames cannot overwrite an older manifest's
     // observations. Publish the small manifest only after all pages are ready.
     if (changed) {
+      mergeCheckpoint('commit', 0);
       fs.mkdirSync(companyRoot, { recursive: true });
       for (const file of companyFiles) {
         const name = path.basename(file.path), destination = path.join(companyRoot, name), staged = path.join(outputRoot, name);
@@ -294,6 +302,7 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
         }
       }
     }
+    mergeCheckpoint('done', funds.length);
     return { changed, manifest: changed ? manifest : previousManifest, receipt, counts, errors: [...errors] };
   } finally {
     if (!committed) for (const file of newFiles) { try { fs.unlinkSync(file); } catch { /* Preserve the original manifest on failure. */ } }

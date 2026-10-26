@@ -4,6 +4,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { diagnose: diagnoseMerge } = require('../lib/merge-diagnostics');
 const { buildSnapshot, catalogDetails, deduplicatePortfolios, publicUrl } = require('./build-data');
 const { validDate } = require('../lib/fund-analysis');
 const { verifiedReportManagers, normalizeManagers, evidenceFor, managerKey, managerCoverageFor, completeManagerCoverage } = require('../lib/report-managers');
@@ -627,7 +628,7 @@ function main(argv = process.argv.slice(2)) {
       errorCodes: result.errors })}\n`);
     return 0;
   } catch (error) {
-    process.stdout.write(`${JSON.stringify({ status: 'failed', errorCode: fixedErrors.has(error?.code) ? error.code : 'MERGE_FAILED' })}\n`);
+    process.stdout.write(`${JSON.stringify({ status: 'failed', errorCode: fixedErrors.has(error?.code) ? error.code : 'MERGE_FAILED', diagnostic: diagnoseMerge(error) })}\n`);
     return 1;
   }
 }
