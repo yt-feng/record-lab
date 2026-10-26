@@ -49,5 +49,6 @@
   "baselinePeriodEnd": "2026-06-30",
   "asOf": "2026-10-26",
   "collectorVersion": 2,
-  "requireReportQuality": true
+  "requireReportQuality": true,
+  "reportLocatorEnabled": true
 }

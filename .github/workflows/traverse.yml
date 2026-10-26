@@ -201,15 +201,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Persist observations and checkpoint
-        run: |
-          git pull --ff-only origin main
-          git config user.name 'Automation'
-          git config user.email 'automation@users.noreply.github.com'
-          git add web/data
-          if ! git diff --staged --quiet; then
-            git commit -m 'Update public observations and coverage'
-            git push origin HEAD:main
-          fi
+        run: python scripts/persist-observations.py
       - name: Prepare compressed public site
         run: python scripts/prepare-site.py
       - uses: actions/configure-pages@v5
