@@ -682,15 +682,8 @@ def fair_research_selection(states, source_codes, quality_codes, enrich_codes, c
     return selected
 
 
-def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, retained=()):
-    current = utc_now(now)
-    phase = phase_for(config)
-    if not isinstance(shards, int) or not isinstance(batch_size, int) or not 1 <= shards <= 32 or not 1 <= batch_size <= 100:
-        raise TraversalError("INVALID_ARGUMENTS")
-    companies, records, states = base_states(catalog, previous, phase, current, config)
-    hydrate_quality(states, retained, phase, current)
-    apply_retry_policy(states, config, current)
-    selected = []
+def eligible_work(states, config):
+    """Use the same nonoverlapping task lanes for planning and coverage audits."""
     enrich_codes = set(enrichment_eligible(states))
     quality_codes = set(quality_eligible(states)) if quality_enabled(config) else set()
     # A report with only missing quotes belongs to the price repair lane. Keep
@@ -700,6 +693,76 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
                       if states[code]["quality"]["missingFields"] == ["prices"]
                       and states[code]["enrichment"]["missingStocks"]}
     source_codes = eligible(states)
+    return source_codes, quality_codes, enrich_codes
+
+
+def completion_audit(states, config, now, directory_pending=False):
+    """Small public counters for review; overlapping dimensions are explicit.
+
+    No absence or exhausted attempt is converted into a completed observation.
+    Share-code coverage and executable representative-product tasks have
+    different units because source-proven share classes share a repair task.
+    """
+    rows = list(states.values())
+    applicable = [item for item in rows if item["status"] != "not-applicable"]
+    source, quality, enrichment = eligible_work(states, config)
+    prices = set(enrichment) - set(quality)
+    ready = set(source) | set(quality) | prices
+    failed = [item for item in rows if item["status"] == "failed"]
+    errors = {}
+    for item in failed:
+        code = item.get("errorCode") or "FUND_FAILED"
+        errors[code] = errors.get(code, 0) + 1
+    complete = [item for item in applicable if item["status"] in SUCCESS
+                and (not quality_enabled(config) or item["quality"]["status"] == "complete")]
+    complete_codes = {item["code"] for item in complete}
+    unresolved_tasks = [item for item in applicable if item["code"] not in complete_codes
+                        and item["attribution"] != "portfolio-evidence" and item["representativeCode"] == item["code"]]
+    scheduled = {item["code"] for item in unresolved_tasks if instant(item.get("nextRetryAt"))
+                 and instant(item["nextRetryAt"]) > now}
+    actionable = ready | scheduled
+    attention = [item for item in unresolved_tasks if item["code"] not in actionable]
+    field_states = {key: {value: sum(item["quality"]["fields"][key] == value for item in applicable)
+                          for value in sorted(QUALITY_VALUES)} for key in QUALITY_FIELDS}
+    return {"schemaVersion": 1, "asOf": now.isoformat(), "coverageUnit": "fund-share-code",
+            "taskUnit": "representative-product-code", "directoryPending": bool(directory_pending),
+            "complete": len(complete) == len(applicable) and not directory_pending,
+            "sourceCoverage": {"totalFunds": len(rows), "pendingFunds": sum(item["status"] == "pending" for item in rows),
+                "failedFunds": len(failed), "observedFunds": sum(item["status"] in SUCCESS for item in rows),
+                "notApplicableFunds": len(rows) - len(applicable),
+                "portfolioEvidenceFunds": sum(item["attribution"] == "portfolio-evidence" for item in rows)},
+            "sourceFailures": {"byErrorCode": dict(sorted(errors.items())),
+                "recoverableErrorFunds": sum(count for code, count in errors.items() if code in RECOVERABLE_ERRORS),
+                "parserOrUnsupportedErrorFunds": sum(count for code, count in errors.items() if code in PARSER_ERRORS),
+                "otherErrorFunds": sum(count for code, count in errors.items() if code not in RECOVERABLE_ERRORS | PARSER_ERRORS)},
+            "research": {"enabled": quality_enabled(config), "applicableFunds": len(applicable),
+                "completeFunds": len(complete), "incompleteFunds": len(applicable) - len(complete),
+                "fieldStates": field_states,
+                "exhaustedFunds": sum(item["status"] in SUCCESS and item["quality"]["status"] == "exhausted" for item in applicable),
+                "exhaustedByMissingField": {key: sum(item["status"] in SUCCESS and item["quality"]["status"] == "exhausted"
+                    and item["quality"]["fields"][key] not in QUALITY_ACCEPTED for item in applicable) for key in QUALITY_FIELDS}},
+            "work": {"readyTasks": len(ready), "freshSourceTasks": sum(states[code]["status"] == "pending" for code in source),
+                "sourceRetryTasks": sum(states[code]["status"] != "pending" for code in source),
+                "reportRepairTasks": len(quality), "priceRepairTasks": len(prices),
+                "scheduledTasks": len(scheduled - ready), "requiresReviewTasks": len(attention),
+                "requiresReviewSourceTasks": sum(item["status"] not in SUCCESS for item in attention),
+                "requiresReviewResearchTasks": sum(item["status"] in SUCCESS for item in attention)},
+            "countingNotes": ["Source coverage states are mutually exclusive and sum to the directory share-code count.",
+                "Field-state counts use applicable share codes; gaps across different fields overlap and must not be added.",
+                "Task queues count representative product codes; source-proven share aliases do not create duplicate repair tasks.",
+                "Requires-review tasks have neither eligible work nor a future retry; they remain incomplete."]}
+
+
+def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, retained=()):
+    current = utc_now(now)
+    phase = phase_for(config)
+    if not isinstance(shards, int) or not isinstance(batch_size, int) or not 1 <= shards <= 32 or not 1 <= batch_size <= 100:
+        raise TraversalError("INVALID_ARGUMENTS")
+    companies, records, states = base_states(catalog, previous, phase, current, config)
+    hydrate_quality(states, retained, phase, current)
+    apply_retry_policy(states, config, current)
+    selected = []
+    source_codes, quality_codes, enrich_codes = eligible_work(states, config)
     if quality_enabled(config):
         selected = fair_research_selection(states, source_codes, quality_codes, enrich_codes, shards * batch_size)
     else:
@@ -827,7 +890,13 @@ def build_status(config, snapshot=None, now=None):
                                if isinstance(entry, dict) and entry.get("code") == code
                                and entry.get("stage") in {"report", "quarterly-report", "no-equities-report", "holdings", "build"}
                                and entry.get("errorCode") in PARSER_ERRORS]
-                error = diagnostics[0] if diagnostics else error
+                # Keep an exact announcement/target absence visible instead of
+                # losing it behind the builder's generic missing-report wrapper.
+                source_diagnostics = [entry.get("errorCode") for entry in snapshot.get("errors", [])
+                                      if isinstance(entry, dict) and entry.get("code") == code
+                                      and entry.get("stage") in {"target-report", "announcements"}
+                                      and entry.get("errorCode") in RECOVERABLE_ERRORS]
+                error = diagnostics[0] if diagnostics else source_diagnostics[0] if source_diagnostics else error
             row = {"code": code, "companyCode": item.get("companyCode") or item.get("companyId"), "status": "failed",
                    "errorCode": error if error in ERROR_CODES else "FUND_FAILED" if snapshot_ok else "BATCH_FAILED"}
         row["enrichmentAttempt"] = code in enrich_codes
@@ -1192,6 +1261,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
             "retryableFailedFunds": sum(state["status"] == "failed" and state["attempts"] < 2 for state in all_states),
             "unmappedFunds": sum(state["companyCode"] is None for state in all_states),
             "completionStatus": "complete" if completed else "incomplete-running" if continuing else "incomplete-exhausted",
+            "completionAudit": completion_audit(states, config, current, directory_incomplete(companies, records)),
             "research": {"enabled": quality_enabled(config), "applicableFunds": applicable, "completeFunds": research_complete,
                          "incompleteFunds": applicable - research_complete, "pendingFunds": research_pending,
                          "exhaustedFunds": research_exhausted, "maxAttempts": QUALITY_MAX_ATTEMPTS,

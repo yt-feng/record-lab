@@ -7,6 +7,7 @@
   <meta name="description" content="按报告期查看公募基金披露的持仓变化、持仓体量、股价区间与基金经理运作说明。">
   <title>公募持仓跟踪 · Record Lab</title>
   <link rel="stylesheet" href="./styles.css">
+  <script src="./analysis.js" defer></script>
   <script src="./app.js" defer></script>
 </head>
 <body>
@@ -30,6 +31,15 @@
       <div class="stat"><span>可查看价格区间</span><strong id="stat-prices">—</strong><small id="stat-prices-note">已匹配行情的持仓条目</small></div>
     </section>
     <section class="method-note" aria-label="计算口径"><span class="note-icon" aria-hidden="true">i</span><p><strong>读数口径</strong> 季报通常披露前十大重仓股；进入 / 离开披露名单不等同于新买入 / 清仓。体量优先展示披露市值，另列「期末净资产 × 持仓占比」估算。期间最低 / 最高价仅作交易区间参考，<strong>真实持有成本未知</strong>。</p><a href="#methodology">查看完整说明 ↗</a></section>
+    <section class="catalog-panel" id="stock-analysis" aria-label="跨基金个股分析">
+      <div class="section-title"><div><p class="eyebrow">CROSS-FUND ANALYSIS</p><h2>一只股票，哪些基金在持有</h2></div></div>
+      <p id="analysis-status" role="status">等待本季度分析结果。</p>
+      <p class="filter-tip">金额仅合计已核验独立组合；身份待核验的记录单列。持股数量变化与披露名单进出分开统计，价格区间不代表买入成本。</p>
+      <div class="search-line"><label class="search-box" for="analysis-search"><input id="analysis-search" type="search" placeholder="搜索全部已分析股票名称、代码或市场" autocomplete="off"></label><button id="analysis-export" type="button" class="button button-primary" disabled>导出筛选结果</button></div>
+      <label class="analysis-sort-label">排序<select id="analysis-sort"><option value="value">披露市值合计</option><option value="estimate">规模乘比重估算合计</option><option value="holders">持有记录数</option><option value="increase">持股数增加的记录数</option><option value="decrease">持股数减少的记录数</option></select></label>
+      <p id="analysis-result-count"></p><div id="analysis-results"></div><button id="analysis-more" type="button" class="text-button" hidden>继续显示 50 只证券</button>
+      <div id="analysis-detail" aria-live="polite"></div><div id="analysis-themes"></div>
+    </section>
     <section class="catalog-panel" aria-label="全量公司目录与处理进度">
       <div class="section-title"><div><p class="eyebrow">COMPANY COVERAGE</p><h2>全部公司，一张覆盖清单</h2></div><span id="catalog-badge" class="badge">目录待生成</span></div>
       <p class="catalog-description">以公开目录逐家公司遍历。处理进度与已有报告分别显示，尚未处理的公司也保留在清单中。</p>

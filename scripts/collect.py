@@ -20,6 +20,43 @@ def safe_error(code, stage, error):
     return result
 
 
+def pdf_holdings_evidence(details, document, holdings):
+    """Keep stock-table proof tied to its PDF, separately from strategy text."""
+    meta = details.get("pdfHoldingsMetadata")
+    if not isinstance(meta, dict) or not holdings:
+        return None
+    stats = details.get("pageStats") or {}
+    count = lambda value: isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    total, processed = stats.get("totalPages"), stats.get("processedPages")
+    start, end = meta.get("startPage"), meta.get("endPage")
+    section, following = meta.get("sectionNumber"), meta.get("nextSectionNumber")
+    sections_valid = (isinstance(section, str) and isinstance(following, str)
+                      and re.fullmatch(r"\d+(?:\.\d+){1,2}", section)
+                      and re.fullmatch(r"\d+(?:\.\d+){1,2}", following)
+                      and tuple(map(int, following.split('.'))) > tuple(map(int, section.split('.'))))
+    complete = bool(meta.get("complete") is True and meta.get("sectionBounded") is True
+                    and sections_valid and meta.get("contiguousRanks") is True and meta.get("unitsVerified") is True
+                    and meta.get("coverage") in {"full", "top10"}
+                    and count(meta.get("rowsSeen")) and meta["rowsSeen"] == len(holdings)
+                    and count(meta.get("parsedRows")) and meta["parsedRows"] == len(holdings)
+                    and type(meta.get("excludedRows")) is int and meta["excludedRows"] == 0
+                    and (meta["coverage"] != "top10" or len(holdings) <= 10)
+                    and count(total) and total > 0 and count(processed) and processed == total
+                    and count(stats.get("pageCount")) and stats["pageCount"] == total
+                    and stats.get("truncated") is False and stats.get("pageNumbersVerified") is True
+                    and count(start) and count(end) and 1 <= start <= end <= total
+                    and details.get("parseMethod") in {"pypdf", "pypdf-fallback"}
+                    and re.fullmatch(r"[a-f0-9]{64}", str(details.get("sourceTextHash", ""))))
+    return {**{key: meta.get(key) for key in ("coverage", "sectionNumber", "nextSectionNumber", "sectionBounded",
+                                            "startPage", "endPage", "rowsSeen", "parsedRows", "excludedRows",
+                                            "contiguousRanks", "unitsVerified")},
+            "complete": complete, "sourceUrl": document["sourceUrl"], "periodEnd": document["periodEnd"],
+            "kind": document["kind"], "publishedAt": document["publishedAt"],
+            "sourceTextHash": details.get("sourceTextHash"), "parseMethod": details.get("parseMethod"),
+            "totalPages": total, "processedPages": processed,
+            "documentTruncated": stats.get("truncated"), "pageNumbersVerified": stats.get("pageNumbersVerified")}
+
+
 def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, target_period=None, baseline_period=None, deadline=None):
     code = item["code"]
     errors = []
@@ -141,13 +178,24 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
                 continue
             attach_details(report, details, selected)
             pdf_holdings = details.get("pdfHoldings") or []
+            stock_proof = pdf_holdings_evidence(details, selected, pdf_holdings)
+            proven_complete = bool(stock_proof and stock_proof["complete"])
             # Prefer a larger disclosed PDF table when all old securities remain
             # represented; otherwise retain the structured table and its source.
-            if pdf_holdings and (not holdings or len(pdf_holdings) > len(holdings)
-                                 and {h["stockCode"] for h in holdings}.issubset({h["stockCode"] for h in pdf_holdings})):
+            if pdf_holdings and (not holdings or {h["stockCode"] for h in holdings}.issubset({h["stockCode"] for h in pdf_holdings})
+                                 and (len(pdf_holdings) > len(holdings) or proven_complete and
+                                      (report["holdingsPossiblyTruncated"] or report["holdingsIncomplete"]
+                                       or report["coverage"] != stock_proof["coverage"]))):
                 holdings = pdf_holdings
-                report.update({"holdings": holdings, "coverage": "unknown", "holdingsSourceUrl": selected["sourceUrl"],
-                               "holdingsRetrieval": "pdf-stock-table-text", "holdingsPossiblyTruncated": True})
+                excluded = getattr(pdf_holdings, "excluded_rows", 0)
+                excluded = 0 if proven_complete else max(excluded, report["holdingsExcludedRowCount"])
+                report.update({"holdings": holdings, "coverage": stock_proof["coverage"] if proven_complete else "unknown",
+                               "holdingsSourceUrl": selected["sourceUrl"], "holdingsRetrieval": "pdf-stock-table-text",
+                               "holdingsPossiblyTruncated": not proven_complete,
+                               "holdingsIncomplete": excluded > 0, "holdingsExcludedRowCount": excluded,
+                               "holdingsIncompleteReason": "UNSUPPORTED_OR_INVALID_SECURITY_ROWS" if excluded else None})
+                if stock_proof:
+                    report["holdingsPdfEvidence"] = stock_proof
         except Exception as error:
             errors.append(safe_error(code, "report", error))
         evidence = details.get("noEquitiesEvidence")

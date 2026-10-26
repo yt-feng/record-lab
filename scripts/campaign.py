@@ -31,7 +31,7 @@ def quarter_config(base, quarter, as_of):
         raise ValueError('INVALID_AS_OF')
     return {**base, 'funds': [], 'quarter': quarter, 'asOf': as_of,
             'targetPeriodEnd': target, 'baselinePeriodEnd': baseline,
-            'collectorVersion': 3, 'requireReportQuality': True,
+            'collectorVersion': 4, 'requireReportQuality': True,
             'retryPolicy': {'dailyUntil': '2026-11-30' if quarter == '2026Q3' else None,
                             'intervalDays': 7, 'maxScheduledCycles': 4},
             'scope': f'{quarter} 全目录产品与报告逐项补齐'}
@@ -143,6 +143,17 @@ def publish(data='web/data', parts='.cache/parts'):
                         '--catalog', str(root / 'catalog.json'), '--progress', str(output / 'progress.json'),
                         '--config', config, '--data-root', str(output)], check=True)
         progress = read_json(output / 'progress.json')
+        atomic_json(output / 'audit.json', {
+            'schemaVersion': 1, 'quarter': quarter, 'phase': progress.get('phase'),
+            'updatedAt': progress.get('updatedAt'), 'completionStatus': progress.get('completionStatus'),
+            'totalFunds': progress.get('totalFunds'), 'processedFunds': progress.get('processedFunds'),
+            'failedFunds': progress.get('failedFunds'), 'pendingFunds': progress.get('pendingFunds'),
+            'notApplicableFunds': progress.get('notApplicableFunds'), 'research': progress.get('research'),
+            'continueRun': progress.get('continueRun'), 'nextRetryAt': progress.get('nextRetryAt'),
+            'completionAudit': progress.get('completionAudit'),
+        })
+        subprocess.run(['node', 'scripts/analyze-data.js', '--data', str(output),
+                        '--output', str(output / 'analysis.json')], check=True)
         summaries.append({'quarter': quarter, **{k: progress.get(k) for k in (
             'totalFunds', 'processedFunds', 'failedFunds', 'pendingFunds', 'research', 'completionStatus', 'continueRun')}})
     periods = []

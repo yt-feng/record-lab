@@ -101,6 +101,8 @@ class CampaignTests(unittest.TestCase):
             def portable_run(command, **kwargs):
                 command = [sys.executable, *command[1:]] if command[0] == 'python' else command
                 kwargs.setdefault('capture_output', True)
+                if command[:2] == ['node', 'scripts/analyze-data.js']:
+                    kwargs['env'] = {**os.environ, 'GITHUB_ACTIONS': 'true'}
                 return real_run(command, **kwargs)
             child_runtime = patch('campaign.subprocess.run', side_effect=portable_run)
             try:
@@ -114,7 +116,7 @@ class CampaignTests(unittest.TestCase):
                     batch = read_json('.cache/plan/' + item['config'])
                     self.assertEqual(batch['traversal']['batchId'], item['id'])
                     self.assertTrue(batch['requireReportQuality'])
-                    self.assertEqual(batch['collectorVersion'], 3)
+                    self.assertEqual(batch['collectorVersion'], 4)
                 # One new product is explicitly post-Q3; all other batch work
                 # is absent, as if a runner stopped before writing its artifact.
                 import datetime as dt
@@ -139,6 +141,9 @@ class CampaignTests(unittest.TestCase):
                 self.assertEqual(q3['notApplicableFunds'], 1)
                 self.assertEqual(q3['processedFunds'], 0)
                 self.assertTrue(result['continueRun'])
+                self.assertEqual(read_json('web/data/periods/2026Q2/analysis.json')['kind'], 'quarter-analysis')
+                self.assertEqual(read_json('web/data/periods/2026Q3/audit.json')['phase']['targetPeriodEnd'], '2026-09-30')
+                self.assertIn('completionAudit', read_json('web/data/periods/2026Q2/audit.json'))
                 self.assertEqual(read_json('web/data/periods.json')['defaultPeriod'], '2026Q3')
                 self.assertEqual(read_json('web/data/latest.json')['targetPeriodEnd'], '2026-06-30')
             finally:
@@ -153,7 +158,7 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual((q3['targetPeriodEnd'], q3['baselinePeriodEnd']), ('2026-09-30', '2026-06-30'))
         self.assertEqual(q3['asOf'], '2026-10-26')
         self.assertTrue(q2['requireReportQuality'])
-        self.assertEqual(q2['collectorVersion'], 3)
+        self.assertEqual(q2['collectorVersion'], 4)
         self.assertIsNone(q2['retryPolicy']['dailyUntil'])
         self.assertEqual(q3['retryPolicy']['dailyUntil'], '2026-11-30')
         self.assertEqual(q3['retryPolicy']['maxScheduledCycles'], 4)
@@ -194,6 +199,37 @@ class CampaignTests(unittest.TestCase):
             body = json.loads((output / 'data/periods/2026Q3/latest.json').read_text())
             self.assertEqual(body['companyFiles'][0]['path'], './data/companies/co1.json.gz')
             with self.assertRaises(ValueError): site.prepare(root, output)
+
+    def test_analysis_parts_are_compressed_and_references_remain_in_their_quarter(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / 'web'; period = root / 'data/periods/2026Q2'
+            (period / 'analysis').mkdir(parents=True)
+            paths = ['./analysis/details-0000.json', './analysis/details-portfolios-0000.json']
+            for value in paths: (period / value[2:]).write_text('{"public":"observed"}')
+            manifest = {'stocks': [{'details': [paths[0]]}], 'portfolioFiles': [{'path': paths[1]}]}
+            (period / 'analysis.json').write_text(json.dumps(manifest))
+            output = Path(temp) / 'site'; site.prepare(root, output)
+            result = json.loads((output / 'data/periods/2026Q2/analysis.json').read_text())
+            self.assertEqual(result['stocks'][0]['details'], [paths[0] + '.gz'])
+            self.assertEqual(result['portfolioFiles'][0]['path'], paths[1] + '.gz')
+            self.assertEqual(gzip.decompress((output / 'data/periods/2026Q2/analysis/details-0000.json.gz').read_bytes()), b'{"public":"observed"}')
+            manifest['stocks'][0]['details'] = ['./analysis/../../private.json']
+            (period / 'analysis.json').write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, 'INVALID_ANALYSIS_PATH'): site.prepare(root, Path(temp) / 'rejected')
+
+    def test_site_rebuilds_missing_analysis_only_in_actions_and_keeps_current_analysis(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / 'web'; period = root / 'data/periods/2026Q3'; period.mkdir(parents=True)
+            (root / 'data/periods.json').write_text(json.dumps({'periods': [{'id': '2026Q3'}]}))
+            latest = {'retrievedAt': '2026-10-26T00:00:00Z', 'targetPeriodEnd': '2026-09-30', 'baselinePeriodEnd': '2026-06-30'}
+            (period / 'latest.json').write_text(json.dumps(latest))
+            with patch.dict(os.environ, {'GITHUB_ACTIONS': 'false'}):
+                with self.assertRaisesRegex(ValueError, 'ANALYSIS_REQUIRES_ACTIONS'): site.ensure_analyses(root)
+            with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), patch.object(site.subprocess, 'run') as run:
+                self.assertEqual(site.ensure_analyses(root), 1)
+                self.assertEqual(run.call_args.args[0][-1], str(period / 'analysis.json'))
+                (period / 'analysis.json').write_text(json.dumps({**latest, 'kind': 'quarter-analysis'}))
+                run.reset_mock(); self.assertEqual(site.ensure_analyses(root), 0); run.assert_not_called()
 
     def test_staging_rejects_missing_part_and_excessive_bytes(self):
         with tempfile.TemporaryDirectory() as temp:

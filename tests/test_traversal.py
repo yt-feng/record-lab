@@ -409,6 +409,19 @@ class TraversalTests(unittest.TestCase):
         self.assertEqual(plan["meta"]["qualityCount"], 1)
         self.assertEqual(plan["meta"]["enrichmentCount"], 1)
         self.assertEqual(len(items), 3)
+        progress = traversal.merge_progress(catalog(), previous, config, now=NOW, retained=[price_only, report_gap])
+        audit = progress["completionAudit"]
+        self.assertEqual(audit["work"]["readyTasks"], 3)
+        self.assertEqual(audit["work"]["freshSourceTasks"], 1)
+        self.assertEqual(audit["work"]["reportRepairTasks"], 1)
+        self.assertEqual(audit["work"]["priceRepairTasks"], 1)
+        self.assertEqual(audit["sourceCoverage"]["observedFunds"], 2)
+        self.assertEqual(audit["sourceCoverage"]["pendingFunds"], 1)
+        self.assertEqual(audit["research"]["fieldStates"]["pdf"]["complete"], 1)
+        self.assertEqual(audit["research"]["fieldStates"]["pdf"]["partial"], 1)
+        self.assertEqual(audit["research"]["fieldStates"]["prices"]["missing"], 3)
+        self.assertFalse(audit["complete"])
+        self.assertLess(len(json.dumps(audit).encode()), 100_000)
 
     def test_round_robin_starts_with_less_visited_institution(self):
         states = {"000001": {"companyCode": "co1", "totalAttempts": 2, "lastAttemptAt": NOW,
@@ -645,6 +658,46 @@ class TraversalTests(unittest.TestCase):
                     "errors": [{"code": "000001", "stage": "report", "errorCode": "PDF_PARSE_FAILED"}]}
         status = traversal.build_status(batch, snapshot, "2026-10-26T07:00:00Z")
         self.assertEqual(status["funds"][0]["errorCode"], "PDF_PARSE_FAILED")
+
+    def test_status_keeps_exact_target_absence_for_completion_audits(self):
+        _, _, config = self.retry_fixture()
+        batch = {**config, "funds": [{"code": "000001", "companyCode": "co1"}]}
+        snapshot = {"schemaVersion": 1, "sourceMode": "actions", "funds": [],
+                    "batchResults": [{"code": "000001", "status": "failed", "errorCode": "NO_VALID_REPORTS"}],
+                    "errors": [{"code": "000001", "stage": "metadata", "errorCode": "TIMEOUT"},
+                               {"code": "000001", "stage": "target-report", "errorCode": "TARGET_REPORT_UNAVAILABLE"}]}
+        status = traversal.build_status(batch, snapshot, "2026-10-26T07:00:00Z")
+        self.assertEqual(status["funds"][0]["errorCode"], "TARGET_REPORT_UNAVAILABLE")
+        snapshot["errors"].append({"code": "000001", "stage": "report", "errorCode": "PDF_PARSE_FAILED"})
+        self.assertEqual(traversal.build_status(batch, snapshot, "2026-10-26T07:00:00Z")["funds"][0]["errorCode"], "PDF_PARSE_FAILED")
+
+    def test_completion_audit_separates_waiting_from_unresolved_without_retry(self):
+        directory, previous, config = self.retry_fixture("TARGET_REPORT_UNAVAILABLE")
+        waiting = traversal.merge_progress(directory, previous, config, now="2026-10-26T07:00:00Z")["completionAudit"]
+        self.assertEqual(waiting["sourceFailures"]["byErrorCode"], {"TARGET_REPORT_UNAVAILABLE": 1})
+        self.assertEqual(waiting["work"]["scheduledTasks"], 1)
+        self.assertEqual(waiting["work"]["requiresReviewTasks"], 0)
+        self.assertEqual(waiting["work"]["readyTasks"], 0)
+        self.assertFalse(waiting["complete"])
+        previous["funds"][0]["errorCode"] = "UNSUPPORTED_MARKET"
+        blocked = traversal.merge_progress(directory, previous, config, now="2026-10-26T07:00:00Z")["completionAudit"]
+        self.assertEqual(blocked["sourceFailures"]["parserOrUnsupportedErrorFunds"], 1)
+        self.assertEqual(blocked["work"]["scheduledTasks"], 0)
+        self.assertEqual(blocked["work"]["requiresReviewSourceTasks"], 1)
+        self.assertFalse(blocked["complete"])
+        fund = previous["funds"][0]
+        fund.update({"status": "complete", "errorCode": None,
+                     "quality": {"attempts": 3, "lastAttemptAt": fund["lastAttemptAt"],
+                         "fields": {key: "missing" if key in {"nav", "strategy"} else "complete" for key in traversal.QUALITY_FIELDS}},
+                     "enrichment": self.coverage(2)})
+        incomplete = traversal.merge_progress(directory, previous, config, now="2026-10-26T07:00:00Z")["completionAudit"]
+        self.assertEqual(incomplete["sourceCoverage"]["observedFunds"], 1)
+        self.assertEqual(incomplete["research"]["exhaustedFunds"], 1)
+        self.assertEqual(incomplete["research"]["exhaustedByMissingField"]["nav"], 1)
+        self.assertEqual(incomplete["research"]["exhaustedByMissingField"]["strategy"], 1)
+        self.assertEqual(incomplete["work"]["requiresReviewResearchTasks"], 1)
+        self.assertEqual(incomplete["research"]["incompleteFunds"], 1)
+        self.assertFalse(incomplete["complete"])
 
     def test_bond_type_does_not_establish_no_equities(self):
         record = event(code="000003", status="no-equities", company="co2")

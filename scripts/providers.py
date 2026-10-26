@@ -190,9 +190,10 @@ def js_literal(text, key):
 
 class HoldingRows(list):
     """List-compatible rows with parser coverage that the collector publishes."""
-    def __init__(self, rows, excluded_rows=0):
+    def __init__(self, rows, excluded_rows=0, metadata=None):
         super().__init__(rows)
         self.excluded_rows = excluded_rows
+        self.metadata = metadata or {}
 
 
 def parse_holdings_html(text):
@@ -339,6 +340,8 @@ def parse_pdf_pages(pages, source_url, period_end, kind):
     nav = None
     narrative = None
     main_code, class_codes, multi_class = pdf_portfolio_identity(pages)
+    nav_heading = r"\s*".join("期末基金资产净值")
+    unit_nav_heading = r"\s*".join("期末基金份额净值")
     if kind in ("semiannual", "annual"):
         all_text = re.sub(r"[ \t]+", "", "\n".join(pages))
         # The first column of the balance sheet is this report's period end.
@@ -362,15 +365,15 @@ def parse_pdf_pages(pages, source_url, period_end, kind):
         # Multiple share-class columns must be summed, while a historical comparison
         # column must not be. Only accept a single quarterly NAV cell here.
         if nav is None and kind == "quarterly" and not multi_class:
-            m = re.search(r"期末基金资产净值\s*(?:[（(]\s*(?:人民币)?元\s*[）)]\s*)?([\d,]+\.\d{2})([^\n]*)", compact)
+            m = re.search(nav_heading + r"\s*(?:[（(]\s*(?:人民币)?元\s*[）)]\s*)?([\d,]+\.\d{2})([^\n]*)", compact)
             if m and not re.search(r"\d[\d,]*\.\d{2}", m[2]):
                 nav = number(m[1])
         elif nav is None and kind == "quarterly" and len(set(class_codes)) >= 2:
             # Quarterly metric columns are share classes, not different dates.
             # Sum only when the report itself identifies exactly those columns.
-            metric = re.search(r"期末基金资产净值([^\n]*(?:\n(?!\s*(?:\d+[.、]|期末基金份额净值))[^\n]*){0,5})", compact)
+            metric = re.search(nav_heading + r"([^\n]*(?:\n(?!\s*(?:\d+[.、]|" + unit_nav_heading + r"))[^\n]*){0,5})", compact)
             if metric:
-                values = re.findall(r"(?<![\d.])[\d,]+\.\d{2}(?!\d)", metric[1].split("期末基金份额净值")[0])
+                values = re.findall(r"(?<![\d.])[\d,]+\.\d{2}(?!\d)", re.split(unit_nav_heading, metric[1], maxsplit=1)[0])
                 if len(values) == len(set(class_codes)):
                     parsed = [number(value) for value in values]
                     if all(value is not None and value >= 0 for value in parsed):
@@ -408,7 +411,9 @@ def parse_pdf_pages(pages, source_url, period_end, kind):
                 selection = "section-opening"
             else:
                 excerpt, excerpt_page, selection = "", page_num, "section-opening"
-            if len(excerpt) >= 40:
+            # A concise, explicitly selected operation sentence remains useful
+            # evidence. Keep the longer threshold for an unfiltered opening.
+            if len(excerpt) >= (20 if selection == "operation-sentences" else 40):
                 narrative = {"text": excerpt, "sourceUrl": source_url, "page": excerpt_page,
                              "periodStart": start, "periodEnd": period_end, "excerptSelection": selection}
                 break
@@ -459,23 +464,48 @@ def parse_pdf_holdings(pages):
     Text-layer extraction can leave table rows broken. Unrecognized rows remain
     missing and the recovered subset is never declared the complete portfolio.
     """
-    text = "\n".join(pages)
-    # Locate on whitespace-normalized text, keeping line breaks for row checks.
-    normalized = re.sub(r"[ \t]+", " ", text)
+    # Preserve physical page offsets and line breaks for bounded row checks.
+    normalized_pages = [re.sub(r"[ \t]+", " ", page) for page in pages]
+    normalized = "\n".join(normalized_pages)
+    offsets, position = [], 0
+    for page in normalized_pages:
+        offsets.append(position)
+        position += len(page) + 1
+    def page_at(offset):
+        return sum(start <= offset for start in offsets)
     section = None
-    for heading in re.finditer(r"按公允价值占基金资产净值比例大小\s*(?:排序|排名)的\s*(?:所有|前十名|前十|前五名)?\s*股票投资明细", normalized):
+    metadata = {}
+    for heading in re.finditer(r"按公允价值占基金资产净值比例大小\s*(?:排序|排名)的\s*(所有|前十名|前十|前五名)?\s*股票投资明细", normalized):
         candidate = normalized[heading.end():]
-        candidate = re.split(r"\n\s*(?:\d+\.){1,2}\d*\s*(?:报告期|期末|期货|投资组合|重大|基金|债券)", candidate, maxsplit=1)[0]
+        prefix = re.search(r"(\d+(?:\.\d+){1,2})\s*(?:报告期末|期末)?\s*$", normalized[max(0, heading.start() - 100):heading.start()])
+        section_number = tuple(map(int, prefix[1].split('.'))) if prefix else None
+        end = None
+        for boundary in re.finditer(r"\n\s*(\d+(?:\.\d+){1,2})\s*(?:报告期|期末|期货|投资组合|重大|基金|债券)", candidate):
+            if section_number is None or tuple(map(int, boundary[1].split('.'))) > section_number:
+                end = boundary
+                break
+        if end:
+            candidate = candidate[:end.start()]
         if all(word in candidate[:1200] for word in ("股票代码", "股票名称", "数量", "公允价值")):
             section = candidate
+            metadata = {"coverage": "full" if heading[1] == "所有" else "top10" if heading[1] in ("前十名", "前十") else "unknown",
+                        "sectionNumber": prefix[1] if prefix else None,
+                        "nextSectionNumber": end[1] if end else None,
+                        "sectionBounded": bool(prefix and end),
+                        "startPage": page_at(heading.start()),
+                        "endPage": page_at(heading.end() + end.start(1)) if end else None}
             break
     if section is None:
-        return []
+        return HoldingRows([])
     if re.search(r"数量\s*[（(]\s*万股|公允价值\s*[（(]\s*万元", section[:1200]):
-        return []
+        return HoldingRows([])
+    header = re.sub(r"\s+", "", section[:1200])
+    units_verified = bool(re.search(r"数量[（(]股[）)]", header)
+                          and re.search(r"公允价值[（(](?:人民币)?元[）)]", header))
     amount = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
     pattern = re.compile(r"^\s*(\d{1,4})\s+(\d{5,6})\s+([^\n]+?)\s+(" + amount + r")\s+(" + amount + r")\s+(\d+(?:\.\d+)?)\s*%?\s*$", re.M)
-    rows, seen = [], set()
+    rows, ranks, seen = [], [], set()
+    candidate_ranks = [int(match[1]) for match in re.finditer(r"(?m)^[ \t]*(\d{1,4})(?=[ \t]+[^ \t\r\n]|\r?$)", section)]
     for match in pattern.finditer(section):
         rank, code, name, shares, value, weight = match.groups()
         shares, value, weight = map(number, (shares, value, weight))
@@ -484,11 +514,21 @@ def parse_pdf_holdings(pages):
         if not re.search(r"[\u4e00-\u9fffA-Za-z]", name) or len(name) > 80:
             continue
         seen.add(code)
+        ranks.append(int(rank))
         market = "HK" if len(code) == 5 else "CN"
         rows.append({"stockCode": code, "stockName": name.strip(), "market": market,
                      "currency": "HKD" if market == "HK" else "CNY", "shares": shares,
                      "marketValueYuan": value, "weightPct": weight})
-    return rows if sum(row["weightPct"] for row in rows) <= 100.1 else []
+    if sum(row["weightPct"] for row in rows) > 100.1:
+        return HoldingRows([])
+    excluded = max(0, len(candidate_ranks) - len(rows))
+    contiguous = bool(rows and ranks == list(range(1, len(rows) + 1)) and candidate_ranks == ranks)
+    metadata.update({"rowsSeen": len(candidate_ranks), "parsedRows": len(rows), "excludedRows": excluded,
+                     "contiguousRanks": contiguous, "unitsVerified": units_verified,
+                     "complete": bool(metadata["sectionBounded"] and units_verified and contiguous and excluded == 0
+                                      and metadata["coverage"] in {"full", "top10"}
+                                      and (metadata["coverage"] != "top10" or len(rows) <= 10))})
+    return HoldingRows(rows, excluded, metadata)
 
 
 class PublicProvider:
@@ -589,12 +629,15 @@ class PublicProvider:
         data = self.get(report["sourceUrl"], binary=True)
         if not data.startswith(b"%PDF"):
             raise DataError("INVALID_PDF")
+        def enrich(pages):
+            holdings = parse_pdf_holdings(pages)
+            return {"noEquitiesEvidence": parse_no_equities(pages, report), "pdfHoldings": holdings,
+                    "pdfHoldingsMetadata": holdings.metadata}
         try:
             result = extract_report(data, report["sourceUrl"], report["periodEnd"], report["kind"],
                                     parse_pages=parse_pdf_pages, filename=report.get("title", "report.pdf"),
                                     max_pages=max_pages,
-                                    enrich_pages=lambda pages: {"noEquitiesEvidence": parse_no_equities(pages, report),
-                                                                "pdfHoldings": parse_pdf_holdings(pages)})
+                                    enrich_pages=enrich)
         except Exception as error:
             code = getattr(error, "code", "PDF_PARSE_FAILED")
             raise DataError(code if re.fullmatch(r"[A-Z0-9_]+", str(code)) else "PDF_PARSE_FAILED") from None

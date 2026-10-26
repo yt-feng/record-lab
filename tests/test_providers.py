@@ -100,6 +100,25 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(result["narrative"]["periodStart"], "2026-04-01")
         self.assertNotIn("业绩说明", result["narrative"]["text"])
 
+    def test_wrapped_nav_labels_keep_exact_share_columns_and_stop_at_unit_nav(self):
+        identity = "基金主代码 000001\n下属分级基金的交易代码 000001 000002 000003\n"
+        metric = "4.期末基金资产净\n值 10,000,000.00 200,000.00 300.00\n5.期末基金份额净\n值 1.1234 1.2345 1.3456"
+        result = parse_pdf_pages([identity + metric], "https://example.org/report.pdf", "2026-06-30", "quarterly")
+        self.assertEqual(result["navYuan"], 10200300)
+        self.assertIsNone(parse_pdf_pages([identity + metric.replace(" 300.00", "")],
+            "https://example.org/report.pdf", "2026-06-30", "quarterly")["navYuan"])
+        single = "基金主代码 000001\n4.期末基金资产净\n值 10,000,000.00\n5.期末基金份额净\n值 1.1234"
+        self.assertEqual(parse_pdf_pages([single], "https://example.org/report.pdf", "2026-06-30", "quarterly")["navYuan"], 10000000)
+
+    def test_short_operation_sentence_is_not_discarded_as_missing_strategy(self):
+        sentence = "本基金本季度适度提高长债配置比例，并保留足够流动性。"
+        pages = ["4.4 报告期内基金的投资策略和运作分析\n" + sentence + "\n4.5 报告期内基金的业绩表现\n不应进入摘录"]
+        narrative = parse_pdf_pages(pages, "https://example.org/report.pdf", "2026-06-30", "quarterly")["narrative"]
+        self.assertEqual(narrative["text"], sentence)
+        self.assertEqual((narrative["page"], narrative["periodStart"]), (1, "2026-04-01"))
+        self.assertIsNone(parse_pdf_pages(["4.4 报告期内基金的投资策略和运作分析\n无。\n4.5 报告期内基金的业绩表现"],
+            "https://example.org/report.pdf", "2026-06-30", "quarterly")["narrative"])
+
     def test_operation_excerpt_skips_macro_and_cites_actual_page(self):
         pages = ["4.4 报告期内基金投资策略和运作分析\n全球经济与证券市场受到各类事件影响。" + "指数变动与宏观背景说明。" * 30,
                  "本基金本季度增加了部分行业的配置，并依据企业经营与估值对组合进行了调整，降低了另一些行业的持仓比例。\n4.5 报告期内基金的业绩表现\n业绩说明"]
@@ -372,6 +391,63 @@ class ReportRecoveryTests(unittest.TestCase):
         self.assertEqual(rows[0]["marketValueYuan"], 20000)
         self.assertEqual(rows[1]["currency"], "HKD")
         self.assertEqual(parse_pdf_holdings([text.replace("股票投资明细", "债券投资明细")]), [])
+
+    def test_pdf_table_completeness_requires_terminal_heading_units_and_all_ranks(self):
+        from providers import parse_pdf_holdings
+        heading = "7.3 期末按公允价值占基金资产净值比例大小排序的所有股票投资明细\n序号 股票代码 股票名称 数量（股） 公允价值（元） 占基金资产净值比例（%）\n"
+        body = "1 600001 合成甲 10 100.00 1.00\n2 600002 合成乙 20 200.00 2.00\n"
+        ending = "7.4 报告期内股票投资组合的重大变动\n1 600003 另一张表 30 300.00 3.00"
+        rows = parse_pdf_holdings([heading + body, ending])
+        self.assertTrue(rows.metadata["complete"])
+        self.assertEqual((rows.metadata["coverage"], rows.metadata["rowsSeen"], rows.metadata["parsedRows"]), ("full", 2, 2))
+        self.assertEqual((rows.metadata["startPage"], rows.metadata["endPage"]), (1, 2))
+        for text in [heading + body, heading + body.replace("2 600002", "3 600002") + ending,
+                     heading + body + "3 AAPL 海外证券 10 200.00 2.00\n" + ending,
+                     heading + body + "3\nAAPL 海外证券 10 200.00 2.00\n" + ending,
+                     heading.replace("数量（股）", "数量") + body + ending]:
+            self.assertFalse(parse_pdf_holdings([text]).metadata["complete"])
+        overseas = parse_pdf_holdings([heading + body + "3 AAPL 海外证券 10 200.00 2.00\n" + ending])
+        self.assertEqual(overseas.excluded_rows, 1)
+        self.assertEqual(overseas.metadata["rowsSeen"], 3)
+        eleven = ''.join(f"{i} {600000+i} 合成证券 10 100.00 0.01\n" for i in range(1, 12))
+        self.assertFalse(parse_pdf_holdings([heading.replace("所有", "前十名") + eleven + ending]).metadata["complete"])
+
+    def test_proven_pdf_can_replace_api_limit_without_losing_its_own_document_evidence(self):
+        from providers import HoldingRows, parse_pdf_holdings
+        from collect import pdf_holdings_evidence
+        page = ("7.3 期末按公允价值占基金资产净值比例大小排序的所有股票投资明细\n"
+                "序号 股票代码 股票名称 数量（股） 公允价值（元） 占基金资产净值比例（%）\n"
+                + ''.join(f"{i} {600000+i} 合成证券 10 100.00 0.01\n" for i in range(1, 101))
+                + "7.4 报告期内股票投资组合的重大变动")
+        pdf_rows = parse_pdf_holdings([page])
+        self.assertTrue(pdf_rows.metadata["complete"])
+        details = {"pdfHoldings": pdf_rows, "pdfHoldingsMetadata": pdf_rows.metadata,
+                   "parseMethod": "pypdf", "sourceTextHash": "a" * 64, "navYuan": 100000,
+                   "pageStats": {"pageCount": 1, "totalPages": 1, "processedPages": 1,
+                                 "truncated": False, "pageNumbersVerified": True}}
+        class Source:
+            def overview(self, code): return {"name": "合成基金", "company": "合成公司", "managers": []}
+            def announcements(self, code, as_of):
+                return [{"title": "合成中报", "periodEnd": "2026-06-30", "kind": "semiannual", "publishedAt": "2026-08-31", "sourceUrl": "https://example.org/interim.pdf"},
+                        {"title": "合成季报", "periodEnd": "2026-06-30", "kind": "quarterly", "publishedAt": "2026-07-20", "sourceUrl": "https://example.org/quarter.pdf"}]
+            def holdings(self, code, year): return {"2026-06-30": HoldingRows(pdf_rows)}
+            def report_details(self, document):
+                if document["kind"] == "semiannual": return details
+                return {"parseMethod": "pypdf", "sourceTextHash": "b" * 64,
+                        "pageStats": {"pageCount": 8, "totalPages": 8, "processedPages": 8, "truncated": False},
+                        "narrative": {"text": "本基金本季度调整组合，适度提高部分行业配置。", "sourceUrl": document["sourceUrl"],
+                                      "page": 4, "periodStart": "2026-04-01", "periodEnd": "2026-06-30"}}
+        item, _ = collect_fund({"code": "000001"}, "2026-10-26", provider=Source(), target_period="2026-06-30")
+        report = item["reports"][0]
+        self.assertEqual((report["coverage"], report["holdingsPossiblyTruncated"], len(report["holdings"])), ("full", False, 100))
+        self.assertEqual(report["holdingsPdfEvidence"]["sourceUrl"], "https://example.org/interim.pdf")
+        self.assertEqual(report["holdingsPdfEvidence"]["sourceTextHash"], "a" * 64)
+        self.assertEqual(report["reportPdfSourceUrl"], "https://example.org/quarter.pdf")
+        self.assertEqual(report["sourceTextHash"], "b" * 64)
+        document = Source().announcements("000001", "2026-10-26")[0]
+        for stats in [{**details["pageStats"], "truncated": True}, {**details["pageStats"], "totalPages": 2},
+                      {**details["pageStats"], "pageNumbersVerified": False}, {**details["pageStats"], "processedPages": True}]:
+            self.assertFalse(pdf_holdings_evidence({**details, "pageStats": stats}, document, pdf_rows)["complete"])
 
     def test_pdf_recovery_preserves_no_equity_strategy_and_report_only_evidence(self):
         report = {"title": "合成基金2026年第3季度报告", "periodEnd": "2026-09-30", "kind": "quarterly", "publishedAt": "2026-10-20", "sourceUrl": "https://example.org/report.pdf"}

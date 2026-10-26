@@ -125,7 +125,8 @@ function cleanReport(raw, code, asOf, addError) {
     addError('REPORT_IDENTITY_MISMATCH', code); return null;
   }
   if (!publicUrl(raw.sourceUrl) || ['officialSourceUrl', 'navSourceUrl', 'holdingsSourceUrl', 'reportPdfSourceUrl']
-    .some(key => raw[key] !== undefined && raw[key] !== null && !publicUrl(raw[key]))) {
+    .some(key => raw[key] !== undefined && raw[key] !== null && !publicUrl(raw[key]))
+    || (raw.holdingsPdfEvidence != null && !publicUrl(raw.holdingsPdfEvidence.sourceUrl))) {
     addError('INVALID_REPORT_SOURCE', code); return null;
   }
   const report = normalizeReport(raw);

@@ -481,6 +481,7 @@
       $('quarter-description').textContent = period ? `报告期 ${period.targetPeriodEnd}，对比 ${period.baselinePeriodEnd}。各季度独立保留，持仓覆盖与研究完整度分别统计。` : '这个季度尚无已发布数据；请选择可用季度。';
     }
     function clearQuarterData() {
+      win.RecordAnalysis?.reset();
       state.request++; state.companyRequest++; state.directoryRequest++;
       state.data = null; state.manifest = null; state.catalog = null; state.progress = null;
       state.companyCode = ''; state.pageIndex = 0; state.loadingCompany = false;
@@ -937,6 +938,7 @@
       if (!state.period) return initializePeriods();
       const request = ++state.request;
       const period = state.period;
+      win.RecordAnalysis?.loadQuarter(period);
       loadDirectory();
       const controller = new win.AbortController();
       const timer = win.setTimeout(() => controller.abort(), 20000);
@@ -994,6 +996,7 @@
         if (state.data?.funds.length && !data.funds.length) throw new Error('EMPTY_REPLACEMENT');
         state.companyRequest++; state.directoryRequest++; state.catalog = null; state.progress = null; state.directoryFailures = [];
         state.manifest = null; state.loadingCompany = false; state.data = data; state.mode = 'imported'; state.failed = false; updateDataset(); updatePagination(); renderDirectory();
+        win.RecordAnalysis?.reset('当前为本地导入记录，未附带跨基金汇总分析。');
         $('quarter-title').textContent = '本地导入'; $('quarter-description').textContent = `导入报告期 ${data.targetPeriodEnd || data.coverage.targetPeriodEnd || '见各基金记录'}，观察截至 ${data.asOf}。`;
         updateObservation('正在查看本地导入结果；文件不会上传，原始报告期与采集日期保持不变。');
       } catch (_) {
