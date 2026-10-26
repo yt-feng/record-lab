@@ -6,7 +6,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
-from price_coverage import CALENDAR, expected_sessions, price_series, merge_price_series, valid_complete_price
+from price_coverage import CALENDAR, expected_sessions, price_series, merge_price_series, valid_complete_price, valid_usable_complete_price
+from price_consistency import conflict_for
 from providers import PublicProvider, checked_price_rows
 from traversal import price_coverage, normalize_enrichment, normalize_quality, valid_price_coverage, report_quality, enrichment_eligible
 import test_traversal
@@ -25,6 +26,49 @@ def make_series(rows, name='first'):
 
 
 class PriceCompletenessTests(unittest.TestCase):
+    def test_conflict_proof_keeps_raw_calendar_fact_but_uses_an_independent_queue(self):
+        from traversal import apply_coverage, quality_eligible, eligible_work, manager_only_repair, merge_quality_observation, QUALITY_FIELDS
+        clock = dt.datetime(2026, 10, 26, tzinfo=dt.timezone.utc)
+        fund = test_traversal.TraversalTests().retained_fund()
+        a = complete_price(); b = {**a, 'low': .9}
+        identity = {key: a[key] for key in ('market', 'stockCode', 'currency', 'rangeStart', 'rangeEnd', 'calendarId')}
+        marker = conflict_for([{'price': price, 'sourceUrl': f'https://example.org/{index}',
+                               'sourceUrls': [f'https://example.org/{index}'], 'fetchedAt': '2026-09-29T10:00:00Z'}
+                              for index, price in enumerate((a, b))], identity, clock)
+        self.assertIsNotNone(marker)
+        a['globalPriceConflict'] = marker; fund['rows'][0]['priceRange'] = a
+        self.assertTrue(valid_complete_price(a, 'CN', '600001', START, END))
+        self.assertFalse(valid_usable_complete_price(a, 'CN', '600001', START, END))
+        coverage = price_coverage(fund, clock)
+        self.assertEqual((coverage['priceComplete'], coverage['priceConflicted'], coverage['missingStocks']), (0, 1, []))
+        self.assertTrue(valid_price_coverage(coverage))
+        raw = report_quality(fund, PHASE, clock)
+        self.assertEqual(raw['fields']['prices'], 'partial'); self.assertTrue(raw['priceConflictOnly'])
+        raw['fields'] = {key: 'complete' for key in QUALITY_FIELDS}; raw['fields']['prices'] = 'partial'
+        quality = normalize_quality({**raw, 'attempts': 2, 'totalAttempts': 9, 'managerAttempts': 1, 'strategyAttempts': 1}, 'complete', clock)
+        enrichment = normalize_enrichment({**coverage, 'attempts': 2, 'totalAttempts': 7}, 'complete', clock)
+        state = {'status': 'complete', 'quality': quality, 'enrichment': enrichment, 'attribution': 'direct',
+                 'representativeCode': '000001', 'code': '000001'}
+        self.assertEqual(enrichment['status'], 'conflict'); self.assertEqual(quality['status'], 'conflict')
+        self.assertEqual(enrichment_eligible({'000001': state}), [])
+        self.assertEqual(quality_eligible({'000001': state}), [])
+        # A late pre-conflict receipt is not an authority to resolve a marker.
+        apply_coverage(state, {**coverage, 'priceComplete': 1, 'priceConflicted': 0, 'conflictingStocks': []})
+        self.assertEqual(state['enrichment']['priceComplete'], 0)
+        self.assertEqual(state['enrichment']['attempts'], 2); self.assertEqual(state['quality']['attempts'], 2)
+        self.assertEqual(merge_quality_observation(quality, {**raw, 'priceConflictOnly': False, 'fields': {key: 'complete' for key in QUALITY_FIELDS}})['fields']['prices'], 'partial')
+        quality['fields']['managers'] = 'partial'; quality['missingFields'] = ['prices', 'managers']
+        self.assertTrue(manager_only_repair(quality))
+
+    def test_invalid_marker_never_makes_a_complete_price_accepted_or_a_forged_conflict_queue(self):
+        fund = test_traversal.TraversalTests().retained_fund()
+        for marker in (None, {}, {'schemaVersion': 1, 'key': 'CN|600001', 'resolution': 'unresolved'}):
+            fund['rows'][0]['priceRange'] = {**complete_price(), 'globalPriceConflict': marker}
+            coverage = price_coverage(fund)
+            self.assertEqual(coverage['priceComplete'], 0)
+            self.assertEqual(coverage['priceConflicted'], 0)
+            self.assertEqual(coverage['missingStocks'], [{'market': 'CN', 'stockCode': '600001'}])
+
     def test_calendar_counts_and_missing_or_conflicting_sources(self):
         self.assertEqual([len(expected_sessions(m, START, END)) for m in ('CN', 'HK', 'US')], [60, 59, 62])
         first, last = make_series(bars()[:31]), make_series(bars()[30:], 'second')

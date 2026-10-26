@@ -6,14 +6,17 @@ are never interpreted as a product schema, and formulas are never executed.
 from __future__ import annotations
 
 import datetime as dt
+from contextlib import contextmanager
 import hashlib
 import io
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import signal
 import socket
 import stat
+import threading
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -36,6 +39,8 @@ MAX_STRINGS = 200_000
 MAX_TEXT_CHARS = 32767
 MAX_SUMMARY = 128 * 1024
 MAX_MATCH_ROWS = 8
+DOWNLOAD_DEADLINE_SECONDS = 60
+DOWNLOAD_ATTEMPTS = 3
 MAIN_NAMESPACES = {'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
                    'http://purl.oclc.org/ooxml/spreadsheetml/main'}
 ERRORS = {'ACTIONS_REQUIRED', 'HTTP_REJECTED', 'NETWORK_ERROR', 'TIMEOUT', 'DOWNLOAD_TOO_LARGE',
@@ -54,14 +59,37 @@ class NoRedirect(HTTPRedirectHandler):
         raise VerificationError('HTTP_REJECTED')
 
 
-def download_official():
-    if os.environ.get('GITHUB_ACTIONS') != 'true':
-        raise VerificationError('ACTIONS_REQUIRED')
-    request = Request(quote(SOURCE_URL, safe=':/'), headers={
-        'User-Agent': 'record-lab-universe-verifier/1.0', 'Accept-Encoding': 'identity'})
-    deadline = time.monotonic() + 60
+@contextmanager
+def download_deadline(deadline):
+    """Actions runs this on its main thread; bound even a slowly streaming read."""
+    if (threading.current_thread() is not threading.main_thread()
+            or not all(hasattr(signal, name) for name in ('SIGALRM', 'ITIMER_REAL', 'getitimer', 'setitimer'))):
+        raise VerificationError('UNIVERSE_VERIFICATION_FAILED')
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    # Do not displace another operation's live alarm. The downloader's actual
+    # entry points do not install one; an unexpected context fails closed.
+    if previous_timer[0] > 0:
+        raise VerificationError('UNIVERSE_VERIFICATION_FAILED')
+    def expire(_number, _frame):
+        raise VerificationError('TIMEOUT')
+    signal.signal(signal.SIGALRM, expire)
     try:
-        with build_opener(NoRedirect()).open(request, timeout=20) as response:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0: raise VerificationError('TIMEOUT')
+        signal.setitimer(signal.ITIMER_REAL, remaining)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+
+def _download_attempt(request, deadline):
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0: raise VerificationError('TIMEOUT')
+        with build_opener(NoRedirect()).open(request, timeout=min(20, remaining)) as response:
             if response.status != 200 or response.headers.get('Content-Encoding', 'identity').lower() != 'identity':
                 raise VerificationError('HTTP_REJECTED')
             length = response.headers.get('Content-Length')
@@ -72,6 +100,8 @@ def download_official():
                 if time.monotonic() >= deadline:
                     raise VerificationError('TIMEOUT')
                 chunk = response.read(min(64 * 1024, MAX_DOWNLOAD + 1 - size))
+                if time.monotonic() >= deadline:
+                    raise VerificationError('TIMEOUT')
                 if not chunk:
                     break
                 size += len(chunk)
@@ -89,6 +119,26 @@ def download_official():
         raise VerificationError('TIMEOUT') from None
     except (URLError, OSError):
         raise VerificationError('NETWORK_ERROR') from None
+
+
+def download_official():
+    if os.environ.get('GITHUB_ACTIONS') != 'true':
+        raise VerificationError('ACTIONS_REQUIRED')
+    request = Request(quote(SOURCE_URL, safe=':/'), headers={
+        'User-Agent': 'record-lab-universe-verifier/1.0', 'Accept-Encoding': 'identity'})
+    deadline = time.monotonic() + DOWNLOAD_DEADLINE_SECONDS
+    with download_deadline(deadline):
+        for attempt in range(DOWNLOAD_ATTEMPTS):
+            try:
+                return _download_attempt(request, deadline)
+            except VerificationError as error:
+                if error.code not in {'NETWORK_ERROR', 'TIMEOUT'} or attempt + 1 == DOWNLOAD_ATTEMPTS:
+                    raise
+                delay = attempt + 1
+                if deadline - time.monotonic() <= delay:
+                    raise VerificationError('TIMEOUT') from None
+                time.sleep(delay)
+    raise VerificationError('TIMEOUT')
 
 
 def local(tag):

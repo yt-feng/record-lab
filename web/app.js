@@ -454,7 +454,10 @@
     if (!range || range.status !== 'observed' || !isFiniteNumber(range.low) || !isFiniteNumber(range.high)) {
       return { value: '价格区间缺失', note: range && textValue(range.label) || '尚无可用行情', observed: false };
     }
-    const complete = range.coverageVersion === 2 && range.calendarId === 'exchange-sessions-2026-q2-q3-v1'
+    // A source calendar can be complete while another retained observation
+    // disagrees. Even malformed conflict metadata must not upgrade the view.
+    const conflictPending = Object.hasOwn(range, 'globalPriceConflict');
+    const complete = !conflictPending && range.coverageVersion === 2 && range.calendarId === 'exchange-sessions-2026-q2-q3-v1'
       && range.sessionScope === 'regular-trading-session' && range.priceBasis === 'unadjusted'
       && range.currency === { CN: 'CNY', HK: 'HKD', US: 'USD' }[range.market]
       && range.low > 0 && range.high >= range.low && range.completeness === 'complete'
@@ -463,10 +466,24 @@
       && range.rejectedRowCount === 0 && range.unexpectedSessionCount === 0 && range.conflictingDateCount === 0
       && typeof range.expectedDateSetHash === 'string' && /^[a-f0-9]{64}$/.test(range.expectedDateSetHash)
       && range.observedDateSetHash === range.expectedDateSetHash;
-    const coverage = complete ? '交易日完整' : Number.isInteger(range.missingSessionCount) && range.missingSessionCount > 0
+    const coverage = conflictPending ? '存在来源冲突待核验' : complete ? '交易日完整' : Number.isInteger(range.missingSessionCount) && range.missingSessionCount > 0
       ? `仍缺 ${range.missingSessionCount} 个交易日或上市/停牌证据` : '完整交易日覆盖未核验';
     return { value: `${formatNumber(range.low, 3)} – ${formatNumber(range.high, 3)} ${textValue(range.currency)}`.trim(),
-      note: `${range.observedStart || '日期未提供'} → ${range.observedEnd || '日期未提供'} · ${isFiniteNumber(range.observedCount) ? range.observedCount : '—'} 条行情 · ${coverage}`, observed: true, complete };
+      note: `${range.observedStart || '日期未提供'} → ${range.observedEnd || '日期未提供'} · ${isFiniteNumber(range.observedCount) ? range.observedCount : '—'} 条行情 · ${coverage}`, observed: true, complete, conflictPending };
+  }
+
+  function priceConflictSources(range) {
+    const facts = range?.globalPriceConflict?.facts;
+    if (!Array.isArray(facts) || facts.length !== 2) return [];
+    return facts.flatMap(fact => {
+      const price = fact?.price;
+      if (!isRecord(price) || !isFiniteNumber(price.low) || !isFiniteNumber(price.high)
+        || price.low <= 0 || price.high < price.low || !safeHttpUrl(fact.sourceUrl)
+        || !validTimestamp(fact.fetchedAt)
+        || ['market', 'stockCode', 'currency', 'rangeStart', 'rangeEnd', 'priceBasis'].some(key => price[key] !== range[key])) return [];
+      return [{ sourceUrl: safeHttpUrl(fact.sourceUrl), fetchedAt: fact.fetchedAt,
+        interval: `${formatNumber(price.low, 8)} – ${formatNumber(price.high, 8)} ${textValue(price.currency)}` }];
+    });
   }
 
   function csvCell(value) {
@@ -481,10 +498,12 @@
       '实际行情起始', '实际行情结束', '行情条数', '实际持有成本', '持仓报告来源', '行情来源', '运作说明期间', '运作说明来源',
       '持仓数据来源', '净资产数据来源', '经理归属观测日', '经理归属口径', '经理概况来源',
       '该基金观察截至', '该基金采集时间', '该基金数据状态', '行情采集时间', '行情数据状态',
-      '价格区间完整性', '应有交易日数', '缺失交易日数', '异常行情行数', '应有日期集合哈希', '观测日期集合哈希']];
+      '价格区间完整性', '应有交易日数', '缺失交易日数', '异常行情行数', '应有日期集合哈希', '观测日期集合哈希',
+      '待核验行情来源1', '对照价格区间1', '原始采集时间1', '待核验行情来源2', '对照价格区间2', '原始采集时间2']];
     for (const fund of funds) for (const row of fund.visibleRows || fund.rows) {
       const price = row.priceRange || {};
       const validPrice = priceDescription(price).observed;
+      const conflictSources = priceConflictSources(price);
       lines.push([fund.code, fund.name, fund.company, managerNames(fund).join(' / '), reportPeriod(fund), fund.previousReport?.periodEnd,
         row.stockCode, row.stockName, row.market, row.currency, row.change.label || row.change.kind, row.change.reason,
         row.current?.shares, row.previous?.shares, row.change.sharesDelta, row.current?.weightPct, row.previous?.weightPct, row.change.weightDeltaPp,
@@ -495,8 +514,9 @@
         safeHttpUrl(fund.selectedReport?.holdingsSourceUrl), safeHttpUrl(fund.selectedReport?.navSourceUrl), fund.managersAsOf,
         managerAttributionLabel(fund), safeHttpUrl(fund.managerSourceUrl || fund.metadataSourceUrl),
         fund.asOf, fund.retrievedAt, fund.dataStatus, price.fetchedAt, price.dataStatus,
-        priceDescription(price).complete ? '完整交易日区间' : '待补全', price.expectedSessionCount, price.missingSessionCount,
-        price.rejectedRowCount, price.expectedDateSetHash, price.observedDateSetHash]);
+        priceDescription(price).conflictPending ? '来源冲突待核验' : priceDescription(price).complete ? '完整交易日区间' : '待补全', price.expectedSessionCount, price.missingSessionCount,
+        price.rejectedRowCount, price.expectedDateSetHash, price.observedDateSetHash,
+        ...[0, 1].flatMap(index => [conflictSources[index]?.sourceUrl, conflictSources[index]?.interval, conflictSources[index]?.fetchedAt])]);
     }
     return '\ufeff' + lines.map(line => line.map(csvCell).join(',')).join('\r\n');
   }
@@ -785,9 +805,13 @@
       const price = priceDescription(row.priceRange);
       const priceCell = el('td'); priceCell.append(el('span', price.observed ? 'price-value' : 'missing', price.value),
         el('span', 'cell-sub', `窗口 ${row.priceRange.rangeStart || '未提供'} → ${row.priceRange.rangeEnd || '未提供'}`), el('span', 'cell-sub', price.note));
-      if (price.observed) priceCell.append(el('span', 'cell-sub', `口径 ${row.priceRange.priceBasis || '未提供'} · ${price.complete ? '已核对完整交易日' : '区间极值尚未完整'} · 非实际持仓成本`));
+      if (price.observed) priceCell.append(el('span', 'cell-sub', `口径 ${row.priceRange.priceBasis || '未提供'} · ${price.conflictPending ? '来源冲突待核验' : price.complete ? '已核对完整交易日' : '区间极值尚未完整'} · 非实际持仓成本`));
       if (row.priceRange.fetchedAt) priceCell.append(el('span', 'cell-sub', `${row.priceRange.dataStatus === 'cached' ? '保留行情 · ' : ''}采集 ${row.priceRange.fetchedAt}`));
       const priceSource = el('span', 'cell-sub'); if (addLink(priceSource, '行情来源 ↗', row.priceRange.sourceUrl)) priceCell.append(priceSource);
+      for (const [index, source] of priceConflictSources(row.priceRange).entries()) {
+        const comparison = el('span', 'cell-sub', `待核验对照 ${index + 1}：${source.interval} · 采集 ${source.fetchedAt} `);
+        addLink(comparison, '来源 ↗', source.sourceUrl); priceCell.append(comparison);
+      }
       tr.append(priceCell); return tr;
     }
 
@@ -1149,5 +1173,5 @@
   }
 
   return { validateDataset, validateCatalog, validateProgress, validatePeriods, selectQuarter, periodDataPath, validatePeriodDataset, responseText, researchOverview, notApplicableBreakdown, retryState, formatRetryAt, fundQuality, catalogComplete, catalogFreshness, companyDirectoryLabel, safeCompanyPath, companyPages, companyRecordSummaries, catalogIndex, companyCoverage, coverageOverview, safeHttpUrl, validEmptyStockEvidence, managerNames, managerAttributionLabel, managerTermLabel, reportPeriod, changeGroup, latestFunds, filterFunds,
-    strategyEvidence, universeDescription, formatNumber, formatMoney, signed, holdingValue, priceDescription, csvCell, exportCsv, observationState, mount };
+    strategyEvidence, universeDescription, formatNumber, formatMoney, signed, holdingValue, priceDescription, priceConflictSources, csvCell, exportCsv, observationState, mount };
 });

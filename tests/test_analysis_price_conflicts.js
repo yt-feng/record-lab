@@ -54,7 +54,7 @@ function analyzeBoth(input) {
     assert.deepEqual(input.docs, original, 'analysis must preserve original price intervals and evidence');
     assert.deepEqual(memory.stocks[0].priceRange.sourceUrls, [...input.sources].sort());
     assert.equal(memory.stocks[0].priceRange.sourceCount, input.sources.length);
-    assert.equal(memory.analysisVersion, 6);
+    assert.equal(memory.analysisVersion, 7);
     assert.equal(memory.coverage.contributionCount, input.sources.length);
     assert.equal(memory.stocks[0].priceRange.isCost, false);
     return memory;
@@ -105,4 +105,25 @@ test('partial observations outside a complete interval remain unresolved, includ
       assert.equal(result.coverage.completePriceStocks, 0);
     }
   }
+});
+
+test('a retained global conflict cannot heal when only one calendar-complete source remains', () => {
+  for (const marker of [null, false, {}, { resolution: 'unresolved' }]) {
+    const input = fixture([[1, 2]]);
+    Object.values(input.docs)[0].funds[0].rows[0].priceRange.globalPriceConflict = marker;
+    const result = analyzeBoth(input);
+    assert.equal(result.stocks[0].priceRange.conflictingObservations, true);
+    assert.equal(result.stocks[0].priceRange.completeness, 'partial');
+    assert.equal(result.coverage.completePriceStocks, 0);
+  }
+});
+
+test('a missing quote does not erase the security global conflict', () => {
+  const input = fixture([[1, 2]]);
+  const range = Object.values(input.docs)[0].funds[0].rows[0].priceRange;
+  Object.assign(range, { status: 'missing', globalPriceConflict: { resolution: 'unresolved' } });
+  const result = analyzeQuarter(input.manifest, file => input.docs[file], { now });
+  assert.equal(result.stocks[0].priceRange.conflictingObservations, true);
+  assert.equal(result.stocks[0].priceRange.completeness, 'partial');
+  assert.equal(result.coverage.completePriceStocks, 0);
 });

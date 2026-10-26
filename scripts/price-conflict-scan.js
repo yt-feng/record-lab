@@ -6,10 +6,12 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { createPriceIndex, addPriceSources } = require('../lib/reuse-prices');
 const { validCompletePrice, calendar } = require('../lib/price-coverage');
+const { normalizeConflict } = require('../lib/price-consistency');
 const { publicUrl } = require('./build-data');
 const PHASES = { '2026Q2': { targetPeriodEnd: '2026-06-30', baselinePeriodEnd: '2026-03-31' },
   '2026Q3': { targetPeriodEnd: '2026-09-30', baselinePeriodEnd: '2026-06-30' } };
 const MAX_OUTPUT = 65536, MAX_KEYS = 30000, MAX_GROUPS = 8;
+const MAX_REGISTRY_BYTES = 24_000_000, MAX_CONFLICT_KEYS = 5000, MAX_FACTS = 32;
 const sha = value => crypto.createHash('sha256').update(value).digest('hex');
 const stamp = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
   && Number.isFinite(Date.parse(value)) ? value : null;
@@ -186,15 +188,131 @@ function scan(root, { now = new Date(), dataCommit = null } = {}) {
   if (Buffer.byteLength(JSON.stringify(result)) + 1 > 48000) fail('DIAGNOSTIC_OUTPUT_LIMIT');
   return result;
 }
+// Full conflict registry input for the independent, bounded recheck lane. This
+// retains price facts only; fund documents and PDF text never enter the output.
+const PRICE_FIELDS = ['status', 'low', 'high', 'market', 'stockCode', 'currency', 'priceBasis', 'rangeStart', 'rangeEnd',
+  'coverageVersion', 'calendarId', 'sessionScope', 'completeness', 'observedCount', 'observedStart', 'observedEnd',
+  'expectedSessionCount', 'expectedDateSetHash', 'observedDateSetHash', 'missingSessionCount', 'missingSessionDates',
+  'unexpectedSessionCount', 'unexpectedSessionDates', 'rejectedRowCount', 'conflictingDateCount'];
+function stableSource(source) {
+  const url = new URL(source);
+  if (['query1.finance.yahoo.com', 'query2.finance.yahoo.com'].includes(url.hostname)) {
+    url.hostname = 'query1.finance.yahoo.com'; url.searchParams.delete('period2');
+  }
+  url.searchParams.sort(); return url.toString();
+}
+function scanRegistry(root, quarter, { now = new Date(), dataCommit = null } = {}) {
+  if (!Object.hasOwn(PHASES, quarter) || !Number.isFinite(Date.parse(now))
+    || dataCommit !== null && !/^[a-f0-9]{40}$/.test(dataCommit)) fail('DIAGNOSTIC_ARGUMENTS_INVALID');
+  const phase = PHASES[quarter], directory = path.join(root, quarter);
+  if (fs.lstatSync(directory).isSymbolicLink() || fs.lstatSync(path.join(directory, 'companies')).isSymbolicLink()) fail('DIAGNOSTIC_INPUT_INVALID');
+  const input = readJson(path.join(directory, 'latest.json')), manifest = input.value;
+  if (manifest?.schemaVersion !== 1 || !['actions', 'awaiting-data'].includes(manifest.sourceMode)
+    || manifest.targetPeriodEnd !== phase.targetPeriodEnd || manifest.baselinePeriodEnd !== phase.baselinePeriodEnd
+    || !Array.isArray(manifest.companyFiles) || manifest.companyFiles.length > 10000
+    || manifest.sourceMode === 'awaiting-data' && (manifest.companyFiles.length || manifest.asOf !== null || manifest.retrievedAt !== null)) fail('DIAGNOSTIC_MANIFEST_INVALID');
+  const seen = new Set(), files = manifest.companyFiles.map(item => {
+    if (!/^\.\/data\/companies\/[A-Za-z0-9_-]{1,64}\.json$/.test(item?.path || '') || seen.has(item.path)) fail('DIAGNOSTIC_COMPANY_PATH_INVALID');
+    seen.add(item.path); return path.join(directory, item.path.slice('./data/'.length));
+  });
+  const load = file => {
+    const document = readJson(file).value;
+    if (document?.schemaVersion !== 1 || document.sourceMode !== 'actions' || document.targetPeriodEnd !== phase.targetPeriodEnd
+      || document.baselinePeriodEnd !== phase.baselinePeriodEnd || !Array.isArray(document.funds) || document.funds.length > 1000) fail('DIAGNOSTIC_COMPANY_INVALID');
+    return document.funds;
+  };
+  const index = createPriceIndex(phase, now); let scannedFunds = 0;
+  for (const file of files) {
+    const funds = load(file); scannedFunds += funds.length; addPriceSources(index, funds);
+    if (index.entries.size > MAX_KEYS) fail('DIAGNOSTIC_KEY_LIMIT');
+  }
+  const keys = new Set([...index.entries].filter(([, value]) => value.conflict).map(([key]) => key));
+  const eligibleRows = function* (file) {
+    for (const fund of load(file)) {
+      if (!/^\d{6}$/.test(fund?.code || '') || !['ok', 'no-equities'].includes(fund.status)
+        || fund.selectedReport?.periodEnd !== phase.targetPeriodEnd || !Array.isArray(fund.rows)
+        || !stamp(fund.retrievedAt) || Date.parse(fund.retrievedAt) > Date.parse(now) + 300000
+        || fund.priceUpdatedAt != null && (!stamp(fund.priceUpdatedAt) || Date.parse(fund.priceUpdatedAt) > Date.parse(now) + 300000)) continue;
+      const bound = Math.max(Date.parse(fund.retrievedAt), stamp(fund.priceUpdatedAt) ? Date.parse(fund.priceUpdatedAt) : -Infinity);
+      for (const row of fund.rows) {
+        const key = identity(row, phase), price = row.priceRange;
+        if (!key || !index.entries.has(key)) continue;
+        const candidates = [];
+        if (price.status === 'observed' && price.priceBasis === 'unadjusted'
+          && Number.isFinite(price.low) && Number.isFinite(price.high) && price.low > 0 && price.high >= price.low
+          && publicUrl(price.sourceUrl) && price.sourceUrl.length <= 2048 && stamp(price.fetchedAt)
+          && Date.parse(price.fetchedAt) >= Date.parse(phase.targetPeriodEnd) && Date.parse(price.fetchedAt) <= bound) candidates.push(row);
+        // A retained two-source witness can outlive either local quote after
+        // portfolio deduplication. Validate its full identity, hashes, calendar
+        // proof and original timestamps before allowing it to supply facts.
+        const witness = normalizeConflict(price.globalPriceConflict, { market: row.market, stockCode: row.stockCode,
+          currency: row.currency, rangeStart: index.interval.start, rangeEnd: index.interval.end, calendarId: calendar.id }, now);
+        if (witness) for (const fact of witness.facts) candidates.push({ market: row.market, stockCode: row.stockCode, currency: row.currency,
+          priceRange: { ...fact.price, sourceUrl: fact.sourceUrl, sourceUrls: fact.sourceUrls, fetchedAt: fact.fetchedAt } });
+        const emitted = new Set();
+        for (const candidate of candidates) {
+          const value = candidate.priceRange;
+          const signature = JSON.stringify([PRICE_FIELDS.map(field => value[field]), value.sourceUrl,
+            [...(value.sourceUrls || [value.sourceUrl])].sort(), value.fetchedAt]);
+          if (emitted.has(signature)) continue;
+          emitted.add(signature); yield [key, candidate];
+        }
+      }
+    }
+  };
+  for (const file of files) for (const [key, row] of eligibleRows(file)) {
+    const source = index.entries.get(key).source.price, price = row.priceRange;
+    if (!validCompletePrice(price, row.market, row.stockCode, index.interval.start, index.interval.end)
+      && (price.low < source.low || price.high > source.high)) keys.add(key);
+    if (keys.size > MAX_CONFLICT_KEYS) fail('DIAGNOSTIC_CONFLICT_KEY_LIMIT');
+  }
+  if (keys.size > MAX_CONFLICT_KEYS) fail('DIAGNOSTIC_CONFLICT_KEY_LIMIT');
+  const facts = new Map([...keys].sort().map(key => [key, new Map()])); let retainedBytes = 0;
+  for (const file of files) for (const [key, row] of eligibleRows(file)) {
+    if (!facts.has(key)) continue;
+    const price = Object.fromEntries(PRICE_FIELDS.filter(field => row.priceRange[field] !== undefined).map(field => [field, row.priceRange[field]]));
+    const sourceUrl = row.priceRange.sourceUrl, fetchedAt = row.priceRange.fetchedAt;
+    const sourceUrls = row.priceRange.sourceUrls === undefined ? [sourceUrl] : row.priceRange.sourceUrls;
+    if (!Array.isArray(sourceUrls) || !sourceUrls.length || sourceUrls.length > 8
+      || sourceUrls.some(url => !publicUrl(url) || url.length > 2048)) fail('DIAGNOSTIC_SOURCE_INVALID');
+    const signature = JSON.stringify([[...new Set([sourceUrl, ...sourceUrls].map(stableSource))].sort(), price]), groups = facts.get(key);
+    let group = groups.get(signature);
+    if (!group) {
+      if (groups.size >= MAX_FACTS) fail('DIAGNOSTIC_FACT_LIMIT');
+      group = { price, observations: [], occurrenceCount: 0, omittedObservationCount: 0, firstFetchedAt: fetchedAt, lastFetchedAt: fetchedAt };
+      groups.set(signature, group); retainedBytes += Buffer.byteLength(JSON.stringify(group));
+    }
+    const oldBytes = Buffer.byteLength(JSON.stringify(group)); group.occurrenceCount++;
+    if (Date.parse(fetchedAt) < Date.parse(group.firstFetchedAt)) group.firstFetchedAt = fetchedAt;
+    if (Date.parse(fetchedAt) > Date.parse(group.lastFetchedAt)) group.lastFetchedAt = fetchedAt;
+    if (!group.observations.some(value => value.sourceUrl === sourceUrl && value.fetchedAt === fetchedAt
+      && JSON.stringify(value.sourceUrls) === JSON.stringify(sourceUrls))) {
+      group.observations.push({ sourceUrl, sourceUrls, fetchedAt });
+      group.observations.sort((a, b) => Date.parse(a.fetchedAt) - Date.parse(b.fetchedAt) || a.sourceUrl.localeCompare(b.sourceUrl));
+      if (group.observations.length > 4) { group.observations.splice(1, 1); group.omittedObservationCount++; }
+    }
+    retainedBytes += Buffer.byteLength(JSON.stringify(group)) - oldBytes;
+    if (retainedBytes > MAX_REGISTRY_BYTES - 500000) fail('DIAGNOSTIC_REGISTRY_LIMIT');
+  }
+  const result = { schemaVersion: 1, kind: 'price-conflict-observations', quarter, ...phase,
+    generatedAt: new Date(now).toISOString(), dataCommit, manifestContentHash: input.hash,
+    scannedCompanyPages: files.length, scannedFunds, eligiblePriceKeys: index.entries.size,
+    productionDataModified: false, automaticResolution: false,
+    records: [...facts].map(([key, groups]) => ({ key, groups: [...groups.values()] })) };
+  if (Buffer.byteLength(JSON.stringify(result)) > MAX_REGISTRY_BYTES) fail('DIAGNOSTIC_REGISTRY_LIMIT');
+  return result;
+}
 function main(argv = process.argv.slice(2)) {
   try {
     if (process.env.GITHUB_ACTIONS !== 'true') fail('DIAGNOSTIC_REQUIRES_ACTIONS');
-    if (argv.length !== 4 || argv[0] !== '--data' || argv[2] !== '--output') fail('DIAGNOSTIC_ARGUMENTS_INVALID');
+    const registryMode = argv.length === 6 && argv[4] === '--registry-quarter' && Object.hasOwn(PHASES, argv[5]);
+    if ((!registryMode && argv.length !== 4) || argv[0] !== '--data' || argv[2] !== '--output') fail('DIAGNOSTIC_ARGUMENTS_INVALID');
     const relative = path.relative(path.resolve(argv[1]), path.resolve(argv[3]));
     if (!relative.startsWith('..' + path.sep) && !path.isAbsolute(relative)) fail('DIAGNOSTIC_OUTPUT_INSIDE_SOURCE');
-    const result = scan(argv[1], { dataCommit: process.env.PRICE_DIAGNOSTIC_DATA_COMMIT || null });
+    const options = { dataCommit: process.env.PRICE_DIAGNOSTIC_DATA_COMMIT || null };
+    const result = registryMode ? scanRegistry(argv[1], argv[5], options) : scan(argv[1], options);
     fs.mkdirSync(path.dirname(argv[3]), { recursive: true }); fs.writeFileSync(argv[3], JSON.stringify(result) + '\n');
-    process.stdout.write(JSON.stringify({ status: 'diagnosed', selectedKeys: result.quarters.reduce((n, quarter) => n + quarter.selected.length, 0) }) + '\n');
+    process.stdout.write(JSON.stringify({ status: 'diagnosed', selectedKeys: registryMode ? result.records.length : result.quarters.reduce((n, quarter) => n + quarter.selected.length, 0) }) + '\n');
     return 0;
   } catch (error) {
     const code = /^DIAGNOSTIC_[A-Z_]+$/.test(error?.message) ? error.message : 'DIAGNOSTIC_FAILED';
@@ -202,4 +320,4 @@ function main(argv = process.argv.slice(2)) {
   }
 }
 if (require.main === module) process.exitCode = main();
-module.exports = { scan, scanQuarter, numericDifference, requestFacts, main, PHASES, MAX_OUTPUT };
+module.exports = { scan, scanQuarter, scanRegistry, numericDifference, requestFacts, main, PHASES, MAX_OUTPUT, MAX_REGISTRY_BYTES };

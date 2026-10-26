@@ -33,6 +33,7 @@ function recoverPrice(row, price, bound) {
 }
 function reuse(funds, options = {}) { return reuseCompletePrices(funds, { phase, now, recoverPrice, ...options }); }
 const complete = row => validCompletePrice(row.priceRange, row.market, row.stockCode, interval.start, interval.end);
+const withoutConflict = value => { const result = clone(value); for (const item of Array.isArray(result) ? result : [result]) for (const row of item.rows) delete row.priceRange.globalPriceConflict; return result; };
 
 test('same security-quarter is reused across companies without modifying report or manager evidence', () => {
   const donor = fund('000001'), target = fund('000002', 'missing'), original = clone(target), beforeDonor = clone(donor);
@@ -61,7 +62,8 @@ test('conflicting complete sources block propagation regardless of input orderin
   for (const order of [[a, b, target], [target, b, a]]) {
     const records = clone(order), result = reuse(records);
     assert.equal(result.conflictingPriceKeyCount, 1); assert.equal(result.reusedPriceRowCount, 0);
-    assert.deepEqual(records, order);
+    assert.deepEqual(withoutConflict(records), order);
+    assert.ok(records.every(item => item.rows[0].priceRange.globalPriceConflict));
   }
 });
 
@@ -71,7 +73,8 @@ test('a valid partial extreme outside the complete source range is retained as a
     Object.assign(target.rows[0].priceRange, change);
     const before = clone(target), result = reuse([donor, target]);
     assert.equal(result.partialConflictRowCount, 1); assert.equal(result.reusedPriceRowCount, 0);
-    assert.deepEqual(target, before);
+    assert.deepEqual(withoutConflict(target), before);
+    assert.ok(target.rows[0].priceRange.globalPriceConflict);
   }
 });
 
@@ -159,6 +162,101 @@ function retainedPair(targetKind = 'missing') {
   return { first, target: target.funds[0] };
 }
 
+test('a global disagreement lowers fund receipts and Python quality without rewriting source facts or spending old lanes', () => {
+  const a = snapshot('000001', 'complete', quoteAt), b = snapshot('000002', 'complete', quoteAt);
+  b.funds[0].rows[0].priceRange.low = 9;
+  const original = clone([a.funds[0], b.funds[0]]);
+  const merged = mergeSnapshots({ snapshots: [a, b], config, catalog, now, receiptCodes: ['000001', '000002'] });
+  const after = Object.values(merged.companySnapshots).flatMap(item => item.funds);
+  assert.equal(merged.counts.conflictingPriceKeyCount, 1);
+  assert.equal(merged.counts.conflictMarkedFundCount, 2);
+  assert.equal(merged.counts.reusedPriceFundCount, 0);
+  assert.equal(merged.manifest.coverage.priceComplete, 0);
+  assert.deepEqual(merged.receipt.funds.map(item => [item.priceCoverage.priceComplete, item.priceCoverage.priceConflicted, item.priceCoverage.missingStocks]), [[0, 1, []], [0, 1, []]]);
+  for (let i = 0; i < after.length; i++) {
+    assert.equal(complete(after[i].rows[0]), true);
+    assert.deepEqual(withoutConflict(after[i]).rows, original[i].rows);
+    for (const key of ['retrievedAt', 'selectedReport', 'reportManagers']) assert.deepEqual(after[i][key], original[i][key]);
+  }
+  const script = `import json,sys,datetime as dt
+sys.path.insert(0,'scripts')
+from traversal import price_coverage, report_quality, normalize_enrichment, normalize_quality, apply_coverage, enrichment_eligible, quality_eligible, merge_quality_observation, QUALITY_FIELDS, MANAGER_TABLE_COVERAGE_VERSION, STRATEGY_SECTION_COVERAGE_VERSION
+v=json.load(sys.stdin); now=dt.datetime.fromisoformat(v['now'].replace('Z','+00:00'))
+fund=v['fund']; coverage=price_coverage(fund,now)
+assert coverage['priceComplete']==0 and coverage['priceConflicted']==1 and coverage['missingStocks']==[]
+q=report_quality(fund,v['phase'],now); assert q['fields']['prices']=='partial' and q['priceConflictOnly']
+prior={**coverage,'attempts':2,'totalAttempts':5,'lastAttemptAt':'2026-10-25T10:00:00Z'}
+enrichment=normalize_enrichment(prior,'complete',now)
+assert enrichment['status']=='conflict' and enrichment['attempts']==2 and enrichment['totalAttempts']==5
+oldq={**q,'fields':{key:'complete' for key in QUALITY_FIELDS},'attempts':2,'totalAttempts':7,'managerAttempts':1,'strategyAttempts':1}
+oldq['fields']['prices']='partial'
+quality=normalize_quality(oldq,'complete',now)
+assert quality['status']=='conflict' and quality['attempts']==2 and quality['managerAttempts']==1 and quality['strategyAttempts']==1
+state={'status':'complete','attribution':'direct','representativeCode':fund['code'],'code':fund['code'],'enrichment':enrichment,'quality':quality}
+assert enrichment_eligible({fund['code']:state})==[] and quality_eligible({fund['code']:state})==[]
+late={**coverage,'priceComplete':1,'priceConflicted':0,'conflictingStocks':[]}
+apply_coverage(state,late)
+assert state['enrichment']['status']=='conflict' and state['enrichment']['priceComplete']==0 and state['enrichment']['attempts']==2
+assert merge_quality_observation(quality,{**q,'fields':{key:'complete' for key in QUALITY_FIELDS},'priceConflictOnly':False})['fields']['prices']=='partial'
+print('conflicts-isolated')`;
+  const output = require('node:child_process').execFileSync('python3', ['-c', script], { cwd: require('node:path').resolve(__dirname, '..'), encoding: 'utf8', input: JSON.stringify({ fund: after[0], phase, now }) });
+  assert.equal(output.trim(), 'conflicts-isolated');
+  const replay = mergeSnapshots({ previousManifest: merged.manifest, previousCompanies: merged.companySnapshots, config, catalog, now });
+  assert.equal(replay.changed, false); assert.equal(replay.counts.conflictingPriceKeyCount, 1);
+});
+
+test('retained conflict witnesses cannot self-clear when only one original fund remains published', () => {
+  const a = fund('000001'), b = fund('000002'); b.rows[0].priceRange.low = 9;
+  reuse([a, b]);
+  const retained = clone(a), before = clone(retained);
+  const result = reuse([retained]);
+  assert.equal(result.conflictingPriceKeyCount, 1); assert.equal(result.conflictMarkedRowCount, 0);
+  assert.deepEqual(retained, before);
+});
+
+test('a malformed partial extreme cannot hide the valid partial witness from an earlier partition', () => {
+  const { createPriceIndex, addPriceSources, applyPriceIndex } = require('../lib/reuse-prices');
+  const completeFund = fund('000001'), bad = fund('000002', 'partial'), valid = fund('000003', 'partial');
+  bad.rows[0].priceRange.low = 1; bad.rows[0].priceRange.observedDateSetHash = '0'.repeat(64);
+  valid.rows[0].priceRange.low = 9;
+  const index = createPriceIndex(phase, now);
+  addPriceSources(index, [bad, valid]); addPriceSources(index, [completeFund]);
+  assert.equal(applyPriceIndex(index, [completeFund], recoverPrice).conflictingPriceKeyCount, 1);
+  assert.deepEqual(completeFund.rows[0].priceRange.globalPriceConflict.facts.map(item => item.price.low).sort((a, b) => a - b), [9, 10]);
+});
+
+test('missing local quotes and fresh replacements retain an existing unresolved key witness', () => {
+  const a = snapshot('000001', 'complete', quoteAt), b = snapshot('000002', 'complete', quoteAt);
+  b.funds[0].rows[0].priceRange.low = 9;
+  const first = mergeSnapshots({ snapshots: [a, b], config, catalog, now });
+  const retained = clone(first.companySnapshots.co1), marker = retained.funds[0].rows[0].priceRange.globalPriceConflict;
+  retained.funds[0].rows[0].priceRange = { ...range('missing'), globalPriceConflict: marker };
+  retained.funds[0].summary.observedPriceCount = 0;
+  const replay = mergeSnapshots({ previousManifest: first.manifest, previousCompanies: { co1: retained }, config, catalog, now });
+  assert.equal(replay.counts.conflictingPriceKeyCount, 1); assert.equal(replay.counts.conflictMarkedFundCount, 0);
+  const fresh = snapshot('000001', 'complete', '2026-10-26T11:00:00Z');
+  const replaced = mergeSnapshots({ snapshots: [fresh], previousManifest: first.manifest,
+    previousCompanies: { co1: first.companySnapshots.co1 }, config, catalog, now });
+  assert.equal(replaced.manifest.coverage.priceComplete, 0);
+  assert.ok(replaced.companySnapshots.co1.funds[0].rows[0].priceRange.globalPriceConflict);
+  assert.equal(replaced.companySnapshots.co1.funds[0].retrievedAt, fresh.retrievedAt);
+  assert.equal(replaced.companySnapshots.co1.funds[0].rows[0].priceRange.fetchedAt, fresh.funds[0].rows[0].priceRange.fetchedAt);
+});
+
+test('partial extreme in a later source partition marks earlier complete source and all missing recipients', () => {
+  const { createPriceIndex, addPriceSources, applyPriceIndex } = require('../lib/reuse-prices');
+  const a = fund('000001'), b = fund('000002', 'partial'), target = fund('000003', 'missing');
+  b.rows[0].priceRange.low = 9;
+  const index = createPriceIndex(phase, now);
+  addPriceSources(index, [target, a]); addPriceSources(index, [b]);
+  for (const item of [a, b, target]) {
+    const before = clone(item), result = applyPriceIndex(index, [item], recoverPrice);
+    assert.equal(result.conflictingPriceKeyCount, 1); assert.equal(result.reusedPriceRowCount, 0);
+    assert.deepEqual(withoutConflict(item), before);
+    assert.deepEqual(item.rows[0].priceRange.globalPriceConflict.types, ['partial-extreme']);
+  }
+});
+
 test('reuse alone publishes changed company pages and truthful receipt coverage without request receipts', () => {
   const { first, target } = retainedPair(), before = clone(target);
   const merged = mergeSnapshots({ previousManifest: first.manifest, previousCompanies: first.companySnapshots,
@@ -179,11 +277,12 @@ test('reuse alone publishes changed company pages and truthful receipt coverage 
   assert.equal(replay.receipt.funds[0].priceCoverage.priceComplete, 1);
 });
 
-test('a conflicting retained complete source is counted without rewriting any saved fund', () => {
+test('a conflicting retained complete source publishes only the conflict metadata', () => {
   const { first } = retainedPair('complete');
   first.companySnapshots.co2.funds[0].rows[0].priceRange.low = 9;
   const merged = mergeSnapshots({ previousManifest: first.manifest, previousCompanies: first.companySnapshots, config, catalog, now });
-  assert.equal(merged.changed, false); assert.equal(merged.counts.conflictingPriceKeyCount, 1);
+  assert.equal(merged.changed, true); assert.equal(merged.counts.conflictingPriceKeyCount, 1);
+  assert.equal(merged.counts.conflictMarkedFundCount, 2); assert.equal(merged.manifest.coverage.priceComplete, 0);
   assert.equal(merged.counts.reusedPriceRowCount, 0); assert.deepEqual(merged.receipt.pricePatches, []);
 });
 
@@ -192,7 +291,7 @@ test('a partial target conflict survives the actual publication recovery callbac
   first.companySnapshots.co2.funds[0].rows[0].priceRange.high = 21;
   const merged = mergeSnapshots({ previousManifest: first.manifest, previousCompanies: first.companySnapshots,
     config, catalog, now, receiptCodes: ['000002'] });
-  assert.equal(merged.changed, false); assert.equal(merged.counts.partialConflictRowCount, 1);
+  assert.equal(merged.changed, true); assert.equal(merged.counts.partialConflictRowCount, 1);
   assert.equal(merged.receipt.funds[0].priceCoverage.priceComplete, 0);
 });
 
@@ -285,6 +384,6 @@ test('conflicting source in the last input partition blocks reuse in every outpu
   for (const target of [fund('000003', 'missing'), fund('000004', 'partial')]) {
     const before = clone(target), result = applyPriceIndex(index, [target], recoverPrice);
     assert.equal(result.conflictingPriceKeyCount, 1); assert.equal(result.reusedPriceRowCount, 0);
-    assert.deepEqual(target, before);
+    assert.deepEqual(withoutConflict(target), before);
   }
 });

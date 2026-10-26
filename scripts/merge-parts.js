@@ -8,7 +8,8 @@ const { buildSnapshot, catalogDetails, deduplicatePortfolios, publicUrl } = requ
 const { validDate } = require('../lib/fund-analysis');
 const { verifiedReportManagers, normalizeManagers, evidenceFor, managerKey, managerCoverageFor, completeManagerCoverage } = require('../lib/report-managers');
 const { strategySectionCoverageFor, strategyAnalysisFor } = require('../lib/strategy-sections');
-const { VERSION: PRICE_COVERAGE_VERSION, calendar, validCompletePrice, validCompleteQuarterPrice, retainedCoverage } = require('../lib/price-coverage');
+const { VERSION: PRICE_COVERAGE_VERSION, calendar, validCompletePrice, validUsableCompletePrice, validUsableCompleteQuarterPrice, retainedCoverage } = require('../lib/price-coverage');
+const { normalizeConflict } = require('../lib/price-consistency');
 const { bindingFor, validPatch, canReplacePrice, key: priceKey } = require('../lib/price-patches');
 const { reuseCompletePrices } = require('../lib/reuse-prices');
 const { normalizePortfolioIdentity, retainPortfolioIdentity } = require('../lib/portfolio-identity');
@@ -40,7 +41,7 @@ function validEnvelope(envelope, now, config) {
     && (!config.targetPeriodEnd || !envelope.targetPeriodEnd || envelope.targetPeriodEnd === config.targetPeriodEnd);
 }
 
-function recoverPrice(row, supplied, retrievedAt) {
+function recoverPrice(row, supplied, retrievedAt, now = new Date()) {
   if (!supplied || supplied.status !== 'observed' || supplied.priceBasis !== 'unadjusted'
     || !publicUrl(supplied.sourceUrl) || supplied.currency !== row.currency
     || supplied.rangeStart !== row.priceRange.rangeStart || supplied.rangeEnd !== row.priceRange.rangeEnd
@@ -52,6 +53,10 @@ function recoverPrice(row, supplied, retrievedAt) {
     || Array.isArray(supplied.sourceUrls) && supplied.sourceUrls.some(url => !publicUrl(url))) return false;
   const fetchedAt = supplied.fetchedAt || retrievedAt;
   if (!timestamp(fetchedAt) || Date.parse(fetchedAt) > Date.parse(retrievedAt)) return false;
+  const conflict = Object.hasOwn(supplied, 'globalPriceConflict') ? normalizeConflict(supplied.globalPriceConflict,
+    { market: row.market, stockCode: row.stockCode, currency: row.currency, rangeStart: supplied.rangeStart,
+      rangeEnd: supplied.rangeEnd, calendarId: calendar.id }, now) : null;
+  if (Object.hasOwn(supplied, 'globalPriceConflict') && !conflict) return false;
   const coverage = retainedCoverage(supplied, row.market, row.stockCode, row.priceRange.rangeStart, row.priceRange.rangeEnd);
   row.priceRange = { ...row.priceRange, ...coverage, status: 'observed',
     label: coverage.completeness === 'complete' ? '完整交易日区间价格（非持仓成本）' : '已观测区间价格（非持仓成本；交易日覆盖未完整）', low: supplied.low, high: supplied.high,
@@ -59,6 +64,7 @@ function recoverPrice(row, supplied, retrievedAt) {
     observedCount: supplied.observedCount, sourceUrl: supplied.sourceUrl, fetchedAt,
     sourceUrls: Array.isArray(supplied.sourceUrls) ? [...new Set(supplied.sourceUrls)].slice(0, 8) : [supplied.sourceUrl],
     dataStatus: supplied.dataStatus === 'cached' ? 'cached' : 'fresh' };
+  if (conflict) row.priceRange.globalPriceConflict = conflict;
   return true;
 }
 
@@ -98,7 +104,13 @@ function sanitizeFund(item, { now, config, envelope }) {
     && Date.parse(item.priceUpdatedAt) <= Date.parse(envelope.priceUpdatedAt || envelope.retrievedAt)
     ? item.priceUpdatedAt : clean.retrievedAt;
   for (const row of clean.rows) {
-    recoverPrice(row, suppliedRows.get(`${row.market}:${row.stockCode}`)?.priceRange, priceAt);
+    const supplied = suppliedRows.get(`${row.market}:${row.stockCode}`)?.priceRange;
+    recoverPrice(row, supplied, priceAt, now);
+    const conflict = normalizeConflict(supplied?.globalPriceConflict,
+      { market: row.market, stockCode: row.stockCode, currency: row.currency, rangeStart: row.priceRange.rangeStart,
+        rangeEnd: row.priceRange.rangeEnd, calendarId: calendar.id }, now);
+    // The globally witnessed key may be present on a row with no local quote.
+    if (conflict) row.priceRange.globalPriceConflict = conflict;
   }
   if (priceAt !== clean.retrievedAt) clean.priceUpdatedAt = priceAt;
   clean.summary.observedPriceCount = clean.rows.filter(row => row.priceRange.status === 'observed').length;
@@ -141,15 +153,19 @@ function shouldReplace(current, candidate) {
   return true;
 }
 
-function retainPrices(candidate, old) {
+function retainPrices(candidate, old, now) {
   if (!old?.selectedReport || !candidate.selectedReport || old.selectedReport.periodEnd !== candidate.selectedReport.periodEnd) return;
   const rows = new Map(old.rows.map(row => [`${row.market}:${row.stockCode}`, row]));
   for (const row of candidate.rows) {
     const prior = rows.get(`${row.market}:${row.stockCode}`)?.priceRange;
+    const conflict = normalizeConflict(prior?.globalPriceConflict,
+      { market: row.market, stockCode: row.stockCode, currency: row.currency, rangeStart: row.priceRange.rangeStart,
+        rangeEnd: row.priceRange.rangeEnd, calendarId: calendar.id }, now);
+    if (conflict) row.priceRange.globalPriceConflict = conflict;
     const complete = value => validCompletePrice(value, row.market, row.stockCode, row.priceRange.rangeStart, row.priceRange.rangeEnd);
     if (row.priceRange.status !== 'observed' || !complete(row.priceRange) && complete(prior)) {
       const bound = Date.parse(old?.priceUpdatedAt) > Date.parse(candidate.retrievedAt) ? old.priceUpdatedAt : candidate.retrievedAt;
-      if (prior && recoverPrice(row, prior, bound)) {
+      if (prior && recoverPrice(row, prior, bound, now)) {
         row.priceRange.dataStatus = 'cached';
         if (Date.parse(bound) > Date.parse(candidate.retrievedAt)) candidate.priceUpdatedAt = bound;
       }
@@ -252,7 +268,7 @@ function coverageFor(funds, directory, config, expectedCount = directory.fundCou
     requestedFundCount: expectedCount, catalogFundCount: directory.fundCount, catalogCompanyCount: directory.companyCount,
     holdingCount: funds.reduce((sum, fund) => sum + fund.rows.filter(row => row.current).length, 0),
     priceAvailable: funds.reduce((sum, fund) => sum + fund.rows.filter(row => row.current && row.priceRange.status === 'observed').length, 0),
-    priceComplete: funds.reduce((sum, fund) => sum + fund.rows.filter(row => row.current && validCompleteQuarterPrice(row.priceRange,
+    priceComplete: funds.reduce((sum, fund) => sum + fund.rows.filter(row => row.current && validUsableCompleteQuarterPrice(row.priceRange,
       row.market, row.stockCode, config.targetPeriodEnd || fund.selectedReport?.periodEnd)).length, 0),
     narrativeCount: funds.filter(fund => fund.narrative?.text).length,
     noEquitiesFundCount: funds.filter(fund => fund.status === 'no-equities').length,
@@ -310,16 +326,21 @@ function finalObservation(fund) {
   const observed = new Set(fund.rows.filter(row => stocks.has(`${row.market}:${row.stockCode}`) && row.priceRange.status === 'observed'
     && row.priceRange.rangeStart === start && row.priceRange.rangeEnd === period)
     .map(row => `${row.market}:${row.stockCode}`));
-  const complete = new Set(fund.rows.filter(row => stocks.has(`${row.market}:${row.stockCode}`) && validCompletePrice(row.priceRange, row.market, row.stockCode, start, period))
+  const complete = new Set(fund.rows.filter(row => stocks.has(`${row.market}:${row.stockCode}`) && validUsableCompletePrice(row.priceRange, row.market, row.stockCode, start, period))
     .map(row => `${row.market}:${row.stockCode}`));
-  const missingStocks = [...stocks.keys()].sort().filter(key => !complete.has(key)).map(key => stocks.get(key));
+  const conflicts = new Set(fund.rows.filter(row => stocks.has(`${row.market}:${row.stockCode}`) && normalizeConflict(row.priceRange.globalPriceConflict,
+    { market: row.market, stockCode: row.stockCode, currency: row.currency, rangeStart: start, rangeEnd: period, calendarId: calendar.id }))
+    .map(row => `${row.market}:${row.stockCode}`));
+  const conflictingStocks = [...conflicts].sort().map(key => stocks.get(key));
+  const missingStocks = [...stocks.keys()].sort().filter(key => !complete.has(key) && !conflicts.has(key)).map(key => stocks.get(key));
   const reportEvidence = { sourceUrl: fund.selectedReport.sourceUrl, periodEnd: fund.selectedReport.periodEnd,
     publishedAt: fund.selectedReport.publishedAt, observedAt: fund.retrievedAt };
   if (fund.status === 'no-equities') reportEvidence.noEquities = clone(fund.noEquitiesEvidence);
   return { representativeCode: fund.code, companyCode: fund.companyId,
     status: fund.status === 'no-equities' ? 'no-equities' : fund.status === 'ok' ? 'complete' : 'failed', reportEvidence,
     priceCoverage: { coverageVersion: PRICE_COVERAGE_VERSION, calendarId: calendar.id,
-      holdingCount: stocks.size, priceAvailable: observed.size, priceComplete: complete.size, missingStocks,
+      consistencyVersion: 1, holdingCount: stocks.size, priceAvailable: observed.size, priceComplete: complete.size,
+      priceConflicted: conflicts.size, conflictingStocks, missingStocks,
       holdingsIdentity: crypto.createHash('sha256').update([...stocks.keys()].sort().join('|')).digest('hex') },
     sourcePortfolioCode: fund.sourcePortfolioCode, portfolioSourceUrl: fund.portfolioSourceUrl,
     shareClassCodes: fund.sourcePortfolioCode && publicUrl(fund.portfolioSourceUrl) ? fund.shareClassCodes : [fund.code] };
@@ -415,7 +436,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
         fund = sanitizeFund(fund, { now: currentTime, config, envelope });
         if (!fund) continue;
       }
-      retainPrices(fund, old);
+      retainPrices(fund, old, currentTime);
       byCode.set(fund.code, fund);
       acceptedFreshFundCount += 1;
     }
@@ -471,7 +492,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
   const { mutatedFunds: reusedFunds, ...reuseCounts } = reusePrices ? reuseCompletePrices(funds,
     { phase: config, now: currentTime, recoverPrice, sourceFunds }) : {
       mutatedFunds: [], reusedPriceRowCount: 0, reusedPriceFundCount: 0, eligiblePriceKeyCount: 0,
-      conflictingPriceKeyCount: 0, partialConflictRowCount: 0 };
+      conflictingPriceKeyCount: 0, partialConflictRowCount: 0, conflictMarkedRowCount: 0, conflictMarkedFundCount: 0, conflictingPriceRowCount: 0 };
   const receipt = mergeReceipt(funds, requestedCodes, config, currentTime, attempts);
   receipt.pricePatches = priceResults;
   // No new observation means no fabricated new timestamp or overwritten old files.

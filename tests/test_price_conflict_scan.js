@@ -7,7 +7,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { priceRange } = require('../lib/fund-analysis');
 const { expectedSessions } = require('../lib/price-coverage');
-const { scan, numericDifference, requestFacts, PHASES, MAX_OUTPUT } = require('../scripts/price-conflict-scan');
+const { scan, scanRegistry, numericDifference, requestFacts, PHASES, MAX_OUTPUT } = require('../scripts/price-conflict-scan');
 const NOW = '2026-10-27T02:00:00Z';
 const COMMIT = 'a'.repeat(40);
 const source = 'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=1.600001&klt=101&fqt=0&beg=20260401&end=20260630&fields1=f1%2Cf2%2Cf3%2Cf4%2Cf5%2Cf6&fields2=f51%2Cf52%2Cf53%2Cf54%2Cf55%2Cf56%2Cf57%2Cf58%2Cf59%2Cf60%2Cf61';
@@ -120,4 +120,76 @@ test('CLI refuses local real scans and forbids output inside input data', t => {
   assert.equal(local.status, 1); assert.match(local.stdout, /DIAGNOSTIC_REQUIRES_ACTIONS/);
   const inside = spawnSync(process.execPath, [cli, '--data', root, '--output', path.join(root, 'result.json')], { encoding: 'utf8', env: { ...process.env, GITHUB_ACTIONS: 'true' } });
   assert.equal(inside.status, 1); assert.match(inside.stdout, /DIAGNOSTIC_OUTPUT_INSIDE_SOURCE/);
+});
+test('full registry keeps complete conflicts and partial extremes across pages without fund bodies', t => {
+  const root = fixture(t, quarter => [
+    makeFund('000001', 'CN', '600001', quarter, 1, 2),
+    makeFund('000002', 'CN', '600001', quarter, .9, 2.1),
+    makeFund('000003', 'HK', '00700', quarter, 1, 2),
+    makeFund('000004', 'HK', '00700', quarter, .5, 3, source, 'partial'),
+    makeFund('000005', 'US', 'AAPL', quarter, 1, 2),
+    makeFund('000006', 'US', 'AAPL', quarter, 1.1, 1.9, source, 'partial')]);
+  const before = treeBytes(root), result = scanRegistry(root, '2026Q2', { now: NOW, dataCommit: COMMIT });
+  assert.deepEqual(treeBytes(root), before); assert.equal(result.records.length, 2);
+  assert.deepEqual(result.records.map(row => row.key.split('|')[0]), ['CN', 'HK']);
+  assert.ok(result.records.every(row => row.groups.length === 2));
+  const serialized = JSON.stringify(result);
+  assert.equal(serialized.includes('MUST_NOT_LEAK_RAW_INPUT'), false);
+  assert.equal(serialized.includes('reportRetrievedAt'), false); assert.equal(serialized.includes('fundCode'), false);
+  assert.ok(result.records.every(row => row.groups.every(group => group.observations[0].fetchedAt === '2026-10-26T10:00:00Z')));
+});
+test('registry deduplicates copied funds and Yahoo retrieval-day changes without dropping original source times', t => {
+  const yahoo = day => `https://query1.finance.yahoo.com/v8/finance/chart/600001.SS?period1=1775001600&period2=${day}&interval=1d&events=splits&includeAdjustedClose=false`;
+  const root = fixture(t, quarter => [makeFund('000001', 'CN', '600001', quarter, 1, 2),
+    makeFund('000002', 'CN', '600001', quarter, .9, 2.1, yahoo(1792972800)),
+    makeFund('000003', 'CN', '600001', quarter, .9, 2.1, yahoo(1793059200).replace('query1.', 'query2.')),
+    makeFund('000004', 'CN', '600001', quarter, .9, 2.1, yahoo(1792972800))]);
+  const row = scanRegistry(root, '2026Q2', { now: NOW }).records[0];
+  assert.equal(row.groups.length, 2);
+  const group = row.groups.find(group => group.price.low === .9);
+  assert.equal(group.occurrenceCount, 3); assert.equal(group.observations.length, 2);
+  assert.notEqual(group.observations[0].sourceUrl, group.observations[1].sourceUrl);
+});
+test('registry excludes invalid future partial quotes and fails explicitly at the per-key fact limit', t => {
+  const futureRoot = fixture(t, quarter => {
+    const future = makeFund('000003', 'CN', '600001', quarter, .1, 5, source, 'partial');
+    future.rows[0].priceRange.fetchedAt = '2026-10-28T12:00:00Z';
+    return [makeFund('000001', 'CN', '600001', quarter, 1, 2), future];
+  });
+  assert.equal(scanRegistry(futureRoot, '2026Q2', { now: NOW }).records.length, 0);
+  const root = fixture(t, quarter => Array.from({ length: 33 }, (_, index) =>
+    makeFund(String(100000 + index), 'CN', '600001', quarter, 1, 2 + index)));
+  assert.throws(() => scanRegistry(root, '2026Q2', { now: NOW }), /DIAGNOSTIC_FACT_LIMIT/);
+});
+test('registry expands validated retained witnesses even when the local quote or other fund is absent', t => {
+  for (const missing of [false, true]) {
+    const root = fixture(t, quarter => {
+      const a = makeFund('000001', 'CN', '600001', quarter, 1, 2);
+      const b = makeFund('000002', 'CN', '600001', quarter, .9, 2.1, 'https://example.org/second');
+      b.retrievedAt = b.rows[0].priceRange.fetchedAt = '2026-10-26T11:00:00+00:00';
+      require('../lib/reuse-prices').reuseCompletePrices([a, b], { phase: PHASES[quarter], now: NOW, recoverPrice() { assert.fail('no quote reuse'); } });
+      if (missing) {
+        const price = a.rows[0].priceRange;
+        a.rows[0].priceRange = { status: 'missing', rangeStart: price.rangeStart, rangeEnd: price.rangeEnd,
+          currency: price.currency, globalPriceConflict: price.globalPriceConflict };
+      }
+      return [a];
+    });
+    const before = treeBytes(root), row = scanRegistry(root, '2026Q2', { now: NOW }).records[0];
+    assert.deepEqual(treeBytes(root), before); assert.equal(row.groups.length, 2);
+    assert.ok(row.groups.every(group => group.occurrenceCount === 1));
+    assert.deepEqual(row.groups.map(group => group.observations[0].fetchedAt).sort(), ['2026-10-26T10:00:00Z', '2026-10-26T11:00:00+00:00']);
+  }
+});
+test('tampered retained witness cannot introduce missing source facts into the registry', t => {
+  for (const tamper of [marker => { marker.facts[0].price.low *= .5; },
+    marker => { marker.key = marker.key.replace('600001', '600002'); },
+    marker => { marker.facts[0].fetchedAt = '2026-10-28T11:00:00Z'; }]) {
+    const root = fixture(t, quarter => {
+      const a = makeFund('000001', 'CN', '600001', quarter, 1, 2), b = makeFund('000002', 'CN', '600001', quarter, .9, 2.1);
+      require('../lib/reuse-prices').reuseCompletePrices([a, b], { phase: PHASES[quarter], now: NOW, recoverPrice() { assert.fail(); } });
+      tamper(a.rows[0].priceRange.globalPriceConflict); return [a];
+    });
+    assert.deepEqual(scanRegistry(root, '2026Q2', { now: NOW }).records, []);
+  }
 });

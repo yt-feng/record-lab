@@ -4,9 +4,11 @@ import datetime as dt
 import hashlib
 import io
 import json
+import signal
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 import warnings
 from unittest.mock import patch
@@ -188,6 +190,124 @@ class UniverseVerificationTests(unittest.TestCase):
         with self.assertRaises(verify.VerificationError) as raised:
             verify.NoRedirect().redirect_request(None, None, 302, None, None, 'https://example.org/')
         self.assertEqual(raised.exception.code, 'HTTP_REJECTED')
+
+    def test_transient_network_and_timeout_retry_then_success_with_one_shared_budget(self):
+        class Response(io.BytesIO):
+            status = 200
+            headers = {}
+        with patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch.object(verify, 'build_opener') as opener, \
+                patch.object(verify.time, 'sleep') as sleep:
+            opener.return_value.open.side_effect = [verify.URLError('temporary'), TimeoutError(), Response(b'synthetic workbook bytes')]
+            self.assertEqual(verify.download_official(), b'synthetic workbook bytes')
+            self.assertEqual(opener.return_value.open.call_count, 3)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+            self.assertEqual({call.args[0].full_url for call in opener.return_value.open.call_args_list},
+                             {verify.quote(verify.SOURCE_URL, safe=':/')})
+
+    def test_failed_partial_stream_is_discarded_before_bounded_retry(self):
+        class Broken(io.BytesIO):
+            status = 200
+            headers = {}
+            def read(self, _size):
+                if self.tell() == 0: self.seek(1); return b'partial-old-bytes'
+                raise OSError('interrupted')
+        class Response(io.BytesIO):
+            status = 200
+            headers = {}
+        bad = Broken(b'x'); good = Response(b'new-complete-bytes')
+        with patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch.object(verify, 'build_opener') as opener, \
+                patch.object(verify.time, 'sleep'):
+            opener.return_value.open.side_effect = [bad, good]
+            self.assertEqual(verify.download_official(), b'new-complete-bytes')
+            self.assertEqual(opener.return_value.open.call_count, 2)
+        self.assertTrue(bad.closed); self.assertTrue(good.closed)
+
+    def test_network_failure_stops_at_three_attempts_with_fixed_public_error(self):
+        with patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch.object(verify, 'build_opener') as opener, \
+                patch.object(verify.time, 'sleep') as sleep:
+            opener.return_value.open.side_effect = verify.URLError('unpublished transport details')
+            with self.assertRaises(verify.VerificationError) as error: verify.download_official()
+            self.assertEqual(error.exception.code, 'NETWORK_ERROR')
+            self.assertEqual(str(error.exception), 'NETWORK_ERROR')
+            self.assertEqual(opener.return_value.open.call_count, 3)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+
+    def test_http_rejection_empty_or_oversize_responses_do_not_retry(self):
+        class Response(io.BytesIO):
+            status = 200
+            headers = {}
+        for status, data, headers, expected in [(503, b'x', {}, 'HTTP_REJECTED'),
+                (200, b'', {}, 'EMPTY_RESPONSE'), (200, b'x', {'Content-Encoding': 'gzip'}, 'HTTP_REJECTED'),
+                (200, b'x', {'Content-Length': str(verify.MAX_DOWNLOAD + 1)}, 'DOWNLOAD_TOO_LARGE')]:
+            response = Response(data); response.status = status; response.headers = headers
+            with patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch.object(verify, 'build_opener') as opener, \
+                    patch.object(verify.time, 'sleep') as sleep:
+                opener.return_value.open.return_value = response
+                with self.assertRaises(verify.VerificationError) as error: verify.download_official()
+                self.assertEqual(error.exception.code, expected)
+                self.assertEqual(opener.return_value.open.call_count, 1); sleep.assert_not_called()
+
+    def test_elapsed_request_and_backoff_share_deadline_and_remaining_connect_timeout(self):
+        class Clock:
+            value = 0.0
+            def now(self): return self.value
+            def sleep(self, delay): self.value += delay
+        clock = Clock(); timeouts = []
+        def fail(_request, timeout):
+            timeouts.append(timeout); clock.value += timeout
+            raise TimeoutError()
+        with patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch.object(verify, 'build_opener') as opener, \
+                patch.object(verify.time, 'monotonic', side_effect=clock.now), patch.object(verify.time, 'sleep', side_effect=clock.sleep):
+            opener.return_value.open.side_effect = fail
+            with self.assertRaises(verify.VerificationError) as error: verify.download_official()
+            self.assertEqual(error.exception.code, 'TIMEOUT')
+        self.assertEqual(timeouts, [20, 20, 17])
+        self.assertEqual(clock.value, 60)
+
+    def test_hard_deadline_interrupts_slow_read_and_restores_handler_without_retry(self):
+        class SlowResponse(io.BytesIO):
+            status = 200
+            headers = {}
+            def read(self, _size): time.sleep(0.3); return b''
+        before = signal.getsignal(signal.SIGALRM); response = SlowResponse(b'')
+        with patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch.object(verify, 'build_opener') as opener, \
+                patch.object(verify, 'DOWNLOAD_DEADLINE_SECONDS', 0.03):
+            opener.return_value.open.return_value = response
+            started = time.monotonic()
+            with self.assertRaises(verify.VerificationError) as error: verify.download_official()
+            elapsed = time.monotonic() - started
+            self.assertEqual(error.exception.code, 'TIMEOUT'); self.assertLess(elapsed, 0.25)
+            self.assertEqual(opener.return_value.open.call_count, 1)
+        self.assertTrue(response.closed)
+        self.assertIs(signal.getsignal(signal.SIGALRM), before)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+
+    def test_existing_outer_alarm_and_non_main_thread_are_not_replaced(self):
+        with patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), \
+                patch.object(verify.signal, 'getitimer', return_value=(0.5, 0)), \
+                patch.object(verify.signal, 'setitimer') as timer, patch.object(verify.signal, 'signal') as handler, \
+                patch.object(verify, 'build_opener') as opener:
+            with self.assertRaises(verify.VerificationError): verify.download_official()
+            timer.assert_not_called(); handler.assert_not_called(); opener.assert_not_called()
+        with patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), \
+                patch.object(verify.threading, 'current_thread', return_value=object()), \
+                patch.object(verify.signal, 'setitimer') as timer, patch.object(verify, 'build_opener') as opener:
+            with self.assertRaises(verify.VerificationError): verify.download_official()
+            timer.assert_not_called(); opener.assert_not_called()
+
+    def test_hash_or_schema_failure_after_download_never_retries_transport(self):
+        import historical_universe as history
+        class Response(io.BytesIO):
+            status = 200
+            headers = {}
+        for data, code in [(b'changed source', 'SOURCE_HASH_MISMATCH'), (workbook(), 'HISTORICAL_SCHEMA_MISMATCH')]:
+            with patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch.object(verify, 'build_opener') as opener, \
+                    patch.object(verify.time, 'sleep') as sleep, \
+                    patch.object(history, 'SOURCE_HASH', hashlib.sha256(data).hexdigest() if code != 'SOURCE_HASH_MISMATCH' else history.SOURCE_HASH):
+                opener.return_value.open.return_value = Response(data)
+                with self.assertRaises(history.HistoricalUniverseError) as error: history.fetch_official_overlay()
+                self.assertEqual(error.exception.code, code)
+                self.assertEqual(opener.return_value.open.call_count, 1); sleep.assert_not_called()
 
     def test_cloud_main_writes_only_guarded_summary_and_fixed_error_categories(self):
         success = verify.run_verification(fetch=workbook, now=NOW)

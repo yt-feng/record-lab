@@ -1,0 +1,70 @@
+name: Recheck bounded security price conflicts
+on:
+  workflow_dispatch:
+    inputs:
+      data_commit:
+        description: Published data commit to inspect
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: recheck-price-conflicts
+  cancel-in-progress: false
+jobs:
+  recheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/*/
+            /scripts/
+            /lib/
+            /config/
+            /web/*.js
+            /tests/
+            /.github/
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.data_commit }}
+          path: .cache/conflict-source
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /web/data/periods/2026Q2/latest.json
+            /web/data/periods/2026Q2/analysis.json
+            /web/data/periods/2026Q2/price-conflict-ledger.json
+            /web/data/periods/2026Q2/companies/
+            /web/data/periods/2026Q3/latest.json
+            /web/data/periods/2026Q3/analysis.json
+            /web/data/periods/2026Q3/price-conflict-ledger.json
+            /web/data/periods/2026Q3/companies/
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Validate ledger and source-bound requests
+        run: |
+          node --test tests/test_price_conflict_scan.js
+          python -m unittest discover -s tests -p 'test_price_conflicts.py'
+      - name: Scan published conflicts and recheck up to eight keys
+        run: |
+          export PRICE_DIAGNOSTIC_DATA_COMMIT="$(git -C .cache/conflict-source rev-parse HEAD)"
+          python scripts/price_conflicts.py run --data .cache/conflict-source/web/data/periods --output .cache/price-conflicts --quarters both --max-keys 8 --max-requests 16
+      - name: Retain guarded conflict ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: price-conflict-ledger-verification
+          path: .cache/price-conflicts/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7

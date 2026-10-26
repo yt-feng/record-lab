@@ -132,7 +132,8 @@
         const row = element('tr'); const first = element('td'); const button = element('button', `${stock.stockName} ${stock.stockCode}`, 'text-button');
         button.addEventListener('click', () => showStock(stock)); first.append(button, element('small', stock.market, 'cell-sub')); row.append(first);
         const prices = stock.priceRange;
-        const priceCoverage = prices?.coverageVersion === 2 && prices?.completeness === 'complete'
+        const conflictPending = prices?.conflictingObservations === true || (prices && Object.hasOwn(prices, 'globalPriceConflict'));
+        const priceCoverage = conflictPending ? '存在来源冲突待核验' : prices?.coverageVersion === 2 && prices?.completeness === 'complete'
           ? '交易日完整' : '已观测，完整区间待补全';
         const interval = prices?.status === 'observed' && finite(prices.low) && finite(prices.high)
           ? `${priceNumber(prices.low)} — ${priceNumber(prices.high)} ${prices.currency} · ${priceCoverage}` : '未取得可比较区间';

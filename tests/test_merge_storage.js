@@ -110,6 +110,33 @@ test('global prices are sealed across components before reuse; a late conflictin
   assert.equal(conflict.counts.partialConflictRowCount, 1); assert.equal(conflict.counts.reusedPriceFundCount, 0);
 });
 
+test('conflict-only metadata is published atomically without any new report, quote request, or timestamps', t => {
+  const state = setup(t);
+  const old = mergeSnapshots({ snapshots: [snapshot('000001', { kind: 'complete' }), snapshot('000003', { kind: 'complete', low: 9 })],
+    config, catalog, now, reusePrices: false });
+  fs.mkdirSync(path.join(state.data, 'companies'));
+  for (const [key, value] of Object.entries(old.companySnapshots)) fs.writeFileSync(path.join(state.data, 'companies', key + '.json'), JSON.stringify(value));
+  fs.writeFileSync(path.join(state.data, 'latest.json'), JSON.stringify(old.manifest));
+  const before = funds(old.companySnapshots);
+  input(state, []);
+  const result = run(state, { receiptCodes: ['000001', '000003'] });
+  assert.equal(result.changed, true); assert.equal(result.counts.conflictMarkedFundCount, 2);
+  assert.equal(result.counts.acceptedFreshFundCount, 0); assert.equal(result.counts.acceptedPricePatchCount, 0);
+  assert.equal(result.counts.reusedPriceFundCount, 0); assert.equal(result.manifest.coverage.priceComplete, 0);
+  assert.deepEqual(result.receipt.pricePatches, []);
+  const after = funds(saved(state, result.manifest));
+  after.forEach((fund, index) => {
+    assert.ok(fund.rows[0].priceRange.globalPriceConflict);
+    delete fund.rows[0].priceRange.globalPriceConflict;
+    assert.deepEqual(fund, before[index]);
+  });
+  const bytes = fs.readFileSync(path.join(state.data, 'latest.json'));
+  const replay = run(state);
+  assert.equal(replay.changed, false); assert.equal(replay.counts.conflictingPriceKeyCount, 1);
+  assert.equal(replay.counts.conflictMarkedFundCount, 0);
+  assert.deepEqual(fs.readFileSync(path.join(state.data, 'latest.json')), bytes);
+});
+
 test('price-only patches retain report timestamps, budget receipts and exact bindings through disk storage', t => {
   const state = setup(t), first = equivalent(state, [snapshot('000001')]);
   const original = funds(saved(state, first.manifest))[0], binding = bindingFor(original, config);

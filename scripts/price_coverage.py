@@ -71,6 +71,11 @@ def valid_complete_price(value, market, code, start, end):
                 and value.get('missingSessionDates') == [] and value.get('unexpectedSessionDates') == [])
 
 
+def valid_usable_complete_price(value, market, code, start, end):
+    """Original complete sessions remain intact, but unresolved sources do not pass acceptance."""
+    return valid_complete_price(value, market, code, start, end) and 'globalPriceConflict' not in value
+
+
 def price_series(code, market, currency, provider, source_url, rows, start, end):
     result = {'stockCode': code, 'market': market, 'currency': currency, 'priceBasis': 'unadjusted',
               'provider': provider, 'sourceUrl': source_url, 'sourceUrls': [source_url], 'rows': list(rows),

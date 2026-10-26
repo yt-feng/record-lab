@@ -323,6 +323,9 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
             if (change.sharesDelta !== null) stock.comparableSharesDelta = (stock.comparableSharesDelta ?? 0) + change.sharesDelta;
           }
         }
+        // A global witness can outlive a source removed by portfolio
+        // deduplication. Retain its unresolved state even for a missing quote.
+        if (row.priceRange && Object.hasOwn(row.priceRange, 'globalPriceConflict')) stock._completePriceConflict = true;
         const price = priceFor(row.priceRange, row, phase);
         if (price) {
           priceRows++; stock._priceSources.add(price.sourceUrl); stock._prices.add(`${price.low}:${price.high}`);
@@ -371,7 +374,7 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
     stock.priceRange.sourceUrls = [...stock._priceSources].sort().slice(0, 8);
     stock.priceRange.sourceCount = stock._priceSources.size;
     stock.priceRange.sourceUrlsTruncated = stock._priceSources.size > 8;
-    stock.priceRange.conflictingObservations = stock._prices.size > 1;
+    stock.priceRange.conflictingObservations = stock._completePriceConflict || stock._prices.size > 1;
     if (stock._completePrice) {
       const complete = stock._completePrice;
       // A narrower partial observation can agree with a complete interval. Two
@@ -418,7 +421,7 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
     && !unknownIdentityHoldingRecords && !conflicts && !invalidRows && !reportOnlyRecords && !coverage.managerEvidenceMissingRecords
     && !coverage.incompletePriceStocks && !coverage.strategySectionIncompleteRecords
     && inputRecords === manifest.coverage?.fundCount) { coverage.status = 'complete'; coverage.complete = true; }
-  const output = { schemaVersion: 1, analysisVersion: 6, kind: 'quarter-analysis', targetPeriodEnd: phase.target, baselinePeriodEnd: phase.baseline,
+  const output = { schemaVersion: 1, analysisVersion: 7, kind: 'quarter-analysis', targetPeriodEnd: phase.target, baselinePeriodEnd: phase.baseline,
     asOf: manifest.asOf, retrievedAt: manifest.retrievedAt, priceUpdatedAt: manifest.priceUpdatedAt || null,
     generatedAt: phase.generation, generation: phase.generation, coverage,
     stocks: ordered, portfolioFiles,

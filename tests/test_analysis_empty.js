@@ -39,7 +39,7 @@ test('all-failed initial Q2 and Q3 merges generate valid empty analysis with nul
     const original = structuredClone(manifest);
     const result = analyze(manifest, { progress: { phase: config(id), completionStatus: 'complete', processedFunds: 1,
       research: { completeFunds: 0, applicableFunds: 0 } } });
-    assert.equal(result.analysisVersion, 6);
+    assert.equal(result.analysisVersion, 7);
     assert.equal(result.coverage.status, 'awaiting-data');
     assert.equal(result.coverage.complete, false);
     assert.equal(result.coverage.historicalUniverseVerified, false);

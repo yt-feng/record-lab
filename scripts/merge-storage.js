@@ -145,7 +145,8 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
     const funds = [], receipt = { schemaVersion: 1, phase: { targetPeriodEnd: config.targetPeriodEnd, baselinePeriodEnd: config.baselinePeriodEnd },
       generatedAt: current.toISOString(), requestedCodes: [...requested].sort(), funds: [], pricePatches: [] };
     const counts = { acceptedFreshFundCount: 0, acceptedPricePatchCount: 0, acceptedInceptionPatchCount: 0,
-      migratedBootstrapFundCount: 0, reusedPriceRowCount: 0, reusedPriceFundCount: 0, partialConflictRowCount: 0 };
+      migratedBootstrapFundCount: 0, reusedPriceRowCount: 0, reusedPriceFundCount: 0, partialConflictRowCount: 0,
+      conflictMarkedRowCount: 0, conflictMarkedFundCount: 0, conflictingPriceRowCount: 0 };
     for (const group of groups.values()) {
       // Each component is bounded before any of its records are parsed.
       const records = [];
@@ -203,7 +204,7 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
     for (const entry of funds.sort((a, b) => a.companyId.localeCompare(b.companyId) || a.code.localeCompare(b.code))) {
       const fund = readJson(entry.file);
       const applied = applyPriceIndex(priceIndex, [fund], recoverPrice);
-      for (const key of ['reusedPriceRowCount', 'reusedPriceFundCount', 'partialConflictRowCount']) counts[key] += applied[key];
+      for (const key of ['reusedPriceRowCount', 'reusedPriceFundCount', 'partialConflictRowCount', 'conflictMarkedRowCount', 'conflictMarkedFundCount', 'conflictingPriceRowCount']) counts[key] += applied[key];
       counts.eligiblePriceKeyCount = applied.eligiblePriceKeyCount; counts.conflictingPriceKeyCount = applied.conflictingPriceKeyCount;
       if (currentCompany !== entry.companyId) {
         flush(); currentCompany = entry.companyId;
@@ -262,7 +263,7 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
       else if (observations.has(old.code) && old.attempted === true) observations.get(old.code).attempted = true;
     }
     receipt.funds = [...observations.values()].sort((a, b) => a.code.localeCompare(b.code));
-    const changed = Boolean(!previousManifest || needsRepartition || ['acceptedFreshFundCount', 'acceptedPricePatchCount', 'acceptedInceptionPatchCount', 'migratedBootstrapFundCount', 'reusedPriceFundCount'].some(key => counts[key]));
+    const changed = Boolean(!previousManifest || needsRepartition || ['acceptedFreshFundCount', 'acceptedPricePatchCount', 'acceptedInceptionPatchCount', 'migratedBootstrapFundCount', 'reusedPriceFundCount', 'conflictMarkedFundCount'].some(key => counts[key]));
     counts.errorCount = errorCount;
     if (changed) Object.assign(counts, { companyCount: companies.size, fundCount: funds.length });
     else delete counts.migratedBootstrapFundCount;

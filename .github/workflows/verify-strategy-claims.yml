@@ -1,0 +1,43 @@
+name: Verify explicit report claims
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: verify-strategy-claims
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /requirements.txt
+            /scripts/*.py
+            /config/*.json
+            /tests/test_strategy_claims.py
+            /tests/test_verify_strategy_claims.py
+            /.github/workflows/verify-strategy-claims.yml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Validate bounded claim extraction without network
+        run: |
+          python -m unittest discover -s tests -p 'test_strategy_claims.py'
+          python -m unittest discover -s tests -p 'test_verify_strategy_claims.py'
+      - name: Check two original PDF strategy sections
+        run: python scripts/verify_strategy_claims.py
+      - name: Retain compact source-linked evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strategy-claims-verification
+          path: .cache/strategy-claims-verification/result.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7

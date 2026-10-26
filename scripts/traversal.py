@@ -12,7 +12,8 @@ from urllib.parse import urlparse, parse_qsl
 from lifecycle import normalize_lifecycle_evidence
 from report_managers import normalize_manager_table_coverage, manager_key
 from strategy_sections import normalize_strategy_section_coverage
-from price_coverage import CALENDAR, VERSION as PRICE_COVERAGE_VERSION, valid_complete_price
+from price_coverage import CALENDAR, VERSION as PRICE_COVERAGE_VERSION, valid_usable_complete_price
+from price_consistency import normalize_price_conflict
 from price_patches import valid_binding as valid_price_binding, valid_target as valid_price_target, status_for as price_patch_status
 from source_dates import china_date
 
@@ -408,14 +409,20 @@ def valid_price_coverage(value):
         return False
     count, available, complete = value.get("holdingCount"), value.get("priceAvailable"), value.get("priceComplete")
     missing = missing_stock_objects(value)
+    conflicts = value.get('conflictingStocks', [])
+    conflict_count = value.get('priceConflicted', 0)
     fingerprint = value.get("holdingsIdentity")
     return (value.get("coverageVersion") == PRICE_COVERAGE_VERSION and value.get("calendarId") == CALENDAR["id"]
             and isinstance(count, int) and not isinstance(count, bool) and count >= 0
             and isinstance(available, int) and not isinstance(available, bool) and 0 <= available <= count
             and isinstance(complete, int) and not isinstance(complete, bool) and 0 <= complete <= available
-            and isinstance(missing, list) and len(missing) == count - complete
+            and isinstance(conflicts, list) and type(conflict_count) is int and conflict_count == len(conflicts)
+            and all(stock_key(item) for item in conflicts) and len({stock_key(item) for item in conflicts}) == len(conflicts)
+            and (not conflicts or value.get('consistencyVersion') == 1)
+            and isinstance(missing, list) and len(missing) + len(conflicts) == count - complete
             and all(stock_key(item) for item in missing)
             and len({stock_key(item) for item in missing}) == len(missing)
+            and not ({stock_key(item) for item in missing} & {stock_key(item) for item in conflicts})
             and isinstance(fingerprint, str) and bool(re.fullmatch(r"[a-f0-9]{64}", fingerprint)))
 
 
@@ -430,7 +437,7 @@ def readable_legacy_price_coverage(value):
             and isinstance(value.get('holdingsIdentity'), str) and bool(re.fullmatch(r'[a-f0-9]{64}', value['holdingsIdentity'])))
 
 
-def price_coverage(fund):
+def price_coverage(fund, now=None):
     holdings = fund.get("selectedReport", {}).get("holdings", [])
     if not isinstance(holdings, list) or any(not stock_key(item) for item in holdings):
         return None
@@ -445,11 +452,13 @@ def price_coverage(fund):
         for row in fund.get("rows", []):
             if isinstance(row, dict) and row.get("previous") is not None and stock_key(row):
                 stocks[stock_key(row)] = {"stockCode": row["stockCode"], "market": row["market"]}
-    observed, complete = set(), set()
+    observed, complete, conflicts = set(), set(), set()
     for row in fund.get("rows", []):
         key = stock_key(row)
         price = row.get("priceRange", {}) if isinstance(row, dict) else {}
         low, high = price.get("low"), price.get("high")
+        if key in stocks and normalize_price_conflict(price.get('globalPriceConflict'), stocks[key]['market'], stocks[key]['stockCode'], start, end, now=now):
+            conflicts.add(key)
         if (key in stocks and price.get("status") == "observed" and price.get("priceBasis") == "unadjusted"
                 and public_url(price.get("sourceUrl")) and isinstance(low, (int, float)) and not isinstance(low, bool)
                 and isinstance(high, (int, float)) and not isinstance(high, bool) and 0 < low <= high < float('inf')
@@ -459,11 +468,12 @@ def price_coverage(fund):
                 and date(price.get("observedStart")) and date(price.get("observedEnd"))
                 and start <= price["observedStart"] <= price["observedEnd"] <= end):
             observed.add(key)
-            if valid_complete_price(price, stocks[key]["market"], stocks[key]["stockCode"], start, end):
+            if valid_usable_complete_price(price, stocks[key]["market"], stocks[key]["stockCode"], start, end):
                 complete.add(key)
-    missing = [stocks[key] for key in sorted(set(stocks) - complete)]
-    return {"coverageVersion": PRICE_COVERAGE_VERSION, "calendarId": CALENDAR["id"],
+    missing = [stocks[key] for key in sorted(set(stocks) - complete - conflicts)]
+    return {"coverageVersion": PRICE_COVERAGE_VERSION, "calendarId": CALENDAR["id"], 'consistencyVersion': 1,
             "holdingCount": len(stocks), "priceAvailable": len(observed), "priceComplete": len(complete), "missingStocks": missing,
+            'priceConflicted': len(conflicts), 'conflictingStocks': [stocks[key] for key in sorted(conflicts)],
             "holdingsIdentity": hashlib.sha256("|".join(sorted(stocks)).encode()).hexdigest()}
 
 
@@ -482,14 +492,18 @@ def normalize_enrichment(previous, status, now):
               "totalAttempts": counter(previous.get("totalAttempts"), previous_attempts), "retry": retry_state(None if migrated else previous.get("retry"), last, now),
               "coverageVersion": PRICE_COVERAGE_VERSION, "calendarId": CALENDAR["id"],
               "holdingCount": None, "priceAvailable": None, "priceComplete": None, "missingStocks": [], "holdingsIdentity": None,
+              'consistencyVersion': 1, 'priceConflicted': 0, 'conflictingStocks': [],
               "errorCode": None}
     if status in SUCCESS:
         if valid_price_coverage(previous):
             result.update({key: previous[key] for key in ("holdingCount", "priceAvailable", "priceComplete", "holdingsIdentity")})
             result["missingStocks"] = missing_stock_objects(previous)
+            result['conflictingStocks'] = previous.get('conflictingStocks', [])
+            result['priceConflicted'] = len(result['conflictingStocks'])
         full = result["holdingCount"] is not None and result["priceComplete"] == result["holdingCount"]
-        result["status"] = "not-applicable" if status == "no-equities" and result['holdingCount'] == 0 else "complete" if full else "exhausted" if attempts >= 3 else "pending"
-        result["errorCode"] = None if full else "PRICE_COVERAGE_INCOMPLETE"
+        conflict_only = result['priceConflicted'] and not result['missingStocks']
+        result["status"] = "not-applicable" if status == "no-equities" and result['holdingCount'] == 0 else "complete" if full else 'conflict' if conflict_only else "exhausted" if attempts >= 3 else "pending"
+        result["errorCode"] = None if full else 'PRICE_SOURCE_CONFLICT' if conflict_only else "PRICE_COVERAGE_INCOMPLETE"
     return result
 
 
@@ -507,15 +521,28 @@ def apply_coverage(state, coverage):
         return
     missing = missing_stock_objects(coverage)
     available = coverage["priceAvailable"]
+    conflicts = {stock_key(item): item for item in coverage.get('conflictingStocks', [])}
     if valid_price_coverage(current) and current["holdingsIdentity"] == coverage["holdingsIdentity"]:
         still_missing = {stock_key(item) for item in missing_stock_objects(current)}
         missing = [item for item in missing if stock_key(item) in still_missing]
         available = max(available, current["priceAvailable"])
-    complete = coverage["holdingCount"] - len(missing)
+        # A delayed single-source receipt cannot resolve a witnessed conflict.
+        conflicts.update({stock_key(item): item for item in current.get('conflictingStocks', [])})
+    missing = [item for item in missing if stock_key(item) not in conflicts]
+    complete = coverage["holdingCount"] - len(missing) - len(conflicts)
     current.update({key: coverage[key] for key in ("coverageVersion", "calendarId", "holdingCount", "holdingsIdentity")})
-    current.update({"missingStocks": missing, "priceAvailable": max(available, complete), "priceComplete": complete})
-    current["status"] = "not-applicable" if state['status'] == 'no-equities' and coverage['holdingCount'] == 0 else "complete" if not missing else "exhausted" if current["attempts"] >= 3 else "pending"
-    current["errorCode"] = None if not missing else "PRICE_COVERAGE_INCOMPLETE"
+    current.update({"missingStocks": missing, "priceAvailable": max(available, complete), "priceComplete": complete,
+                    'consistencyVersion': 1, 'priceConflicted': len(conflicts), 'conflictingStocks': [conflicts[key] for key in sorted(conflicts)]})
+    current["status"] = "not-applicable" if state['status'] == 'no-equities' and coverage['holdingCount'] == 0 else 'conflict' if not missing and conflicts else "complete" if not missing else "exhausted" if current["attempts"] >= 3 else "pending"
+    current["errorCode"] = 'PRICE_SOURCE_CONFLICT' if not missing and conflicts else None if not missing else "PRICE_COVERAGE_INCOMPLETE"
+    quality = state.get('quality')
+    if conflicts and isinstance(quality, dict) and isinstance(quality.get('fields'), dict):
+        quality['fields']['prices'] = 'partial'
+        quality['priceConflictOnly'] = not missing
+        quality['priceConsistencyVersion'] = 1
+        quality['missingFields'] = [key for key in QUALITY_FIELDS if quality['fields'].get(key) not in QUALITY_ACCEPTED]
+        if quality['missingFields'] == ['prices'] and not missing:
+            quality['status'] = 'conflict'
 
 
 def normalize_quality(previous, status, now, code=None):
@@ -567,19 +594,22 @@ def normalize_quality(previous, status, now, code=None):
     if not instant(last) or instant(last) > now + dt.timedelta(minutes=5):
         last = None
     missing = [key for key in QUALITY_FIELDS if fields[key] not in QUALITY_ACCEPTED]
+    conflict_only = previous.get('priceConflictOnly') is True and fields['prices'] not in QUALITY_ACCEPTED
+    actionable_missing = [key for key in missing if key != 'prices' or not conflict_only]
     result = {"fields": fields, "missingFields": missing, "attempts": attempts, "lastAttemptAt": last,
               "managerAttempts": manager_attempts, "managerTotalAttempts": counter(previous.get("managerTotalAttempts"), counter(previous.get("managerAttempts"))),
               "managerLastAttemptAt": manager_last,
               "strategyAttempts": strategy_attempts, "strategyTotalAttempts": counter(previous.get("strategyTotalAttempts"), counter(previous.get("strategyAttempts"))),
               "strategyLastAttemptAt": strategy_last, "strategySectionCoverageVersion": STRATEGY_SECTION_COVERAGE_VERSION,
               "managerTableCoverageVersion": MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2,
+              'priceConsistencyVersion': 1, 'priceConflictOnly': conflict_only,
               "priceUniverseEmpty": previous.get("priceUniverseEmpty") is True,
               "totalAttempts": counter(previous.get("totalAttempts"), attempts), "retry": retry_state(previous.get("retry"), last, now),
               "pdfRetryable": previous.get("pdfRetryable") is not False,
-              "status": "complete" if not missing else "pending" if (
-                  any(key not in {"managers", "strategy"} for key in missing) and attempts < QUALITY_MAX_ATTEMPTS
-                  or "managers" in missing and manager_attempts < MANAGER_MAX_ATTEMPTS
-                  or "strategy" in missing and strategy_attempts < STRATEGY_MAX_ATTEMPTS) else "exhausted"}
+              "status": "complete" if not missing else 'conflict' if not actionable_missing else "pending" if (
+                  any(key not in {"managers", "strategy"} for key in actionable_missing) and attempts < QUALITY_MAX_ATTEMPTS
+                  or "managers" in actionable_missing and manager_attempts < MANAGER_MAX_ATTEMPTS
+                  or "strategy" in actionable_missing and strategy_attempts < STRATEGY_MAX_ATTEMPTS) else "exhausted"}
     if baseline_exempt and fields["baseline"] == "not-applicable":
         result["baselineExemption"] = {key: baseline_exemption[key] for key in ("reason", "date", "sourceUrl", "fundCode", "baselinePeriodEnd", "periodEnd")}
         if baseline_exemption.get('inceptionEvidence'):
@@ -776,15 +806,17 @@ def report_quality(fund, phase, now):
         fields["baseline"] = "complete"
     elif valid_baseline_exemption(baseline_exemption, now):
         fields["baseline"] = "not-applicable"
-    coverage = price_coverage(fund)
+    coverage = price_coverage(fund, now)
     if valid_price_coverage(coverage):
         if coverage['holdingCount'] == 0 and fund.get('status') == 'no-equities':
             fields['prices'] = 'not-applicable'
         elif coverage['holdingCount'] > 0:
-            fields["prices"] = "complete" if coverage["priceComplete"] == coverage["holdingCount"] else "partial" if coverage["priceAvailable"] else "missing"
+            fields["prices"] = "complete" if coverage["priceComplete"] == coverage["holdingCount"] else "partial" if coverage["priceAvailable"] or coverage.get('priceConflicted') else "missing"
     result = {"fields": fields, "managerTableCoverageVersion": MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2,
               "strategySectionCoverageVersion": STRATEGY_SECTION_COVERAGE_VERSION,
               "priceUniverseEmpty": bool(coverage and coverage['holdingCount'] == 0),
+              'priceConsistencyVersion': 1,
+              'priceConflictOnly': bool(coverage and coverage.get('priceConflicted') and not coverage['missingStocks']),
               "pdfRetryable": not report.get("parseMethod") and report.get("parseErrorCode") in (None, *RECOVERABLE_ERRORS)}
     if fields["baseline"] == "not-applicable" and valid_baseline_exemption(baseline_exemption, now):
         result["baselineExemption"] = baseline_exemption
@@ -796,19 +828,19 @@ def quality_eligible(states):
             and not state.get("deferredUntil")
             and state["attribution"] != "portfolio-evidence" and state.get("representativeCode", code) == code
             and state["quality"]["status"] == "pending" and (
-                any(field not in {"managers", "strategy"} for field in state["quality"]["missingFields"]) and state["quality"]["attempts"] < QUALITY_MAX_ATTEMPTS
+                any(field not in {"managers", "strategy"} and (field != 'prices' or not state['quality'].get('priceConflictOnly')) for field in state["quality"]["missingFields"]) and state["quality"]["attempts"] < QUALITY_MAX_ATTEMPTS
                 or "managers" in state["quality"]["missingFields"] and state["quality"]["managerAttempts"] < MANAGER_MAX_ATTEMPTS
                 or "strategy" in state["quality"]["missingFields"] and state["quality"]["strategyAttempts"] < STRATEGY_MAX_ATTEMPTS)]
 
 
 def manager_only_repair(quality):
     return ("managers" in quality["missingFields"] and quality["managerAttempts"] < MANAGER_MAX_ATTEMPTS
-            and (quality["missingFields"] == ["managers"] or quality["attempts"] >= QUALITY_MAX_ATTEMPTS))
+            and ([field for field in quality["missingFields"] if field != 'prices' or not quality.get('priceConflictOnly')] == ["managers"] or quality["attempts"] >= QUALITY_MAX_ATTEMPTS))
 
 
 def strategy_only_repair(quality):
     return ("strategy" in quality["missingFields"] and quality["strategyAttempts"] < STRATEGY_MAX_ATTEMPTS
-            and (quality["missingFields"] == ["strategy"] or quality["attempts"] >= QUALITY_MAX_ATTEMPTS))
+            and ([field for field in quality["missingFields"] if field != 'prices' or not quality.get('priceConflictOnly')] == ["strategy"] or quality["attempts"] >= QUALITY_MAX_ATTEMPTS))
 
 
 def valid_quality(value, phase=None):
@@ -834,7 +866,10 @@ def merge_quality_observation(previous, observation):
                 incoming[field] = previous["fields"].get(field, "missing")
             elif incoming[field] == "complete":
                 incoming[field] = "partial"
+    if previous.get('priceConflictOnly') is True:
+        incoming['prices'] = 'partial'
     return {**previous, **observation, "fields": incoming,
+            'priceConsistencyVersion': 1, 'priceConflictOnly': previous.get('priceConflictOnly') is True or observation.get('priceConflictOnly') is True,
             "strategySectionCoverageVersion": STRATEGY_SECTION_COVERAGE_VERSION,
             "managerTableCoverageVersion": MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2}
 
@@ -845,7 +880,7 @@ def hydrate_quality(states, retained, phase, now):
         quality = report_quality(fund, phase, now)
         if quality is None:
             continue
-        coverage = price_coverage(fund)
+        coverage = price_coverage(fund, now)
         codes = [fund["code"]]
         classes = fund.get("shareClassCodes")
         canonical = fund.get("sourcePortfolioCode")
@@ -1292,7 +1327,7 @@ def build_status(config, snapshot=None, now=None):
             if not proof:
                 continue
             status, evidence = proof
-            coverage = price_coverage(fund)
+            coverage = price_coverage(fund, current)
             observed[fund["code"]] = (status, evidence, coverage)
             classes = fund.get("shareClassCodes", [])
             canonical = fund.get("sourcePortfolioCode")
@@ -1899,6 +1934,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
             "research": {"enabled": quality_enabled(config), "applicableFunds": applicable, "completeFunds": research_complete,
                          "sixFieldsCompleteFunds": six_fields_complete,
                          "incompleteFunds": applicable - research_complete, "pendingFunds": research_pending,
+                         'priceConflictFunds': sum(bool(state['enrichment'].get('priceConflicted')) for state in all_states),
                          "exhaustedFunds": research_exhausted, "maxAttempts": QUALITY_MAX_ATTEMPTS,
                          "managerMaxAttempts": MANAGER_MAX_ATTEMPTS,
                          "strategyMaxAttempts": STRATEGY_MAX_ATTEMPTS,
@@ -1907,6 +1943,8 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
             "enrichment": {"pendingFunds": sum(item["status"] == "pending" for item in enrichment_states),
                            "completeFunds": sum(item["status"] == "complete" for item in enrichment_states),
                            "exhaustedFunds": sum(item["status"] == "exhausted" for item in enrichment_states),
+                           'conflictFunds': sum(bool(item.get('priceConflicted')) for item in enrichment_states),
+                           'conflictingStocks': sum(item.get('priceConflicted', 0) for item in enrichment_states),
                            "attemptedFunds": sum(item["attempts"] > 0 for item in enrichment_states),
                            "attempts": sum(item["attempts"] for item in enrichment_states), "maxAttempts": 3},
             "companies": company_rows,
