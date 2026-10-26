@@ -39,11 +39,11 @@ def quality(*_):
     return {"fields": {"holdings": "complete", "managers": "complete", "strategy": "complete"}}
 
 
-def strategy_details(sample):
+def strategy_details(sample, with_outlook=False):
     from strategy_sections import parse_strategy_sections
     quarter = (int(sample["periodEnd"][5:7]) - 1) // 3 + 1
     pages = [f"合成基金2026年第{quarter}季度报告\n4.4 报告期内基金的投资策略和运作分析\n本季度经济和市场回暖。我们增加债券配置，因为估值较为合理。",
-             "未来本基金将关注科技方向。\n4.5 报告期内基金的业绩表现\n合成结束"]
+             ("未来本基金将关注科技方向。" if with_outlook else "") + "\n4.5 报告期内基金的业绩表现\n合成结束"]
     return parse_strategy_sections(pages, sample, page_numbers=sample["strategyPages"])
 
 
@@ -153,7 +153,7 @@ class VerifyRepairTests(unittest.TestCase):
                 pages[page - 1] = header + f"{name} 本基金基金经理 {start} {end or '-'} 13年\n"
             pages[sample["managerRows"][-1][3] - 1] += "4.2 运作说明"
             pages[6] = "4.4 报告期内基金的投资策略和运作分析\n本季度经济和市场回暖。我们增加债券配置，因为估值较为合理。"
-            pages[7] = "未来本基金将关注科技方向。\n4.5 报告期内基金的业绩表现\n合成结束"
+            pages[7] = "4.5 报告期内基金的业绩表现\n合成结束"
             details = _details_for_pages(pages, sample["sourceUrl"], sample["periodEnd"], sample["kind"],
                                          lambda *_: {"navYuan": 10000}, total_pages=8, published_at=sample["publishedAt"])
             details["parseMethod"] = "pypdf"
@@ -171,13 +171,14 @@ class VerifyRepairTests(unittest.TestCase):
             self.assertEqual(result["status"], "passed")
             self.assertEqual(result["observed"]["strategy"]["pages"], [7, 8])
             self.assertFalse(result["observed"]["strategy"]["semanticAnalysisComplete"])
+            self.assertEqual(result["observed"]["strategy"]["sentenceCounts"]["outlook"], 0)
             self.assertNotIn("市场回暖", json.dumps(result, ensure_ascii=False))
             for field, value in [("complete", False), ("periodStart", "2026-01-01"),
                                  ("sourceUrl", "https://example.org/other.pdf"), ("publishedAt", "2026-10-25")]:
                 broken = normalized(sample)
                 broken["selectedReport"]["strategySectionCoverage"][field] = value
                 self.assertEqual(verify.evaluate(sample, {}, broken, quality())["status"], "failed")
-            for category in ("market-review", "portfolio-operations", "outlook"):
+            for category in sample["strategyRequiredCategories"]:
                 broken = normalized(sample)
                 broken["selectedReport"]["strategyAnalysis"]["evidence"] = [item for item in broken["selectedReport"]["strategyAnalysis"]["evidence"] if category not in item["categories"]]
                 self.assertFalse(verify.evaluate(sample, {}, broken, quality())["checks"]["strategyCategories"])
@@ -186,6 +187,25 @@ class VerifyRepairTests(unittest.TestCase):
             self.assertFalse(verify.evaluate(sample, {}, broken, quality())["checks"]["selectedEvidence"])
             measured = quality(); measured["fields"]["strategy"] = "partial"
             self.assertFalse(verify.evaluate(sample, {}, normalized(sample), measured)["checks"]["strategyQuality"])
+
+    def test_no_outlook_is_valid_but_invented_outlook_or_unsupported_category_counts_fail(self):
+        for sample in verify.SAMPLES[3:5]:
+            self.assertTrue(verify.evaluate(sample, {}, normalized(sample), quality())["checks"]["strategyAbsentCategories"])
+            invented = normalized(sample)
+            invented["selectedReport"].update(strategy_details(sample, with_outlook=True))
+            result = verify.evaluate(sample, {}, invented, quality())
+            self.assertTrue(result["checks"]["strategyCategories"])
+            self.assertFalse(result["checks"]["strategyAbsentCategories"])
+            self.assertEqual(result["status"], "failed")
+            for category, value in [("outlook", 1), ("market-review", 0), ("unclassified", 1)]:
+                broken = normalized(sample)
+                broken["selectedReport"]["strategyAnalysis"]["categorySentenceCounts"][category] = value
+                self.assertFalse(verify.evaluate(sample, {}, broken, quality())["checks"]["strategyCategories"])
+            # A different source that really contains an outlook can declare
+            # that expectation; the generic check does not prohibit the class.
+            with_outlook = {**sample, "strategyRequiredCategories": ["market-review", "portfolio-operations", "outlook"],
+                            "strategyAbsentCategories": []}
+            self.assertEqual(verify.evaluate(with_outlook, {}, invented, quality())["status"], "passed")
 
     def test_foreign_cells_cross_actual_proof_builder_and_normalization_bridge(self):
         from foreign_holdings import parse_foreign_equity_grids

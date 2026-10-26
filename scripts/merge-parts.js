@@ -10,6 +10,7 @@ const { verifiedReportManagers, normalizeManagers, evidenceFor, managerKey, mana
 const { strategySectionCoverageFor, strategyAnalysisFor } = require('../lib/strategy-sections');
 const { VERSION: PRICE_COVERAGE_VERSION, calendar, validCompletePrice, validCompleteQuarterPrice, retainedCoverage } = require('../lib/price-coverage');
 const { bindingFor, validPatch, canReplacePrice, key: priceKey } = require('../lib/price-patches');
+const { reuseCompletePrices } = require('../lib/reuse-prices');
 
 const CODE = /^\d{6}$/;
 const COMPANY = /^[A-Za-z0-9_-]{1,40}$/;
@@ -248,7 +249,7 @@ function coverageFor(funds, directory, config, expectedCount = directory.fundCou
 
 function observationDates(funds) {
   return { asOf: funds.length ? funds.map(fund => fund.asOf).sort().at(-1) : null,
-    priceUpdatedAt: funds.map(fund => fund.priceUpdatedAt).filter(timestamp).sort().at(-1) || null,
+    priceUpdatedAt: funds.map(fund => fund.priceUpdatedAt).filter(timestamp).sort((a, b) => Date.parse(a) - Date.parse(b)).at(-1) || null,
     retrievedAt: funds.length ? [...funds].sort((a, b) => Date.parse(b.retrievedAt) - Date.parse(a.retrievedAt))[0].retrievedAt : null };
 }
 
@@ -420,7 +421,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
         if (!row || !canReplacePrice(row.priceRange, update.priceRange, row, config)) continue;
         const before = JSON.stringify(row.priceRange);
         if (recoverPrice(row, update.priceRange, envelope.retrievedAt) && JSON.stringify(row.priceRange) !== before) {
-          fund.priceUpdatedAt = [fund.priceUpdatedAt, row.priceRange.fetchedAt].filter(Boolean).sort().at(-1);
+          fund.priceUpdatedAt = [fund.priceUpdatedAt, row.priceRange.fetchedAt].filter(timestamp).sort((a, b) => Date.parse(a) - Date.parse(b)).at(-1);
           adopted++;
         }
       }
@@ -429,15 +430,19 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
       priceResults.push({ code: patch.code, binding: patch.binding, accepted: true, errorCode: null });
     }
   }
-  const funds = deduplicatePortfolios([...byCode.values()], addError);
+  const sourceFunds = [...byCode.values()];
+  const funds = deduplicatePortfolios(sourceFunds, addError);
+  const { mutatedFunds: reusedFunds, ...reuseCounts } = reuseCompletePrices(funds,
+    { phase: config, now: currentTime, recoverPrice, sourceFunds });
   const receipt = mergeReceipt(funds, requestedCodes, config, currentTime, attempts);
   receipt.pricePatches = priceResults;
   // No new observation means no fabricated new timestamp or overwritten old files.
   const needsRepartition = Object.values(previousCompanies).some(item => item.funds?.length > (pageLimits?.maxFunds || MAX_COMPANY_FUNDS)
     || Buffer.byteLength(JSON.stringify(item)) + 1 > (pageLimits?.maxBytes || MAX_COMPANY_BYTES));
-  if (!acceptedFreshFundCount && !acceptedPricePatchCount && !migratedBootstrapFundCount && !needsRepartition && previousManifest) {
+  if (!acceptedFreshFundCount && !acceptedPricePatchCount && !reusedFunds.length && !migratedBootstrapFundCount && !needsRepartition && previousManifest) {
     return { changed: false, manifest: previousManifest, companySnapshots: {},
-      receipt, counts: { acceptedFreshFundCount: 0, errorCount: errors.length }, errors: [...new Set(errors)] };
+      receipt, counts: { acceptedFreshFundCount: 0, acceptedPricePatchCount: 0, ...reuseCounts,
+        errorCount: errors.length }, errors: [...new Set(errors)] };
   }
   const buckets = new Map();
   for (const fund of funds) {
@@ -493,7 +498,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
     targetPeriodEnd: config.targetPeriodEnd || null, baselinePeriodEnd: config.baselinePeriodEnd || null,
     coverage, companyCoverage, companyFiles, funds: [], errors: [] };
   return { changed: true, manifest, companySnapshots, receipt,
-    counts: { acceptedFreshFundCount, acceptedPricePatchCount, migratedBootstrapFundCount, companyCount: buckets.size,
+    counts: { acceptedFreshFundCount, acceptedPricePatchCount, ...reuseCounts, migratedBootstrapFundCount, companyCount: buckets.size,
       fundCount: funds.length, errorCount: errors.length },
     errors: [...new Set(errors)] };
 }

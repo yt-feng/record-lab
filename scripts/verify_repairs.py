@@ -36,10 +36,12 @@ SAMPLES = (
      "check": "no-equities", "evidenceType": "zero-stock-balance-sheet", "page": 14},
     {"code": "000606", "kind": "quarterly", "periodEnd": "2026-06-30", "publishedAt": "2026-07-21",
      "title": "天弘优选债券型证券投资基金2026年第2季度报告", "sourceUrl": "https://pdf.dfcfw.com/pdf/H2_AN202607211827184178_1.pdf",
-     "check": "managers", "managerRows": [("刘洋", "2017-10-28", None, 6)], "strategyPages": [7, 8]},
+     "check": "managers", "managerRows": [("刘洋", "2017-10-28", None, 6)], "strategyPages": [7, 8],
+     "strategyRequiredCategories": ["market-review", "portfolio-operations"], "strategyAbsentCategories": ["outlook"]},
     {"code": "010898", "kind": "quarterly", "periodEnd": "2026-09-30", "publishedAt": "2026-10-24",
      "title": "银河产业动力混合型证券投资基金2026年第3季度报告", "sourceUrl": "https://pdf.dfcfw.com/pdf/H2_AN202610241830863000_1.pdf",
-     "check": "managers", "managerRows": [("高鹏", "2025-10-24", None, 5), ("石磊", "2026-08-01", None, 6)], "strategyPages": [7, 8]},
+     "check": "managers", "managerRows": [("高鹏", "2025-10-24", None, 5), ("石磊", "2026-08-01", None, 6)], "strategyPages": [7, 8],
+     "strategyRequiredCategories": ["market-review", "portfolio-operations"], "strategyAbsentCategories": ["outlook"]},
     {"code": "253050", "kind": "quarterly", "periodEnd": "2026-06-30", "publishedAt": "2026-07-21",
      "title": "国联安货币市场证券投资基金2026年第2季度报告", "sourceUrl": "https://pdf.dfcfw.com/pdf/H2_AN202607211827190658_1.pdf",
      "check": "no-equities", "evidenceType": "exhaustive-nonstock-assets", "page": 8,
@@ -181,6 +183,17 @@ def evaluate(sample, details, fund, quality):
         sections = proof.get("sections") or []
         evidence = analysis.get("evidence") or []
         categories = ("market-review", "portfolio-operations", "outlook")
+        counts = analysis.get("categorySentenceCounts") or {}
+        selected_counts = {category: sum(isinstance(item, dict) and isinstance(item.get("text"), str) and bool(item["text"].strip())
+                                        and category in (item.get("categories") or []) for item in evidence)
+                           for category in (*categories, "unclassified")}
+        sentence_count = analysis.get("sentenceCount")
+        # These fixed source sections contain retrospective market commentary
+        # and portfolio operations, but no explicit forward-looking outlook.
+        # Zero is a source observation; never manufacture a missing category.
+        consistent_categories = type(sentence_count) is int and all(type(counts.get(category)) is int
+            and 0 <= selected_counts[category] <= counts[category] <= sentence_count
+            and bool(selected_counts[category]) == (counts[category] > 0) for category in selected_counts)
         period_start = (dt.date.fromisoformat(phase_for(sample)["baselinePeriodEnd"]) + dt.timedelta(days=1)).isoformat()
         checks.update(strategySectionComplete=proof.get("complete") is True,
                       strategyPeriod=(proof.get("periodStart") == period_start and proof.get("periodEnd") == sample["periodEnd"]
@@ -197,9 +210,10 @@ def evaluate(sample, details, fund, quality):
                           and isinstance(item.get("text"), str) and 0 < len(item["text"]) <= 160
                           and item.get("sourceUrl") == sample["sourceUrl"] and item.get("periodStart") == period_start
                           and item.get("periodEnd") == sample["periodEnd"] and item.get("page") in sample["strategyPages"] for item in evidence),
-                      strategyCategories=all(any(isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip()
-                                                 and category in (item.get("categories") or []) for item in evidence) for category in categories))
-        counts = analysis.get("categorySentenceCounts") or {}
+                      strategyCategories=consistent_categories and all(selected_counts.get(category, 0) > 0
+                          for category in sample["strategyRequiredCategories"]),
+                      strategyAbsentCategories=all(counts.get(category) == 0 and selected_counts.get(category) == 0
+                          for category in sample["strategyAbsentCategories"]))
         observed["strategy"] = {"sectionComplete": proof.get("complete") is True,
                                 "analysisCoverage": "selected-evidence" if analysis.get("analysisCoverage") == "selected-evidence" else "unknown",
                                 "semanticAnalysisComplete": analysis.get("semanticAnalysisComplete") is True,
