@@ -20,6 +20,67 @@ spec.loader.exec_module(site)
 
 
 class CampaignTests(unittest.TestCase):
+    def test_default_campaign_matrix_passes_workflow_output_and_missing_part_reconciliation(self):
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for directory in ('scripts', 'lib', 'config'):
+                shutil.copytree(source / directory, root / directory, ignore=shutil.ignore_patterns('__pycache__'))
+            atomic_json(root / 'web/data/catalog.json', {'schemaVersion': 1, 'asOf': '2026-10-26',
+                'coverage': {'directoryComplete': True, 'companyCount': 1, 'fundCount': 1200},
+                'companies': [{'code': 'co1', 'name': '合成机构', 'fundCount': 1200, 'directoryStatus': 'complete'}],
+                'funds': [{'code': f'{index:06d}', 'companyCode': 'co1'} for index in range(1, 1201)]})
+            original = Path.cwd()
+            real_run = subprocess.run
+            def captured_run(command, **kwargs):
+                kwargs.setdefault('capture_output', True)
+                return real_run(command, **kwargs)
+            try:
+                os.chdir(root)
+                with patch('campaign.subprocess.run', side_effect=captured_run):
+                    result = plan('both', '2026-10-26', refresh=False)
+                self.assertEqual(result['batchCount'], 32)
+                matrix = read_json('.cache/plan/matrix.json')
+                self.assertEqual([item['id'] for item in matrix], [str(index) for index in range(32)])
+                task_count = 0
+                for quarter in ('2026Q2', '2026Q3'):
+                    scoped = [item for item in matrix if item['quarter'] == quarter]
+                    self.assertEqual(len(scoped), 16)
+                    codes = []
+                    for item in scoped:
+                        batch = read_json('.cache/plan/' + item['config'])
+                        self.assertEqual(len(batch['funds']), 75)
+                        self.assertEqual(batch['traversal']['batchId'], item['id'])
+                        codes.extend(row['code'] for row in batch['funds'])
+                    self.assertEqual(len(set(codes)), 1200)
+                    task_count += len(codes)
+                self.assertEqual(task_count, 2400)
+                output = subprocess.run(['node', 'scripts/workflow-outputs.js', '.cache/plan'],
+                                        check=True, capture_output=True, text=True)
+                values = dict(line.split('=', 1) for line in output.stdout.splitlines())
+                self.assertEqual(json.loads(values['matrix']), matrix)
+                self.assertEqual(values['has_work'], 'true')
+                reconciled = subprocess.run([sys.executable, 'scripts/complete-status.py'],
+                                            check=True, capture_output=True, text=True)
+                self.assertEqual(json.loads(reconciled.stdout)['repairedCount'], 32)
+                statuses = list(Path('.cache/parts').glob('part-*/status.json'))
+                self.assertEqual(len(statuses), 32)
+                self.assertEqual(sum(len(read_json(path)['funds']) for path in statuses), 2400)
+                repeated = subprocess.run([sys.executable, 'scripts/complete-status.py'],
+                                          check=True, capture_output=True, text=True)
+                self.assertEqual(json.loads(repeated.stdout)['preservedCount'], 32)
+            finally:
+                os.chdir(original)
+
+    def test_campaign_rejects_unsupported_capacity_before_directory_refresh(self):
+        with patch('campaign.refresh_directory') as refresh:
+            for quarter, shards, batch_size in [('both', 17, 75), ('2026Q3', 33, 75),
+                                                ('both', True, 75), ('both', 16, 101)]:
+                with self.subTest(quarter=quarter, shards=shards, batch_size=batch_size):
+                    with self.assertRaisesRegex(ValueError, 'INVALID_BATCH_CAPACITY'):
+                        plan(quarter, '2026-10-26', shards=shards, batch_size=batch_size)
+            refresh.assert_not_called()
+
     def test_two_quarter_campaign_keeps_missing_parts_and_exemptions_in_their_phase(self):
         source = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temp:

@@ -78,12 +78,18 @@ def refresh_directory(root, as_of):
 
 
 def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True):
+    selected = selected_periods(quarter)
+    # Planning, Actions output and missing-part reconciliation share one bound.
+    # Reject unsupported configurations before fetching or changing any files.
+    if (type(shards) is not int or not 1 <= shards <= 32
+            or shards * len(selected) > 32
+            or type(batch_size) is not int or not 1 <= batch_size <= 100):
+        raise ValueError('INVALID_BATCH_CAPACITY')
     root = Path(data)
     directory_status = refresh_directory(root, as_of) if refresh else {'status': 'provided'}
     catalog = read_json(root / 'catalog.json')
     base = read_json('config/universe.json')
     matrix = []
-    selected = selected_periods(quarter)
     for name in selected:
         output = seed_quarter(root, name)
         config = quarter_config(base, name, as_of)
