@@ -2,6 +2,15 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { checkpoint, diagnose } = require('../lib/merge-diagnostics');
+test('checkpoints preserve the single JSON stdout contract even inside Actions', () => {
+  const before = process.env.GITHUB_ACTIONS, write = process.stdout.write;
+  let emitted = false;
+  try {
+    process.env.GITHUB_ACTIONS = 'true'; process.stdout.write = () => { emitted = true; return true; };
+    checkpoint('inputs', 0); checkpoint('components', 500); checkpoint('done', 501);
+  } finally { process.stdout.write = write; if (before === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = before; }
+  assert.equal(emitted, false);
+});
 test('typed errors expose only fixed metadata and allowlisted source locations', () => {
   checkpoint('components', 500);
   const error = new TypeError('PRIVATE_MESSAGE_MARKER');
