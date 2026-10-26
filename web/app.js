@@ -3,10 +3,11 @@
   const api = factory(typeof module === 'object' && module.exports ? require('./lifecycle') : root.RecordLabLifecycle,
     typeof module === 'object' && module.exports ? require('./zero-stock') : root.RecordLabZeroStock,
     typeof module === 'object' && module.exports ? require('./nonstock-assets') : root.RecordLabNonstockAssets,
-    typeof module === 'object' && module.exports ? require('./strategy-sections') : root.RecordLabStrategySections);
+    typeof module === 'object' && module.exports ? require('./strategy-sections') : root.RecordLabStrategySections,
+    typeof module === 'object' && module.exports ? require('./source-dates') : root.RecordLabSourceDates);
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root && root.document) api.mount(root.document, root);
-})(typeof globalThis !== 'undefined' ? globalThis : this, function (lifecycle, zeroStock, nonstockAssets, strategySections) {
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (lifecycle, zeroStock, nonstockAssets, strategySections, sourceDates) {
   'use strict';
 
   const CHANGE_GROUPS = {
@@ -28,9 +29,9 @@
     const start = `${report?.periodEnd?.slice(0, 4)}-${String(month - 2).padStart(2, '0')}-01`;
     const current = proof?.kind === 'quarterly' && proof.periodStart === start;
     const observedAt = report?.strategyEvidenceRetrievedAt || retrievedAt;
-    const ceiling = validTimestamp(retrievedAt) ? Date.parse(retrievedAt) : dateOnly(asOf) ? Date.parse(asOf + 'T23:59:59Z') : NaN;
+    const ceiling = validTimestamp(retrievedAt) ? Date.parse(retrievedAt) : sourceDates.chinaDayEnd(asOf);
     const observed = observedAt ? validTimestamp(observedAt) && Date.parse(observedAt) <= ceiling + 300000
-      && proof?.publishedAt <= observedAt.slice(0, 10) : dateOnly(asOf) && proof?.publishedAt <= asOf;
+      && proof?.publishedAt <= sourceDates.chinaDate(observedAt) : dateOnly(asOf) && proof?.publishedAt <= asOf;
     return { proof, analysis: proof && current && observed ? strategySections.strategyAnalysisFor(report?.strategyAnalysis, proof) : null,
       complete: Boolean(current && observed && proof.complete), label: !proof ? '策略章节尚未完整核验' : !current ? '说明覆盖期并非本季度，未计入本季完整度'
         : !observed ? '策略公告日期与当前观测时点尚未核对'

@@ -1,9 +1,10 @@
 (function (root, factory) {
   'use strict';
-  const api = factory(typeof module === 'object' && module.exports ? require('./strategy-sections') : root.RecordLabStrategySections);
+  const api = factory(typeof module === 'object' && module.exports ? require('./strategy-sections') : root.RecordLabStrategySections,
+    typeof module === 'object' && module.exports ? require('./source-dates') : root.RecordLabSourceDates);
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root && root.document) root.RecordAnalysis = api.mount(root.document, root);
-})(typeof globalThis !== 'undefined' ? globalThis : this, function (strategySections) {
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (strategySections, sourceDates) {
   'use strict';
   const object = x => x !== null && typeof x === 'object' && !Array.isArray(x);
   const finite = x => typeof x === 'number' && Number.isFinite(x);
@@ -15,7 +16,8 @@
     const current = proof?.kind === 'quarterly' && proof.periodStart === start;
     const observedAt = strategy?.evidenceRetrievedAt;
     const observed = typeof asOf === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(asOf)
-      && generationValue(observedAt) && observedAt.slice(0, 10) <= asOf && proof?.publishedAt <= observedAt.slice(0, 10);
+      && generationValue(observedAt) && sourceDates.chinaDate(observedAt) <= asOf
+      && proof?.publishedAt <= sourceDates.chinaDate(observedAt);
     return { proof, analysis: current && observed ? strategySections.strategyAnalysisFor(strategy?.analysis, proof) : null,
       complete: Boolean(current && observed && proof.complete) };
   }

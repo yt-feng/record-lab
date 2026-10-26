@@ -7,6 +7,7 @@ const { analyzeFund, normalizeReport, normalizeLifecycleEvidence, validDate, val
 const { validCompletePrice, validCompleteQuarterPrice } = require('../lib/price-coverage');
 const { normalizePatch } = require('../lib/price-patches');
 const { retainPortfolioIdentity } = require('../lib/portfolio-identity');
+const { chinaDate } = require('../web/source-dates');
 
 const BUILD_CODES = new Set([
   'INVALID_INPUT', 'INVALID_AS_OF', 'FUTURE_AS_OF', 'INVALID_RETRIEVED_AT', 'INVALID_CONFIG',
@@ -392,7 +393,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
     throw new SafeBuildError('INVALID_INPUT');
   }
   if (!validDate(raw.asOf)) throw new SafeBuildError('INVALID_AS_OF');
-  if (raw.asOf > nowValue.toISOString().slice(0, 10)) throw new SafeBuildError('FUTURE_AS_OF');
+  if (raw.asOf > chinaDate(nowValue)) throw new SafeBuildError('FUTURE_AS_OF');
   if (!timestamp(raw.retrievedAt) || Date.parse(raw.retrievedAt) > nowValue.getTime() + 300000) {
     throw new SafeBuildError('INVALID_RETRIEVED_AT');
   }

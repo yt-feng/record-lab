@@ -241,6 +241,27 @@ def normalized_manager_check(sample, details, now):
             'sourcePreserved': proof.get('sourceUrl') == sample['sourceUrl']}
 
 
+def manager_details_from_pages(pages, sample):
+    """Keep the production report-only PDF evidence beside the manager table.
+
+    These are the pages just extracted from this PDF, not inferred metadata.
+    The production builder must still reject a table without its PDF facts.
+    """
+    from report_extract import _details_for_pages
+    details = _details_for_pages(pages, sample['sourceUrl'], '2026-06-30', 'quarterly',
+        lambda *_: {}, total_pages=pages.total_pages, published_at=sample['publishedAt'])
+    details.update(parseMethod='pypdf', parseErrorCode=None)
+    return details
+
+
+def normalization_error(error):
+    # Fixed categories only: exception text can contain local paths or source
+    # content and must never enter the public diagnostic artifact.
+    if isinstance(error, ImportError): return 'NORMALIZATION_DEPENDENCY_MISSING'
+    code = getattr(error, 'code', None)
+    return code if code in {'SNAPSHOT_BRIDGE_FAILED', 'SNAPSHOT_REJECTED'} else 'NORMALIZATION_CHECK_FAILED'
+
+
 def run_sample(sample):
     if os.environ.get('GITHUB_ACTIONS') != 'true': raise DiagnosticError('ACTIONS_REQUIRED')
     if sample not in SAMPLES: raise DiagnosticError('MANAGER_DIAGNOSTIC_FAILED')
@@ -253,8 +274,7 @@ def run_sample(sample):
     if not any(page.strip() for page in pages): raise DiagnosticError('PDF_TEXT_EMPTY')
     result = diagnose_pages(pages, sample, pdf_sha256=hashlib.sha256(data).hexdigest(), total_pages=pages.total_pages)
     from manager_cells import enrich_manager_details
-    baseline = managers.parse_report_managers(pages, dict(sample, kind='quarterly', periodEnd='2026-06-30'))
-    details = {'reportManagers': baseline, 'managerTableCoverage': baseline.coverage}
+    details = manager_details_from_pages(pages, sample)
     enrich_manager_details(details, data, dict(sample, kind='quarterly', periodEnd='2026-06-30'), pages)
     final = details['reportManagers']; proof = details['managerTableCoverage']
     # Replace the old row list instead of publishing a second copy of quotes;
@@ -282,8 +302,8 @@ def run_sample(sample):
             for table in geometry['tables']]
     try:
         result['normalizedManagerCheck'] = normalized_manager_check(sample, details, dt.datetime.now(dt.timezone.utc))
-    except Exception:
-        result['normalizedManagerCheck'] = {'complete': False, 'errorCode': 'NORMALIZATION_CHECK_FAILED'}
+    except Exception as error:
+        result['normalizedManagerCheck'] = {'complete': False, 'errorCode': normalization_error(error)}
     try:
         add_layout_diagnostics(result, data)
     except Exception:

@@ -259,3 +259,32 @@ test('mixed timezone observations retain the latest instant through company enve
   assert.equal(updated.companySnapshots.co2.funds.find(fund => fund.code === target.code).priceUpdatedAt, quoteAt);
   assert.equal(updated.receipt.pricePatches[0].accepted, true);
 });
+
+test('partitioned price reuse matches one pass and isolates stored observations from callers', () => {
+  const { createPriceIndex, addPriceSources, applyPriceIndex } = require('../lib/reuse-prices');
+  const donor = fund('000001'), target = fund('000002', 'missing'), target2 = fund('000003', 'partial');
+  const expected = clone([target, target2]);
+  const completePass = reuse(expected, { sourceFunds: [donor, target, target2] });
+  const index = createPriceIndex(phase, now);
+  for (const partition of [[target], [donor], [target2]]) addPriceSources(index, partition);
+  // Disk-backed callers may release or reuse their input objects after indexing.
+  donor.rows[0].priceRange.low = 1;
+  const first = applyPriceIndex(index, [target], recoverPrice);
+  const second = applyPriceIndex(index, [target2], recoverPrice);
+  assert.deepEqual([target, target2], expected);
+  assert.equal(first.reusedPriceRowCount + second.reusedPriceRowCount, completePass.reusedPriceRowCount);
+  assert.equal(first.eligiblePriceKeyCount, 1); assert.equal(second.eligiblePriceKeyCount, 1);
+  assert.throws(() => addPriceSources(index, [fund('000004')]), /PRICE_INDEX_ALREADY_APPLIED/);
+});
+
+test('conflicting source in the last input partition blocks reuse in every output partition', () => {
+  const { createPriceIndex, addPriceSources, applyPriceIndex } = require('../lib/reuse-prices');
+  const a = fund('000001'), b = fund('000002'); b.rows[0].priceRange.low = 9;
+  const index = createPriceIndex(phase, now);
+  addPriceSources(index, [a]); addPriceSources(index, []); addPriceSources(index, [b]);
+  for (const target of [fund('000003', 'missing'), fund('000004', 'partial')]) {
+    const before = clone(target), result = applyPriceIndex(index, [target], recoverPrice);
+    assert.equal(result.conflictingPriceKeyCount, 1); assert.equal(result.reusedPriceRowCount, 0);
+    assert.deepEqual(target, before);
+  }
+});

@@ -27,7 +27,7 @@ class CampaignTests(unittest.TestCase):
             for directory in ('scripts', 'lib', 'config'):
                 shutil.copytree(source / directory, root / directory, ignore=shutil.ignore_patterns('__pycache__'))
             (root / 'web').mkdir()
-            for module in ('lifecycle.js', 'zero-stock.js', 'nonstock-assets.js', 'strategy-sections.js'):
+            for module in ('lifecycle.js', 'zero-stock.js', 'nonstock-assets.js', 'strategy-sections.js', 'source-dates.js'):
                 shutil.copy2(source / 'web' / module, root / 'web' / module)
             atomic_json(root / 'web/data/catalog.json', {'schemaVersion': 1, 'asOf': '2026-10-26',
                 'coverage': {'directoryComplete': True, 'companyCount': 1, 'fundCount': 1200},
@@ -92,7 +92,7 @@ class CampaignTests(unittest.TestCase):
             for directory in ('scripts', 'lib', 'config'):
                 shutil.copytree(source / directory, root / directory, ignore=shutil.ignore_patterns('__pycache__'))
             (root / 'web').mkdir()
-            for module in ('lifecycle.js', 'zero-stock.js', 'nonstock-assets.js', 'strategy-sections.js'):
+            for module in ('lifecycle.js', 'zero-stock.js', 'nonstock-assets.js', 'strategy-sections.js', 'source-dates.js'):
                 shutil.copy2(source / 'web' / module, root / 'web' / module)
             catalog = {'schemaVersion': 1, 'asOf': '2026-10-26', 'retrievedAt': '2026-10-26T00:00:00Z',
                 'coverage': {'directoryComplete': True, 'companyCount': 1, 'fundCount': 2},

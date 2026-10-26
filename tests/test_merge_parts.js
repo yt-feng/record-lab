@@ -281,7 +281,8 @@ test('CLI merges snapshot files atomically and leaves bytes unchanged on a later
     const first = spawnSync(process.execPath, args, { encoding: 'utf8' });
     assert.equal(first.status, 0);
     const before = fs.readFileSync(path.join(data, 'latest.json'), 'utf8');
-    const companyBefore = fs.readFileSync(path.join(data, 'companies', 'co1.json'), 'utf8');
+    const companyFile = path.join(data, 'companies', path.basename(JSON.parse(before).companyFiles[0].path));
+    const companyBefore = fs.readFileSync(companyFile, 'utf8');
     const receipt = JSON.parse(fs.readFileSync(path.join(parts, 'merge-receipt.json'), 'utf8'));
     assert.equal(receipt.funds[0].priceCoverage.holdingCount, 1);
     const traversal = path.join(__dirname, '..', 'scripts', 'traversal.py');
@@ -301,7 +302,7 @@ test('CLI merges snapshot files atomically and leaves bytes unchanged on a later
     assert.equal(JSON.parse(second.stdout).status, 'unchanged');
     assert.equal(second.stderr, '');
     assert.equal(fs.readFileSync(path.join(data, 'latest.json'), 'utf8'), before);
-    assert.equal(fs.readFileSync(path.join(data, 'companies', 'co1.json'), 'utf8'), companyBefore);
+    assert.equal(fs.readFileSync(companyFile, 'utf8'), companyBefore);
     assert.equal(fs.readdirSync(data).some(name => name.includes('.tmp-')), false);
   } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
 });

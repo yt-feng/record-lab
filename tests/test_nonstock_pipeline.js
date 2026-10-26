@@ -96,7 +96,7 @@ test('actual browser scripts render both source tables, physical page links and 
     createElement: tag => new Element(tag), createTextNode: text => ({ textContent: text }), addEventListener() {} };
   const context = vm.createContext({ document, URL, AbortController, Intl, console,
     setTimeout: () => 1, clearTimeout() {}, fetch: () => new Promise(() => {}), location: { href: 'https://example.org/' } });
-  for (const filename of ['lifecycle.js', 'zero-stock.js', 'nonstock-assets.js', 'app.js']) {
+  for (const filename of ['lifecycle.js', 'zero-stock.js', 'nonstock-assets.js', 'source-dates.js', 'app.js']) {
     vm.runInContext(fs.readFileSync(path.join(root, 'web', filename), 'utf8'), context, { filename });
   }
   const json = JSON.stringify(build());

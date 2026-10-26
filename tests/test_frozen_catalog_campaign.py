@@ -78,7 +78,9 @@ class FrozenCampaignTests(unittest.TestCase):
         self.assertEqual(progress['unmappedFunds'], 1)
         self.assertNotEqual(progress['completionStatus'], 'complete')
         self.assertFalse(progress['quarterUniverse']['historicalUniverseVerified'])
-        unknown = read_json('web/data/periods/2026Q2/companies/unknown.json')
+        manifest = read_json('web/data/periods/2026Q2/latest.json')
+        unknown_page = next(row for row in manifest['companyFiles'] if row['companyCode'] == 'unknown')
+        unknown = read_json(Path('web/data/periods/2026Q2/companies') / Path(unknown_page['path']).name)
         self.assertEqual(unknown['funds'][0]['code'], '000003')
         self.assertEqual(unknown['funds'][0]['companyMapping'], 'unmatched-catalog')
 

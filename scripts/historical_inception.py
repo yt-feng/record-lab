@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+from source_dates import china_date
 
 
 def _observed(value):
@@ -24,7 +25,7 @@ def normalize_profile_inception(raw, code, *, now=None):
         observed = _observed(raw['retrievedAt'])
         current = now or dt.datetime.now(dt.timezone.utc)
         if (founded.isoformat() != raw['date'] or 'T' not in raw['retrievedAt'] or observed.tzinfo is None
-                or current.tzinfo is None or founded > observed.date() or observed > current + dt.timedelta(minutes=5)):
+                or current.tzinfo is None or founded > china_date(observed) or observed > current + dt.timedelta(minutes=5)):
             return None
     except (KeyError, TypeError, ValueError, AttributeError):
         return None
@@ -56,7 +57,7 @@ def normalize_inception(raw, code, period, *, now=None):
         current = now or dt.datetime.now(dt.timezone.utc)
         if (founded.isoformat() != raw['date'] or founded > dt.date.fromisoformat(period)
                 or 'T' not in raw['retrievedAt'] or observed.tzinfo is None or current.tzinfo is None
-                or observed.date() < dt.date.fromisoformat(period) or observed > current + dt.timedelta(minutes=5)):
+                or china_date(observed) < dt.date.fromisoformat(period) or observed > current + dt.timedelta(minutes=5)):
             return None
     except (KeyError, TypeError, ValueError, AttributeError):
         return None

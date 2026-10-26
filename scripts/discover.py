@@ -21,6 +21,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 from providers import DataError, PublicProvider
+from source_dates import china_today
 
 COMPANIES_URL = "https://fund.eastmoney.com/js/jjjz_gs.js"
 FUNDS_URL = "https://fund.eastmoney.com/js/fundcode_search.js"
@@ -331,7 +332,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default="raw/catalog.json")
     parser.add_argument("--state", default="raw/catalog-state.json")
-    parser.add_argument("--as-of", default=dt.datetime.now(dt.timezone.utc).date().isoformat())
+    parser.add_argument("--as-of", default=china_today())
     parser.add_argument("--limit", type=int)
     parser.add_argument("--allow-partial", action="store_true")
     parser.add_argument("--max-companies", type=int, help="Bound this run; state resumes remaining companies.")

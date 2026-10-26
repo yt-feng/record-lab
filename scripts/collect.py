@@ -14,6 +14,7 @@ import threading
 from providers import DataError, PublicProvider, HOLDINGS_TOPLINE
 from lifecycle import normalize_lifecycle_evidence, should_check_lifecycle
 from report_managers import normalize_manager_table_coverage
+from source_dates import china_today
 
 
 def safe_error(code, stage, error):
@@ -72,7 +73,7 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
     if item.get("companyCode") or item.get("companyId"):
         fund["companyId"] = item.get("companyCode") or item.get("companyId")
     fund["metadataSourceUrl"] = f"https://fundf10.eastmoney.com/jbgk_{code}.html"
-    fund["managersAsOf"] = dt.datetime.now(dt.timezone.utc).date().isoformat()
+    fund["managersAsOf"] = china_today()
     fund["managerScope"] = "current-profile"
     def expired():
         if deadline is not None and time.monotonic() >= deadline:
@@ -500,7 +501,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config/universe.json")
     parser.add_argument("--output", default="raw/input.json")
-    parser.add_argument("--as-of", default=dt.datetime.now(dt.timezone.utc).date().isoformat())
+    parser.add_argument("--as-of", default=china_today())
     parser.add_argument("--limit", type=int)
     parser.add_argument("--max-seconds", type=float)
     parser.add_argument("--price-seconds", type=float)

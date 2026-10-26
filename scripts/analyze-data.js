@@ -5,11 +5,13 @@
 // additive unit; unresolved share-class identities remain visible, not summed.
 const fs = require('node:fs');
 const path = require('node:path');
+const { createAnalysisSpool } = require('./analysis-spool');
 const { compareHolding, estimatePosition, normalizeHolding, validDate } = require('../lib/fund-analysis');
 const { publicUrl, isValidNotApplicable } = require('./build-data');
 const { validCompletePrice, retainedCoverage } = require('../lib/price-coverage');
 const { strategySectionCoverageFor, strategyAnalysisFor } = require('../lib/strategy-sections');
 const { normalizeManagers, verifiedReportManagers, managerCoverageFor, completeManagerCoverage, overlaps: managerOverlaps } = require('../lib/report-managers');
+const { chinaDate } = require('../web/source-dates');
 
 const CODE = /^\d{6}$/;
 const COMPANY_PATH = /^\.\/data\/companies\/[A-Za-z0-9_-]{1,64}\.json$/;
@@ -54,7 +56,7 @@ function strategyFor(fund, phase) {
   const observed = stamp(strategyObserved) && stamp(phase.generation || fund.retrievedAt)
     && Date.parse(strategyObserved) <= Date.parse(phase.generation || fund.retrievedAt) + 300000;
   const proof = sourceProof?.periodStart === phase.start && sourceProof.kind === 'quarterly'
-    && observed && sourceProof.publishedAt <= strategyObserved.slice(0, 10) ? sourceProof : null;
+    && observed && sourceProof.publishedAt <= chinaDate(strategyObserved) ? sourceProof : null;
   const analysis = proof ? strategyAnalysisFor(report.strategyAnalysis, proof) : null;
   const candidates = [...(Array.isArray(report.strategyExcerpts) ? report.strategyExcerpts : [])];
   if (narrative?.text) candidates.push(narrative);
@@ -101,7 +103,7 @@ function descriptor(fund, file, index, phase) {
     { asOf: fund.asOf, code: fund.code, periodEnd: phase.target })) return null;
   const report = reportRef(fund.selectedReport);
   if (!report || report.periodEnd !== phase.target) fail('ANALYSIS_PERIOD_MISMATCH');
-  if (report.publishedAt > fund.retrievedAt.slice(0, 10)) fail('ANALYSIS_FUTURE_REPORT');
+  if (report.publishedAt > chinaDate(fund.retrievedAt)) fail('ANALYSIS_FUTURE_REPORT');
   if (fund.selectedReport.fundCode && fund.selectedReport.fundCode !== fund.code) fail('ANALYSIS_IDENTITY_MISMATCH');
   const aliases = [...new Set((fund.shareClassCodes || []).filter(code => typeof code === 'string' && CODE.test(code)))];
   const proven = CODE.test(fund.sourcePortfolioCode || '') && publicUrl(fund.portfolioSourceUrl)
@@ -206,7 +208,7 @@ function boundedParts(kind, field, items, prefix, phase, limit, writePart, onPar
 }
 
 function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = () => {}, maxPartBytes = PART_LIMIT,
-  now = new Date() } = {}) {
+  now = new Date(), spool = null } = {}) {
   const awaitingData = manifest?.coverage?.status === 'awaiting-data';
   const emptyObservation = awaitingData && manifest.asOf === null && manifest.retrievedAt === null
     && manifest.priceUpdatedAt == null && manifest.coverage.fundCount === 0 && manifest.coverage.complete !== true
@@ -222,7 +224,7 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
     || (awaitingData ? !emptyObservation : !stamp(manifest.retrievedAt) || !validDate(manifest.asOf))) fail('INVALID_ANALYSIS_MANIFEST');
   const phase = datesFor(manifest.targetPeriodEnd, manifest.baselinePeriodEnd);
   const currentTime = new Date(now);
-  if (!Number.isFinite(currentTime.getTime()) || !awaitingData && (manifest.asOf > currentTime.toISOString().slice(0, 10)
+  if (!Number.isFinite(currentTime.getTime()) || !awaitingData && (manifest.asOf > chinaDate(currentTime)
     || Date.parse(manifest.retrievedAt) > currentTime.getTime() + 300000 || manifest.asOf < phase.target)) fail('ANALYSIS_FUTURE_OBSERVATION');
   if (manifest.priceUpdatedAt != null && (!stamp(manifest.priceUpdatedAt)
     || Date.parse(manifest.priceUpdatedAt) > currentTime.getTime() + 300000)) fail('ANALYSIS_FUTURE_OBSERVATION');
@@ -252,7 +254,10 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
   }
   const { selected, conflicts, duplicatesRemoved } = selectRecords(records);
   const selectedByRef = new Map(selected.map(item => [`${item.file}\0${item.index}`, item]));
-  const stocks = new Map(), portfolios = [], themes = new Map();
+  const stocks = new Map(), portfolios = spool ? null : [], themes = new Map();
+  const portfolioCounts = { analyzedRecords: 0, strategySectionCompleteRecords: 0, strategySectionIncompleteRecords: 0,
+    strategySelectedEvidenceRecords: 0, reportManagerRecords: 0, reportManagerPartialRecords: 0,
+    tenureOverlapManagerRecords: 0, managerEvidenceMissingRecords: 0, currentProfileOnlyManagerRecords: 0 };
   let invalidRows = 0, reportOnlyRecords = 0, noEquityRecords = 0, unknownIdentityRecords = 0,
     unknownIdentityHoldingRecords = 0, strategyRecords = 0, currentHoldingRecords = 0, priceRows = 0;
   for (const file of manifest.companyFiles) {
@@ -267,7 +272,16 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
         companyId: identity.companyId, shareClassCodes: identity.aliases, aggregationEligible: identity.aggregationEligible,
         identitySourceUrl: identity.identitySourceUrl, report: identity.report, previousReport,
         ...managers, strategy, retrievedAt: fund.retrievedAt };
-      portfolios.push(portfolio);
+      if (spool) spool.addPortfolio(portfolio); else portfolios.push(portfolio);
+      portfolioCounts.analyzedRecords++;
+      portfolioCounts.strategySectionCompleteRecords += Number(strategy.sectionStatus === 'complete');
+      portfolioCounts.strategySectionIncompleteRecords += Number(strategy.sectionStatus !== 'complete');
+      portfolioCounts.strategySelectedEvidenceRecords += Number(Boolean(strategy.analysis?.evidence.length));
+      portfolioCounts.reportManagerRecords += Number(managers.managerCoverageStatus === 'complete');
+      portfolioCounts.reportManagerPartialRecords += Number(managers.managerCoverageStatus === 'partial');
+      portfolioCounts.tenureOverlapManagerRecords += Number(managers.managerAttribution === 'tenure-overlap');
+      portfolioCounts.managerEvidenceMissingRecords += Number(managers.managerCoverageStatus !== 'complete');
+      portfolioCounts.currentProfileOnlyManagerRecords += Number(!managers.reportManagers.length && managers.managers.length > 0);
       if (!identity.aggregationEligible) unknownIdentityRecords++;
       if (strategy.excerpts.length) strategyRecords++;
       for (const theme of strategy.themes) {
@@ -318,24 +332,25 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
             high: stock.priceRange.high === null ? price.high : Math.max(stock.priceRange.high, price.high),
             observedCount: Math.max(stock.priceRange.observedCount, price.observedCount) });
         }
-        stock._contributions.push({ portfolioId: identity.id, current: holdingFacts(current), previous: holdingFacts(prior),
+        const contribution = { portfolioId: identity.id, current: holdingFacts(current), previous: holdingFacts(prior),
           change: CHANGES[change.kind], sharesDelta: change.sharesDelta, weightDeltaPp: change.weightDeltaPp, provesTrade: false,
           disclosedValueYuan: position.disclosedYuan, navWeightEstimateYuan: position.estimatedYuan,
-          aggregationEligible: identity.aggregationEligible });
+          aggregationEligible: identity.aggregationEligible };
+        if (spool) spool.addContribution(key, contribution); else stock._contributions.push(contribution);
       }
       currentHoldingRecords += Number(hasCurrent);
       unknownIdentityHoldingRecords += Number(hasCurrent && !identity.aggregationEligible);
     }
   }
-  portfolios.sort((a, b) => a.id.localeCompare(b.id));
+  if (portfolios) portfolios.sort((a, b) => a.id.localeCompare(b.id));
   const portfolioFiles = [];
-  boundedParts('portfolio-evidence', 'portfolios', portfolios, 'details-portfolios', phase, maxPartBytes, writePart,
+  boundedParts('portfolio-evidence', 'portfolios', spool ? spool.portfolios() : portfolios, 'details-portfolios', phase, maxPartBytes, writePart,
     (file, items) => portfolioFiles.push({ path: file, ids: items.map(item => item.id) }));
   const ordered = [...stocks.values()].sort((a, b) => a.key.localeCompare(b.key));
   function* stockChunks() {
     for (const stock of ordered) {
       let chunk = [], size = 100;
-      for (const contribution of stock._contributions) {
+      for (const contribution of spool ? spool.contributions(stock.key) : stock._contributions) {
         const itemSize = Buffer.byteLength(JSON.stringify(contribution)) + 1;
         if (chunk.length && size + itemSize > maxPartBytes - 400) { yield { key: stock.key, contributions: chunk }; chunk = []; size = 100; }
         chunk.push(contribution); size += itemSize;
@@ -371,22 +386,14 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
     for (const field of Object.keys(stock).filter(key => key.startsWith('_'))) delete stock[field];
   }
   const research = progress?.research;
-  const coverage = { status: awaitingData ? 'awaiting-data' : 'partial', complete: false, inputRecords, analyzedRecords: portfolios.length,
+  const coverage = { status: awaitingData ? 'awaiting-data' : 'partial', complete: false, inputRecords, ...portfolioCounts,
     currentHoldingRecords, noEquityRecords, reportOnlyRecords, excludedNotApplicable, duplicatesRemoved,
     stockCount: ordered.length, contributionCount: ordered.reduce((sum, stock) => sum + Object.values(stock.changes).reduce((a, b) => a + b, 0), 0),
     identityUnresolvedRecords: unknownIdentityRecords, identityUnresolvedHoldingRecords: unknownIdentityHoldingRecords,
     identityConflictGroups: conflicts, invalidRows, strategyRecords, observedPriceRows: priceRows,
-    strategySectionCompleteRecords: portfolios.filter(item => item.strategy.sectionStatus === 'complete').length,
-    strategySectionIncompleteRecords: portfolios.filter(item => item.strategy.sectionStatus !== 'complete').length,
-    strategySelectedEvidenceRecords: portfolios.filter(item => item.strategy.analysis?.evidence.length).length,
     strategySemanticAnalysisComplete: false,
     completePriceStocks: ordered.filter(stock => stock.priceRange.completeness === 'complete').length,
     incompletePriceStocks: ordered.filter(stock => stock.priceRange.completeness !== 'complete').length,
-    reportManagerRecords: portfolios.filter(item => item.managerCoverageStatus === 'complete').length,
-    reportManagerPartialRecords: portfolios.filter(item => item.managerCoverageStatus === 'partial').length,
-    tenureOverlapManagerRecords: portfolios.filter(item => item.managerAttribution === 'tenure-overlap').length,
-    managerEvidenceMissingRecords: portfolios.filter(item => item.managerCoverageStatus !== 'complete').length,
-    currentProfileOnlyManagerRecords: portfolios.filter(item => !item.reportManagers.length && item.managers.length > 0).length,
     sourceCatalogShareCodes: manifest.coverage?.catalogFundCount ?? null,
     sourceProcessedShareCodes: progress?.processedFunds ?? null, sourceResearchCompleteShareCodes: research?.completeFunds ?? null,
     sourceResearchApplicableShareCodes: research?.applicableFunds ?? null,
@@ -423,15 +430,25 @@ function readJson(filename, limit = INDEX_LIMIT) {
   return JSON.parse(fs.readFileSync(filename, 'utf8'));
 }
 
+function readAnalysisProgress(filename) {
+  if (!fs.existsSync(filename)) return null;
+  const value = readJson(filename, 96_000_000);
+  return { phase: value.phase, research: value.research, processedFunds: value.processedFunds,
+    completionStatus: value.completionStatus, quarterUniverse: value.quarterUniverse };
+}
+
 function generate(dataRoot) {
   const root = path.resolve(dataRoot), staging = path.join(root, `.analysis-stage-${process.pid}`);
   if (fs.existsSync(staging)) fail('ANALYSIS_STAGE_EXISTS');
   fs.mkdirSync(staging);
+  let spool;
   try {
     const manifest = readJson(path.join(root, 'latest.json'));
-    const progress = fs.existsSync(path.join(root, 'progress.json')) ? readJson(path.join(root, 'progress.json'), 96_000_000) : null;
+    const progress = readAnalysisProgress(path.join(root, 'progress.json'));
+    spool = createAnalysisSpool(path.join(staging, '.spool'));
     const output = analyzeQuarter(manifest, file => readJson(path.join(root, file.slice('./data/'.length))), {
-      progress, writePart: (file, value) => fs.writeFileSync(path.join(staging, path.basename(file)), `${JSON.stringify(value)}\n`) });
+      progress, spool, writePart: (file, value) => fs.writeFileSync(path.join(staging, path.basename(file)), `${JSON.stringify(value)}\n`) });
+    spool.dispose();
     const destination = path.join(root, 'analysis');
     fs.mkdirSync(destination, { recursive: true });
     // New files become visible before the new index. A failed run never replaces

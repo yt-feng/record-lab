@@ -5,6 +5,7 @@ import datetime as dt
 import hashlib
 import re
 from urllib.parse import urlsplit, parse_qsl
+from source_dates import china_date
 
 METHOD = 'pdf-explicit-fund-code-rows-v1'
 PERIOD = re.compile(r'(20\d{2})\s*年\s*(?:第\s*([1-4一二三四])\s*季度|(中期|半年度|年度))\s*报告')
@@ -70,7 +71,7 @@ def normalize_portfolio_identity(raw, report=None, *, now=None):
             or raw.get('textHashScope') != 'provided-extracted-pages'):
         return None
     observed = _instant(raw.get('retrievedAt'))
-    if not observed or observed > current + dt.timedelta(minutes=5) or observed.date().isoformat() < raw['publishedAt']: return None
+    if not observed or observed > current + dt.timedelta(minutes=5) or china_date(observed).isoformat() < raw['publishedAt']: return None
     if report is not None and any(raw.get(key) != report.get(key) for key in ('sourceUrl', 'periodEnd', 'publishedAt', 'kind')): return None
     title = raw.get('reportPeriodEvidence')
     if (not isinstance(title, dict) or not _page(title.get('page')) or not isinstance(title.get('text'), str)

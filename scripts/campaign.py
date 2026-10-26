@@ -17,6 +17,7 @@ from quarter_catalog import (compose_quarter_catalog, freeze_catalog, validate_c
                              normalize_overlay, recover_historical_overlay, combine_historical_overlays,
                              historical_candidate_codes, report_candidate_codes, copy_frozen_catalog)
 from report_identity_catalog import supplement_catalog
+from source_dates import china_today
 
 PERIODS = {
     '2026Q2': ('2026-06-30', '2026-03-31'),
@@ -339,10 +340,15 @@ def publish(data='web/data', parts='.cache/parts'):
             'continueRun': progress.get('continueRun'), 'nextRetryAt': progress.get('nextRetryAt'),
             'completionAudit': progress.get('completionAudit'),
         })
+        summary = {'quarter': quarter, **{k: progress.get(k) for k in (
+            'totalFunds', 'processedFunds', 'failedFunds', 'pendingFunds', 'research', 'completionStatus', 'continueRun')}}
+        # The analyzer reads its own compact progress view. Do not retain the
+        # whole per-product checkpoint in this parent process during analysis
+        # or while merging the next quarter.
+        del progress
         subprocess.run(['node', 'scripts/analyze-data.js', '--data', str(output),
                         '--output', str(output / 'analysis.json')], check=True)
-        summaries.append({'quarter': quarter, **{k: progress.get(k) for k in (
-            'totalFunds', 'processedFunds', 'failedFunds', 'pendingFunds', 'research', 'completionStatus', 'continueRun')}})
+        summaries.append(summary)
     periods = []
     for quarter, (target, baseline) in PERIODS.items():
         directory = root / 'periods' / quarter
@@ -370,7 +376,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('command', choices=['plan', 'publish'])
     parser.add_argument('--quarter', choices=['both', *PERIODS], default='both')
-    parser.add_argument('--as-of', default=dt.datetime.now(dt.timezone.utc).date().isoformat())
+    parser.add_argument('--as-of', default=china_today())
     parser.add_argument('--shards', type=int, default=16)
     parser.add_argument('--batch-size', type=int, default=75)
     parser.add_argument('--historical-overlays', help='JSON object mapping quarter IDs to normalized historical overlays')

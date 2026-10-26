@@ -12,6 +12,7 @@ const { VERSION: PRICE_COVERAGE_VERSION, calendar, validCompletePrice, validComp
 const { bindingFor, validPatch, canReplacePrice, key: priceKey } = require('../lib/price-patches');
 const { reuseCompletePrices } = require('../lib/reuse-prices');
 const { normalizePortfolioIdentity, retainPortfolioIdentity } = require('../lib/portfolio-identity');
+const { chinaDate } = require('../web/source-dates');
 
 const CODE = /^\d{6}$/;
 const COMPANY = /^[A-Za-z0-9_-]{1,40}$/;
@@ -25,7 +26,7 @@ const label = (value, limit = 200) => typeof value === 'string' ? value.trim().s
 const clone = value => JSON.parse(JSON.stringify(value));
 const fixedErrors = new Set(['INVALID_CATALOG', 'INVALID_PART', 'INVALID_FUND', 'INVALID_COMPANY_SNAPSHOT',
   'CATALOG_IDENTITY_MISMATCH', 'INVALID_ARGUMENTS', 'MERGE_READ_FAILED', 'MERGE_WRITE_FAILED',
-  'PORTFOLIO_IDENTITY_CONFLICT', 'TARGET_PERIOD_MISMATCH', 'COMPANY_FUND_TOO_LARGE', 'MERGE_FAILED']);
+  'PORTFOLIO_IDENTITY_CONFLICT', 'TARGET_PERIOD_MISMATCH', 'COMPANY_FUND_TOO_LARGE', 'MERGE_COMPONENT_TOO_LARGE', 'MERGE_FAILED']);
 
 class MergeError extends Error {
   constructor(code) { super(fixedErrors.has(code) ? code : 'MERGE_FAILED'); this.code = this.message; }
@@ -34,7 +35,7 @@ class MergeError extends Error {
 function validEnvelope(envelope, now, config) {
   return envelope && envelope.schemaVersion === 1 && envelope.sourceMode === 'actions'
     && Array.isArray(envelope.funds) && validDate(envelope.asOf)
-    && envelope.asOf <= now.toISOString().slice(0, 10) && timestamp(envelope.retrievedAt)
+    && envelope.asOf <= chinaDate(now) && timestamp(envelope.retrievedAt)
     && Date.parse(envelope.retrievedAt) <= now.getTime() + 300000
     && (!config.targetPeriodEnd || !envelope.targetPeriodEnd || envelope.targetPeriodEnd === config.targetPeriodEnd);
 }
@@ -339,7 +340,7 @@ function mergeReceipt(funds, codes, config, now, attempts = new Map()) {
 }
 
 function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManifest = null, catalog,
-  config = {}, now = new Date(), receiptCodes = [], pageLimits } = {}) {
+  config = {}, now = new Date(), receiptCodes = [], pageLimits, reusePrices = true, onSourceFunds = null } = {}) {
   const currentTime = now instanceof Date ? now : new Date(now);
   if (!Number.isFinite(currentTime.getTime())) throw new MergeError('MERGE_FAILED');
   let directory;
@@ -465,9 +466,12 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
     }
   }
   const sourceFunds = [...byCode.values()];
+  if (onSourceFunds) onSourceFunds(sourceFunds);
   const funds = deduplicatePortfolios(sourceFunds, addError);
-  const { mutatedFunds: reusedFunds, ...reuseCounts } = reuseCompletePrices(funds,
-    { phase: config, now: currentTime, recoverPrice, sourceFunds });
+  const { mutatedFunds: reusedFunds, ...reuseCounts } = reusePrices ? reuseCompletePrices(funds,
+    { phase: config, now: currentTime, recoverPrice, sourceFunds }) : {
+      mutatedFunds: [], reusedPriceRowCount: 0, reusedPriceFundCount: 0, eligiblePriceKeyCount: 0,
+      conflictingPriceKeyCount: 0, partialConflictRowCount: 0 };
   const receipt = mergeReceipt(funds, requestedCodes, config, currentTime, attempts);
   receipt.pricePatches = priceResults;
   // No new observation means no fabricated new timestamp or overwritten old files.
@@ -545,23 +549,6 @@ function readJson(filename) {
   } catch { throw new MergeError('MERGE_READ_FAILED'); }
 }
 
-function partSnapshots(root) {
-  const snapshots = [];
-  if (!fs.existsSync(root)) return snapshots;
-  const visit = (directory, depth) => {
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      if (entry.isSymbolicLink()) continue;
-      const filename = path.join(directory, entry.name);
-      if (entry.isDirectory() && depth < 2) visit(filename, depth + 1);
-      else if (entry.isFile() && (entry.name === 'snapshot.json' || entry.name === 'part.json' || /^part[^/]*\.json$/.test(entry.name))) {
-        try { snapshots.push(readJson(filename)); } catch { snapshots.push(null); }
-      }
-    }
-  };
-  visit(root, 0);
-  return snapshots;
-}
-
 function statusCodes(root) {
   const codes = new Set();
   if (!fs.existsSync(root)) return [];
@@ -591,6 +578,13 @@ function writeAtomic(filename, value) {
   }
 }
 
+function mergeFiles(options) {
+  return require('./merge-storage').mergeOnDisk({ ...options,
+    receiptCodes: options.receiptCodes || statusCodes(options.parts), engine: mergeSnapshots,
+    helpers: { readJson, validEnvelope, coverageFor, observationDates, recoverPrice, writeAtomic, finalObservation,
+      publicUrl, catalogDetails, maxCompanyBytes: MAX_COMPANY_BYTES, maxCompanyFunds: MAX_COMPANY_FUNDS } });
+}
+
 function main(argv = process.argv.slice(2)) {
   try {
     const args = { parts: '.cache/parts', data: 'web/data', catalog: 'web/data/catalog.json', config: 'config/universe.json' };
@@ -603,31 +597,7 @@ function main(argv = process.argv.slice(2)) {
     const config = fs.existsSync(args.config) ? readJson(args.config) : {};
     const manifestFile = path.join(args.data, 'latest.json');
     const previousManifest = fs.existsSync(manifestFile) ? readJson(manifestFile) : null;
-    const companyRoot = path.join(args.data, 'companies');
-    const previousCompanies = {};
-    const referenced = Array.isArray(previousManifest?.companyFiles)
-      ? new Set(previousManifest.companyFiles.map(item => item.path?.match(/^\.\/data\/companies\/([A-Za-z0-9_-]{1,64})\.json$/)?.[1]).filter(Boolean)) : null;
-    if (fs.existsSync(companyRoot)) {
-      for (const entry of fs.readdirSync(companyRoot, { withFileTypes: true })) {
-        if (entry.isFile() && entry.name.endsWith('.json') && COMPANY_FILE.test(entry.name.slice(0, -5))
-          && (!referenced || referenced.has(entry.name.slice(0, -5)))) {
-          previousCompanies[entry.name.slice(0, -5)] = readJson(path.join(companyRoot, entry.name));
-        }
-      }
-    }
-    const result = mergeSnapshots({ snapshots: partSnapshots(args.parts), previousCompanies, previousManifest, catalog, config,
-      receiptCodes: statusCodes(args.parts) });
-    if (result.changed) {
-      for (const [companyCode, envelope] of Object.entries(result.companySnapshots)) {
-        writeAtomic(path.join(companyRoot, `${companyCode}.json`), envelope);
-      }
-      writeAtomic(manifestFile, result.manifest);
-      for (const entry of fs.existsSync(companyRoot) ? fs.readdirSync(companyRoot, { withFileTypes: true }) : []) {
-        if (entry.isFile() && entry.name.endsWith('.json') && COMPANY_FILE.test(entry.name.slice(0, -5))
-          && !Object.hasOwn(result.companySnapshots, entry.name.slice(0, -5))) fs.unlinkSync(path.join(companyRoot, entry.name));
-      }
-    }
-    writeAtomic(path.join(args.parts, 'merge-receipt.json'), result.receipt);
+    const result = mergeFiles({ ...args, catalog, config, previousManifest });
     process.stdout.write(`${JSON.stringify({ status: result.changed ? 'updated' : 'unchanged', ...result.counts,
       errorCodes: result.errors })}\n`);
     return 0;
@@ -639,4 +609,4 @@ function main(argv = process.argv.slice(2)) {
 
 if (require.main === module) process.exitCode = main();
 
-module.exports = { MergeError, main, mergeSnapshots, sanitizeFund, splitCompanyFunds };
+module.exports = { MergeError, main, mergeFiles, mergeSnapshots, sanitizeFund, splitCompanyFunds };

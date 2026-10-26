@@ -1,5 +1,6 @@
 """Synthetic page tests; fixed real PDFs are requested only by Actions."""
 import importlib.util
+import datetime as dt
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,40 @@ def diagnose(text):
 
 
 class VerifyManagersTests(unittest.TestCase):
+    def test_actual_report_only_normalizer_requires_and_receives_pdf_extraction_facts(self):
+        from report_extract import PDFPages
+        from verify_repairs import VerificationError
+        pages = PDFPages([HEADER + ROW + END], 1)
+        details = verify.manager_details_from_pages(pages, SAMPLE)
+        self.assertEqual(details['parseMethod'], 'pypdf')
+        self.assertEqual(details['pageStats']['totalPages'], 1)
+        self.assertGreater(details['pageStats']['charCount'], 100)
+        now = dt.datetime(2026, 10, 26, 15, 25, tzinfo=dt.timezone.utc)
+        with self.assertRaises(VerificationError):
+            verify.normalized_manager_check(SAMPLE, {key: details[key] for key in
+                ('reportManagers', 'managerTableCoverage')}, now)
+        result = verify.normalized_manager_check(SAMPLE, details, now)
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['managerCount'], 1)
+        self.assertTrue(result['sourcePreserved'])
+
+    def test_sample_uses_actual_normalization_and_fixed_failure_categories(self):
+        from report_extract import PDFPages
+        from providers import PublicProvider
+        from verify_repairs import VerificationError
+        pages = PDFPages([HEADER + ROW + END], 1)
+        with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), \
+                patch.object(PublicProvider, 'get', return_value=b'%PDF-synthetic'), \
+                patch('report_extract._pypdf_pages', return_value=pages), \
+                patch('manager_cells.enrich_manager_details'), patch.object(verify, 'add_layout_diagnostics'):
+            result = verify.run_sample(SAMPLE)
+        self.assertTrue(result['normalizedManagerCheck']['complete'])
+        self.assertTrue(result['tableCoverageComplete'])
+        self.assertLessEqual(result['sourceContextCharacters'], verify.MAX_CONTEXT_CHARACTERS)
+        self.assertEqual(verify.normalization_error(VerificationError('SNAPSHOT_REJECTED')), 'SNAPSHOT_REJECTED')
+        self.assertEqual(verify.normalization_error(ImportError('private local path')), 'NORMALIZATION_DEPENDENCY_MISSING')
+        self.assertEqual(verify.normalization_error(RuntimeError('private source text')), 'NORMALIZATION_CHECK_FAILED')
+
     def test_unchanged_parser_control_and_ast_counter_alignment(self):
         text = HEADER + ROW + END
         result = diagnose(text)
