@@ -661,6 +661,7 @@ class PublicProvider:
         from report_extract import extract_report
 
         data = self.get(report["sourceUrl"], binary=True)
+        pdf_retrieved_at = dt.datetime.now(dt.timezone.utc).isoformat()
         if not data.startswith(b"%PDF"):
             raise DataError("INVALID_PDF")
         def enrich(pages):
@@ -673,7 +674,8 @@ class PublicProvider:
             result = extract_report(data, report["sourceUrl"], report["periodEnd"], report["kind"],
                                     parse_pages=parse_pdf_pages, filename=report.get("title", "report.pdf"),
                                     max_pages=max_pages,
-                                    enrich_pages=enrich, published_at=report.get("publishedAt"))
+                                    enrich_pages=enrich, published_at=report.get("publishedAt"),
+                                    retrieved_at=pdf_retrieved_at)
         except Exception as error:
             code = getattr(error, "code", "PDF_PARSE_FAILED")
             raise DataError(code if re.fullmatch(r"[A-Z0-9_]+", str(code)) else "PDF_PARSE_FAILED") from None

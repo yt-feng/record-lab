@@ -11,6 +11,7 @@ const { strategySectionCoverageFor, strategyAnalysisFor } = require('../lib/stra
 const { VERSION: PRICE_COVERAGE_VERSION, calendar, validCompletePrice, validCompleteQuarterPrice, retainedCoverage } = require('../lib/price-coverage');
 const { bindingFor, validPatch, canReplacePrice, key: priceKey } = require('../lib/price-patches');
 const { reuseCompletePrices } = require('../lib/reuse-prices');
+const { normalizePortfolioIdentity, retainPortfolioIdentity } = require('../lib/portfolio-identity');
 
 const CODE = /^\d{6}$/;
 const COMPANY = /^[A-Za-z0-9_-]{1,40}$/;
@@ -161,6 +162,18 @@ function retainReportEvidence(target, source) {
   if (!target?.selectedReport || !source?.selectedReport || target.selectedReport.periodEnd !== source.selectedReport.periodEnd) return false;
   let changed = false;
   const to = target.selectedReport, from = source.selectedReport;
+  changed = retainPortfolioIdentity(to, from) || changed;
+  // Keep a different PDF's identity only in that report's own history. A
+  // quarterly strategy supplement cannot become an interim identity source.
+  const identityReports = [...(source.reports || []), from, source.previousReport].filter(Boolean)
+    .filter(report => normalizePortfolioIdentity(report.portfolioIdentityEvidence, report));
+  const targetReports = [...(target.reports || []), to, target.previousReport].filter(Boolean);
+  const identityKey = report => [report.periodEnd, report.kind, report.sourceUrl, report.publishedAt].join('|');
+  for (const report of identityReports) {
+    const matching = targetReports.filter(existing => identityKey(existing) === identityKey(report));
+    if (!matching.length) changed = true;
+    for (const existing of matching) changed = retainPortfolioIdentity(existing, report) || changed;
+  }
   const month = Number(to.periodEnd.slice(5, 7));
   const quarterStart = `${to.periodEnd.slice(0, 4)}-${String(Math.floor((month - 1) / 3) * 3 + 1).padStart(2, '0')}-01`;
   const oldManagers = verifiedReportManagers(target.reportManagers?.length ? target.reportManagers : to.managers, quarterStart, to.periodEnd);
@@ -221,6 +234,9 @@ function retainReportEvidence(target, source) {
   if (changed) {
     const key = r => [r.periodEnd, r.kind, r.sourceUrl].join('|');
     target.reports = [...new Map([...(target.reports || []), ...(source.reports || []), target.previousReport, to].filter(Boolean).map(r => [key(r), r])).values()];
+    for (const report of target.reports) {
+      for (const original of [...identityReports, ...targetReports]) retainPortfolioIdentity(report, original);
+    }
   }
   return changed;
 }

@@ -165,6 +165,10 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         return not main_code or main_code == code or code in details.get("shareClassCodes", [])
 
     def attach_details(report, details, document):
+        from portfolio_identity import normalize_portfolio_identity
+        identity = normalize_portfolio_identity(details.get("portfolioIdentityEvidence"), report)
+        if identity:
+            report["portfolioIdentityEvidence"] = identity
         report.update({key: details.get(key) for key in ("navYuan", "narrative")})
         if isinstance(details.get("managerTableCoverage"), dict):
             report["managerTableCoverage"] = details["managerTableCoverage"]
@@ -184,6 +188,11 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
                            "evidenceRetrievedAt": dt.datetime.now(dt.timezone.utc).isoformat()})
         if details.get("navYuan") is not None:
             report["navRetrievedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        # Legacy fund-level aliases describe the target observation. Baseline
+        # parsing must not overwrite them with an older class list or PDF.
+        identity_period = target_period or max(r["periodEnd"] for r in reports)
+        if document["periodEnd"] != identity_period:
+            return
         if details.get("portfolioCode"):
             fund.update({"portfolioCode": details["portfolioCode"], "sourcePortfolioCode": details["portfolioCode"],
                          "portfolioSourceUrl": document["sourceUrl"]})

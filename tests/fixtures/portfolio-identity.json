@@ -1,0 +1,72 @@
+{
+  "report": {
+    "title": "合成基金2026年第2季度报告",
+    "fundCode": "000001",
+    "sourceUrl": "https://example.org/quarter.pdf",
+    "periodEnd": "2026-06-30",
+    "publishedAt": "2026-07-21",
+    "kind": "quarterly"
+  },
+  "proof": {
+    "schemaVersion": 1,
+    "method": "pdf-explicit-fund-code-rows-v1",
+    "scope": "explicitly-listed-fund-codes",
+    "sourceUrl": "https://example.org/quarter.pdf",
+    "periodEnd": "2026-06-30",
+    "publishedAt": "2026-07-21",
+    "kind": "quarterly",
+    "retrievedAt": "2026-07-21T10:00:00+00:00",
+    "pdfSha256": "0e6621aafca3733630ff48eae8953e550323f352662e526d050aa1fff92b5f40",
+    "sourceTextHash": "de63b1483f39a18833b5a75c885fc0e3ce50369551eb2ccadf9ebdfd2b051b41",
+    "textHashScope": "provided-extracted-pages",
+    "reportPeriodEvidence": {
+      "text": "2026年第2季度报告",
+      "page": 1
+    },
+    "identitySection": {
+      "heading": "§2 基金产品概况",
+      "endHeading": "§3 主要财务指标和基金净值表现",
+      "startPage": 2,
+      "endPage": 3,
+      "pages": [
+        2,
+        3
+      ],
+      "sectionBounded": true,
+      "pageNumbersVerified": true
+    },
+    "rows": [
+      {
+        "field": "mainCode",
+        "text": "基金主代码 000001",
+        "codes": [
+          "000001"
+        ],
+        "page": 2,
+        "pages": [
+          2
+        ]
+      },
+      {
+        "field": "shareClassCodes",
+        "text": "下属分级基金的交易代码\n000001 000002",
+        "codes": [
+          "000001",
+          "000002"
+        ],
+        "page": 2,
+        "pages": [
+          2
+        ]
+      }
+    ],
+    "sourcePortfolioCode": "000001",
+    "shareClassCodes": [
+      "000001",
+      "000002"
+    ],
+    "eligibleForShareClassExpansion": true,
+    "shareClassUniverseComplete": false,
+    "shareClassSpecificMetricsProvided": false
+  }
+}

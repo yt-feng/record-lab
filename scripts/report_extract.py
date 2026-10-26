@@ -325,10 +325,15 @@ def _details_for_pages(pages: list[str], source_url: str, period_end: str, kind:
                       parse_pages: Callable[[list[str], str, str, str], dict[str, Any]],
                       enrich_pages: Callable[[list[str]], Mapping[str, Any]] | None = None,
                       page_numbers: list[int | None] | None = None,
-                      total_pages: int | None = None, published_at: str | None = None) -> dict[str, Any]:
+                      total_pages: int | None = None, published_at: str | None = None,
+                      retrieved_at: str | None = None, pdf_sha256: str | None = None) -> dict[str, Any]:
     parsed = dict(parse_pages(pages, source_url, period_end, kind))
     if enrich_pages:
         parsed.update(dict(enrich_pages(pages)))
+    from portfolio_identity import parse_portfolio_identity
+    parsed["portfolioIdentityEvidence"] = parse_portfolio_identity(pages,
+        {"sourceUrl": source_url, "periodEnd": period_end, "kind": kind, "publishedAt": published_at},
+        page_numbers=page_numbers, retrieved_at=retrieved_at, pdf_sha256=pdf_sha256)
     from report_managers import parse_report_managers
     parsed["reportManagers"] = parse_report_managers(pages,
         {"sourceUrl": source_url, "periodEnd": period_end, "kind": kind, "publishedAt": published_at}, page_numbers=page_numbers)
@@ -371,9 +376,10 @@ def extract_report(pdf_bytes: bytes, source_url: str, period_end: str, kind: str
                    mineru_client: MinerUClient | None = None, filename: str = "report.pdf",
                    max_pages: int = 300, env: Mapping[str, str] | None = None,
                    enrich_pages: Callable[[list[str]], Mapping[str, Any]] | None = None,
-                   published_at: str | None = None) -> dict[str, Any]:
+                   published_at: str | None = None, retrieved_at: str | None = None) -> dict[str, Any]:
     """Parse a report with MinerU when configured, falling back to pypdf."""
     tokens = mineru_tokens_from_env(env)
+    pdf_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
     mineru_error: str | None = None
     if tokens:
         client = mineru_client or MinerUClient(
@@ -388,7 +394,7 @@ def extract_report(pdf_bytes: bytes, source_url: str, period_end: str, kind: str
                 page_numbers = [number for number, _page in records]
                 pages = [page for _number, page in records]
                 result = _details_for_pages(pages, source_url, period_end, kind, parse_pages, enrich_pages, page_numbers,
-                                           published_at=published_at)
+                                           published_at=published_at, retrieved_at=retrieved_at, pdf_sha256=pdf_sha256)
                 result.update({"parseMethod": "mineru", "sourceTextHash": hashlib.sha256(markdown.encode("utf-8")).hexdigest(),
                                "pageStats": {**result["pageStats"], "markdownBytes": len(markdown.encode("utf-8"))},
                                "mineruTokenLabel": label})
@@ -400,7 +406,8 @@ def extract_report(pdf_bytes: bytes, source_url: str, period_end: str, kind: str
     try:
         pages = _pypdf_pages(pdf_bytes, max_pages)
         result = _details_for_pages(pages, source_url, period_end, kind, parse_pages, enrich_pages,
-                                    total_pages=getattr(pages, "total_pages", len(pages)), published_at=published_at)
+                                    total_pages=getattr(pages, "total_pages", len(pages)), published_at=published_at,
+                                    retrieved_at=retrieved_at, pdf_sha256=pdf_sha256)
         result["parseMethod"] = "pypdf-fallback" if mineru_error else "pypdf"
         if mineru_error:
             result["parseErrorCode"] = mineru_error

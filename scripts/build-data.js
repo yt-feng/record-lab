@@ -6,6 +6,7 @@ const path = require('node:path');
 const { analyzeFund, normalizeReport, normalizeLifecycleEvidence, validDate, validHoldingIdentity } = require('../lib/fund-analysis');
 const { validCompletePrice, validCompleteQuarterPrice } = require('../lib/price-coverage');
 const { normalizePatch } = require('../lib/price-patches');
+const { retainPortfolioIdentity } = require('../lib/portfolio-identity');
 
 const BUILD_CODES = new Set([
   'INVALID_INPUT', 'INVALID_AS_OF', 'FUTURE_AS_OF', 'INVALID_RETRIEVED_AT', 'INVALID_CONFIG',
@@ -547,7 +548,10 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
       const normalized = cleanReport(historical, code, raw.asOf, addError);
       if (normalized) history.set(reportKey(normalized), normalized);
     }
-    for (const [key, normalized] of reports) history.set(key, normalized);
+    for (const [key, normalized] of reports) {
+      retainPortfolioIdentity(normalized, history.get(key));
+      history.set(key, normalized);
+    }
     const finalFund = analyzeFund({ ...metadata,
       reports: [...history.values()] }, analysisOptions);
     finalFund.reports = [...history.values()].sort((a, b) => b.periodEnd.localeCompare(a.periodEnd)

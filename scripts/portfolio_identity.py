@@ -1,0 +1,178 @@
+"""Report-local proof of explicitly listed fund codes, never class inference."""
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import re
+from urllib.parse import urlsplit, parse_qsl
+
+METHOD = 'pdf-explicit-fund-code-rows-v1'
+PERIOD = re.compile(r'(20\d{2})\s*年\s*(?:第\s*([1-4一二三四])\s*季度|(中期|半年度|年度))\s*报告')
+HEADINGS = re.compile(r'(?m)^[ \t|]*(?P<text>(?:§\s*2\s*基金产品概况|2\.1\s*基金基本情况|§\s*3\s*[^\n|]+|2\.2\s*[^\n|]+))[ \t|]*$')
+LABELS = {'mainCode': ['基金主代码'], 'shareClassCodes': ['下属分级基金的交易代码', '下属分类基金的交易代码']}
+
+
+def _date(value):
+    try: return isinstance(value, str) and dt.date.fromisoformat(value).isoformat() == value
+    except (ValueError, TypeError): return False
+
+
+def _instant(value):
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return parsed if 'T' in value and parsed.tzinfo is not None else None
+    except (ValueError, TypeError, AttributeError): return None
+
+
+def _url(value):
+    if not isinstance(value, str) or len(value) > 2048: return False
+    try:
+        url = urlsplit(value); host = url.hostname or ''
+        return (url.scheme in {'http', 'https'} and '.' in host and ':' not in host and not re.fullmatch(r'\d+(?:\.\d+){3}', host)
+                and not host.endswith(('.local', '.localhost')) and not url.username and not url.password and not url.fragment
+                and not any(re.search(r'token|secret|password|signature|authorization|credential|key', key, re.I) for key, _ in parse_qsl(url.query)))
+    except ValueError: return False
+
+
+def _hash(value): return isinstance(value, str) and re.fullmatch(r'[a-f0-9]{64}', value) is not None
+def _page(value): return type(value) is int and 1 <= value <= 10000
+def _spaced(value): return r'\s*'.join(re.escape(char) for char in value)
+
+
+def _period(text):
+    match = PERIOD.fullmatch(re.sub(r'\s+', '', str(text or '')))
+    if not match: return None
+    year, quarter, annual = match.groups()
+    if quarter:
+        quarter = int(quarter) if quarter.isdigit() else '一二三四'.index(quarter) + 1
+        return ('quarterly', f'{year}-{("03-31", "06-30", "09-30", "12-31")[quarter-1]}')
+    return ('annual', year + '-12-31') if annual == '年度' else ('semiannual', year + '-06-30')
+
+
+def _row_values(text, field):
+    if not isinstance(text, str) or not 1 <= len(text) <= 350: return None
+    patterns = '|'.join(_spaced(label) for label in LABELS[field])
+    match = re.fullmatch(r'[ \t|]*(?:' + patterns + r')[ \t|：:]*\s*(\d{6}(?:[\s|]+\d{6})*)[\s|]*', text)
+    if not match: return None
+    codes = re.findall(r'\d{6}', match[1])
+    if not codes or len(codes) > 20 or len(codes) != len(set(codes)) or field == 'mainCode' and len(codes) != 1: return None
+    return codes
+
+
+def normalize_portfolio_identity(raw, report=None, *, now=None):
+    current = _instant(now) if isinstance(now, str) else now or dt.datetime.now(dt.timezone.utc)
+    if not isinstance(current, dt.datetime) or current.tzinfo is None: return None
+    if (not isinstance(raw, dict) or type(raw.get('schemaVersion')) is not int or raw.get('schemaVersion') != 1
+            or raw.get('method') != METHOD or raw.get('scope') != 'explicitly-listed-fund-codes'
+            or raw.get('shareClassUniverseComplete') is not False or raw.get('shareClassSpecificMetricsProvided') is not False
+            or not _url(raw.get('sourceUrl')) or not _date(raw.get('periodEnd')) or not _date(raw.get('publishedAt'))
+            or raw['publishedAt'] < raw['periodEnd'] or not _hash(raw.get('pdfSha256')) or not _hash(raw.get('sourceTextHash'))
+            or raw.get('textHashScope') != 'provided-extracted-pages'):
+        return None
+    observed = _instant(raw.get('retrievedAt'))
+    if not observed or observed > current + dt.timedelta(minutes=5) or observed.date().isoformat() < raw['publishedAt']: return None
+    if report is not None and any(raw.get(key) != report.get(key) for key in ('sourceUrl', 'periodEnd', 'publishedAt', 'kind')): return None
+    title = raw.get('reportPeriodEvidence')
+    if (not isinstance(title, dict) or not _page(title.get('page')) or not isinstance(title.get('text'), str)
+            or len(title['text']) > 80 or _period(title['text']) != (raw.get('kind'), raw['periodEnd'])): return None
+    table = raw.get('identitySection')
+    if not isinstance(table, dict): return None
+    pages = table.get('pages')
+    if (not isinstance(pages, list) or not 1 <= len(pages) <= 5 or not all(_page(page) for page in pages)
+            or pages != list(range(pages[0], pages[-1] + 1)) or table.get('startPage') != pages[0] or table.get('endPage') != pages[-1]
+            or table.get('pageNumbersVerified') is not True or table.get('sectionBounded') is not True): return None
+    heading, end = table.get('heading'), table.get('endHeading')
+    if not isinstance(heading, str) or len(heading) > 160 or not isinstance(end, str) or len(end) > 160: return None
+    compact = lambda value: re.sub(r'\s+', '', value) if isinstance(value, str) else ''
+    if not ((compact(heading) == '§2基金产品概况' and re.fullmatch(r'§3[^\d]{2,100}', compact(end)))
+            or (compact(heading) == '2.1基金基本情况' and re.fullmatch(r'2\.2[^\d]{2,100}', compact(end)))): return None
+    rows = raw.get('rows')
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 2: return None
+    parsed, cleaned = {}, []
+    for row in rows:
+        if not isinstance(row, dict) or row.get('field') not in LABELS or row['field'] in parsed: return None
+        codes = _row_values(row.get('text'), row['field'])
+        rp = row.get('pages')
+        if (not codes or codes != row.get('codes') or not isinstance(rp, list) or not rp or not all(_page(p) and p in pages for p in rp)
+                or rp != list(range(rp[0], rp[-1] + 1)) or row.get('page') != rp[0]): return None
+        parsed[row['field']] = codes
+        cleaned.append({'field': row['field'], 'text': row['text'], 'codes': codes, 'page': rp[0], 'pages': rp})
+    if 'mainCode' not in parsed: return None
+    main = parsed['mainCode'][0]; classes = parsed.get('shareClassCodes', [])
+    if classes and main not in classes: return None
+    if main != raw.get('sourcePortfolioCode') or classes != raw.get('shareClassCodes'): return None
+    if report is not None and any(report.get(key) is not None and report[key] not in [main, *classes] for key in ('fundCode', 'sourceFundCode')): return None
+    return {'schemaVersion': 1, 'method': METHOD, 'scope': 'explicitly-listed-fund-codes',
+            **{key: raw[key] for key in ('sourceUrl', 'periodEnd', 'publishedAt', 'kind', 'retrievedAt', 'pdfSha256', 'sourceTextHash', 'textHashScope')},
+            'reportPeriodEvidence': {'text': title['text'], 'page': title['page']},
+            'identitySection': {key: table[key] for key in ('heading', 'endHeading', 'startPage', 'endPage', 'pages', 'sectionBounded', 'pageNumbersVerified')},
+            'rows': cleaned, 'sourcePortfolioCode': main, 'shareClassCodes': classes,
+            'eligibleForShareClassExpansion': bool(classes), 'shareClassUniverseComplete': False, 'shareClassSpecificMetricsProvided': False}
+
+
+def parse_portfolio_identity(pages, report, *, page_numbers=None, retrieved_at=None, pdf_sha256=None, now=None):
+    """Only bounded identity-section rows from known physical PDF pages."""
+    if not isinstance(pages, list) or not isinstance(report, dict): return None
+    numbers = list(range(1, len(pages)+1)) if page_numbers is None else page_numbers
+    if not isinstance(numbers, list) or len(numbers) != len(pages): return None
+    chunks, positions = [], []
+    for text, number in zip(pages[:12], numbers[:12]):
+        value = str(text or '') + '\n'; chunks.append(value); positions.extend([number] * len(value))
+    text = ''.join(chunks)
+    periods = []
+    for chunk, number in zip(pages[:12], numbers[:12]):
+        lines = str(chunk or '').splitlines()
+        for line in [*lines[:8], *lines[-8:]]:
+            if len(line) > 180: continue
+            for match in PERIOD.finditer(line): periods.append((match[0], number))
+    expected = (report.get('kind'), report.get('periodEnd'))
+    if not periods or any(_period(value) != expected for value, _ in periods): return None
+    title = next(({'text': value, 'page': page} for value, page in periods if _page(page)), None)
+    if not title: return None
+    headings = list(HEADINGS.finditer(text))
+    starts = [item for item in headings if re.sub(r'\s+', '', item['text']) in {'§2基金产品概况', '2.1基金基本情况'}]
+    # A normal report has one product identity section. Duplicated real tables
+    # require review instead of pairing one product's main code with another.
+    if len(starts) != 1: return None
+    start = starts[0]; is_quarter = re.sub(r'\s+', '', start['text']) == '§2基金产品概况'
+    closing = next((item for item in headings if item.start() > start.end()
+                    and re.sub(r'\s+', '', item['text']).startswith('§3' if is_quarter else '2.2')), None)
+    if not closing: return None
+    section_pages = list(dict.fromkeys(positions[start.start():closing.end()]))
+    if (not section_pages or not all(_page(page) for page in section_pages) or len(section_pages) > 5
+            or section_pages != list(range(section_pages[0], section_pages[-1]+1))): return None
+    body = text[start.end():closing.start()]; rows = []
+    for field, labels in LABELS.items():
+        pattern = re.compile(r'(?m)^[ \t|]*(?:' + '|'.join(_spaced(label) for label in labels) + r')[ \t|：:]*')
+        matches = list(pattern.finditer(body))
+        if len(matches) > 1: return None
+        if not matches:
+            if field == 'mainCode': return None
+            continue
+        match = matches[0]; cursor = match.end(); end = cursor
+        candidate_lines = body[cursor:].splitlines(keepends=True)
+        for line in candidate_lines[:8]:
+            if not line.strip(' \t|\r\n'):
+                end += len(line); continue
+            if not re.fullmatch(r'[ \t|]*\d{6}(?:[ \t|]+\d{6})*[ \t|]*(?:\r?\n)?', line): break
+            end += len(line)
+        if end >= cursor + sum(len(line) for line in candidate_lines[:8]) and len(candidate_lines) > 8:
+            if re.fullmatch(r'[\s|]*\d{6}(?:[\s|]+\d{6})*[\s|]*', candidate_lines[8]): return None
+        quote = body[match.start():end].strip(); codes = _row_values(quote, field)
+        if not codes: return None
+        offset = start.end() + match.start(); last = start.end() + end
+        row_pages = list(dict.fromkeys(positions[offset:last]))
+        rows.append({'field': field, 'text': quote, 'codes': codes, 'page': row_pages[0], 'pages': row_pages})
+    main = next(row['codes'][0] for row in rows if row['field'] == 'mainCode')
+    classes = next((row['codes'] for row in rows if row['field'] == 'shareClassCodes'), [])
+    proof = {'schemaVersion': 1, 'method': METHOD, 'scope': 'explicitly-listed-fund-codes',
+             **{key: report.get(key) for key in ('sourceUrl', 'periodEnd', 'publishedAt', 'kind')},
+             'retrievedAt': retrieved_at, 'pdfSha256': pdf_sha256,
+             'sourceTextHash': hashlib.sha256('\n\n'.join(str(page or '').strip() for page in pages if str(page or '').strip()).encode()).hexdigest(),
+             'textHashScope': 'provided-extracted-pages', 'reportPeriodEvidence': title,
+             'identitySection': {'heading': start['text'].strip(), 'endHeading': closing['text'].strip(),
+                 'startPage': section_pages[0], 'endPage': section_pages[-1], 'pages': section_pages,
+                 'sectionBounded': True, 'pageNumbersVerified': True},
+             'rows': rows, 'sourcePortfolioCode': main, 'shareClassCodes': classes,
+             'shareClassUniverseComplete': False, 'shareClassSpecificMetricsProvided': False}
+    return normalize_portfolio_identity(proof, report, now=now)
