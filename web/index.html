@@ -17,7 +17,7 @@
       <span class="topbar-note"><span class="live-dot" aria-hidden="true"></span>以已披露报告为准</span>
     </div>
     <div class="hero wrap">
-      <div><p class="eyebrow">2026 Q2 · FUND DISCLOSURE EXPLORER</p><h1>公募持仓跟踪<span>2026 年二季度</span></h1><p class="hero-description">报告期 2026-06-30，对比 2026-03-31。按公司逐家查看，全部公募公司分批补齐。</p></div>
+      <div><p class="eyebrow" id="quarter-eyebrow">FUND DISCLOSURE EXPLORER</p><h1>公募持仓跟踪<span id="quarter-title">按季度独立查看</span></h1><p class="hero-description" id="quarter-description">正在读取已发布季度。持仓覆盖与 PDF、策略、规模、基准完整度分别统计。</p><label class="quarter-picker" for="quarter-select">研究季度<select id="quarter-select" aria-label="选择研究季度"><option value="">正在载入…</option></select></label></div>
       <div class="hero-actions"><button type="button" id="reload" class="button button-light">↻ 重新载入</button><label for="import-file" class="button button-outline">导入结果 JSON<input id="import-file" class="visually-hidden" type="file" accept=".json,application/json"></label><span>导入文件只在当前浏览器中查看</span></div>
     </div>
   </header>
@@ -35,6 +35,7 @@
       <p class="catalog-description">以公开目录逐家公司遍历。处理进度与已有报告分别显示，尚未处理的公司也保留在清单中。</p>
       <div class="coverage-topline"><div><strong id="progress-count">等待目录与进度</strong><span id="progress-detail">已有少量报告不代表全量覆盖。</span></div><span id="progress-percent">—</span></div>
       <progress id="coverage-progress" max="100" value="0" aria-label="全量基金处理进度">0%</progress>
+      <div id="research-status" class="research-status" aria-live="polite"><p>研究字段完整度待核验。</p></div>
       <div class="catalog-tools"><label class="search-box" for="company-search"><span aria-hidden="true">⌕</span><input id="company-search" type="search" placeholder="搜索全部公司名称或代码" autocomplete="off"></label><span id="catalog-dates">目录与处理时点尚未提供</span></div>
       <p id="catalog-status" class="catalog-status" role="status" aria-live="polite">正在读取目录与处理进度…</p>
       <div id="company-coverage" class="company-coverage"><div class="empty-state compact"><h3>全量目录待生成</h3><p>目录生成后，这里会显示每家公司的基金数量与处理状态。</p></div></div>

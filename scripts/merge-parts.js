@@ -53,12 +53,13 @@ function recoverPrice(row, supplied, retrievedAt) {
 }
 
 function sanitizeFund(item, { now, config, envelope }) {
-  if (!item || !CODE.test(item.code) || !['ok', 'no-equities'].includes(item.status)
+  const exemption = item?.status === 'unavailable' && item?.notApplicableEvidence;
+  if (!item || !CODE.test(item.code) || !['ok', 'no-equities', 'unavailable'].includes(item.status)
     || !['fresh', 'cached'].includes(item.dataStatus) || !validDate(item.asOf)
     || item.asOf > envelope.asOf || !timestamp(item.retrievedAt)
     || Date.parse(item.retrievedAt) > Date.parse(envelope.retrievedAt)
-    || !item.selectedReport || !Array.isArray(item.rows)
-    || (config.targetPeriodEnd && item.selectedReport.periodEnd !== config.targetPeriodEnd)) return null;
+    || (!item.selectedReport && !exemption) || (item.status === 'unavailable' && !exemption && item.selectedReport.reportOnly !== true) || !Array.isArray(item.rows)
+    || (config.targetPeriodEnd && item.selectedReport && item.selectedReport.periodEnd !== config.targetPeriodEnd)) return null;
   const reportList = [...(Array.isArray(item.reports) ? item.reports : []), item.selectedReport, item.previousReport].filter(Boolean);
   const reports = [...new Map(reportList.map(report => [[report.periodEnd, report.kind, report.sourceUrl].join('|'), report])).values()];
   const cleanInput = {
@@ -67,10 +68,11 @@ function sanitizeFund(item, { now, config, envelope }) {
       .map(manager => ({ name: label(manager && manager.name, 100), startDate: manager && manager.startDate,
         endDate: manager && manager.endDate })),
     metadataSourceUrl: item.metadataSourceUrl, managerSourceUrl: item.managerSourceUrl,
+    inceptionDate: item.inceptionDate, inceptionSourceUrl: item.inceptionSourceUrl,
     managerScope: item.managerScope, managersAsOf: item.managersAsOf,
     shareClassCodes: (Array.isArray(item.shareClassCodes) ? item.shareClassCodes : []).filter(code => typeof code === 'string' && CODE.test(code)),
     sourcePortfolioCode: item.sourcePortfolioCode, portfolioSourceUrl: item.portfolioSourceUrl,
-    reports, noEquitiesEvidence: item.noEquitiesEvidence,
+    reports, noEquitiesEvidence: item.noEquitiesEvidence, notApplicableEvidence: item.notApplicableEvidence,
   };
   let clean;
   try {
@@ -78,7 +80,7 @@ function sanitizeFund(item, { now, config, envelope }) {
       { now, config: { funds: [{ code: item.code }], targetPeriodEnd: config.targetPeriodEnd,
         baselinePeriodEnd: config.baselinePeriodEnd } }).funds[0];
   } catch { return null; }
-  if (!clean || clean.selectedReport.periodEnd !== item.selectedReport.periodEnd || clean.status !== item.status) return null;
+  if (!clean || clean.selectedReport?.periodEnd !== item.selectedReport?.periodEnd || clean.status !== item.status) return null;
   const suppliedRows = new Map(item.rows.filter(row => row && typeof row.stockCode === 'string')
     .map(row => [`${row.market}:${row.stockCode}`, row]));
   for (const row of clean.rows) {
@@ -113,9 +115,11 @@ function mapCompany(fund, directory) {
 function shouldReplace(current, candidate) {
   if (!current) return true;
   if (Date.parse(candidate.retrievedAt) <= Date.parse(current.retrievedAt)) return false;
+  if (!candidate.selectedReport) return !current.selectedReport;
+  if (!current.selectedReport) return true;
   if (candidate.selectedReport.periodEnd < current.selectedReport.periodEnd) return false;
   if (candidate.selectedReport.periodEnd === current.selectedReport.periodEnd) {
-    if (candidate.status !== current.status) return false;
+    if (candidate.status !== current.status && current.status !== 'unavailable') return false;
     if (candidate.selectedReport.holdings.length < current.selectedReport.holdings.length) return false;
     if (current.selectedReport.coverage === 'full' && candidate.selectedReport.coverage !== 'full') return false;
   }
@@ -123,7 +127,7 @@ function shouldReplace(current, candidate) {
 }
 
 function retainPrices(candidate, old) {
-  if (!old || old.selectedReport.periodEnd !== candidate.selectedReport.periodEnd) return;
+  if (!old?.selectedReport || !candidate.selectedReport || old.selectedReport.periodEnd !== candidate.selectedReport.periodEnd) return;
   const rows = new Map(old.rows.map(row => [`${row.market}:${row.stockCode}`, row]));
   for (const row of candidate.rows) {
     if (row.priceRange.status !== 'observed') {
@@ -132,6 +136,41 @@ function retainPrices(candidate, old) {
     }
   }
   candidate.summary.observedPriceCount = candidate.rows.filter(row => row.priceRange.status === 'observed').length;
+}
+
+// Fill independently sourced gaps without replacing a stronger holdings table.
+// A recovered narrative keeps its own source, period, extraction time and PDF hash.
+function retainReportEvidence(target, source) {
+  if (!target?.selectedReport || !source?.selectedReport || target.selectedReport.periodEnd !== source.selectedReport.periodEnd) return false;
+  let changed = false;
+  const to = target.selectedReport, from = source.selectedReport;
+  if (Date.parse(source.retrievedAt) > Date.parse(target.retrievedAt) && from.holdingsIncomplete === true) {
+    to.holdingsIncomplete = true;
+    to.holdingsExcludedRowCount = Math.max(to.holdingsExcludedRowCount || 0, from.holdingsExcludedRowCount || 0);
+    to.holdingsIncompleteReason = from.holdingsIncompleteReason;
+    changed = true;
+  }
+  if (!to.narrative?.text && from.narrative?.text) {
+    to.narrative = clone(from.narrative); target.narrative = clone(from.narrative); changed = true;
+    for (const key of ['parseMethod', 'parseErrorCode', 'sourceTextHash', 'pageStats', 'strategyExcerpts', 'strategyThemes',
+      'reportPdfSourceUrl', 'reportPdfPeriodEnd', 'reportPdfKind']) if (from[key] !== undefined) to[key] = clone(from[key]);
+    to.evidenceRetrievedAt = source.retrievedAt;
+  } else if ((!to.pageStats?.textStatus || to.pageStats.truncated) && from.pageStats?.textStatus === 'usable' && !from.pageStats.truncated
+    && to.sourceUrl === from.sourceUrl) {
+    for (const key of ['parseMethod', 'parseErrorCode', 'sourceTextHash', 'pageStats', 'strategyExcerpts', 'strategyThemes',
+      'reportPdfSourceUrl', 'reportPdfPeriodEnd', 'reportPdfKind']) if (from[key] !== undefined) to[key] = clone(from[key]);
+    to.evidenceRetrievedAt = source.retrievedAt; changed = true;
+  }
+  if (!(to.navYuan > 0) && from.navYuan > 0 && publicUrl(from.navSourceUrl || from.sourceUrl)) {
+    to.navYuan = from.navYuan; to.navSourceUrl = from.navSourceUrl || from.sourceUrl;
+    to.navRetrievedAt = source.retrievedAt; changed = true;
+  }
+  if (!target.previousReport && source.previousReport) { target.previousReport = clone(source.previousReport); changed = true; }
+  if (changed) {
+    const key = r => [r.periodEnd, r.kind, r.sourceUrl].join('|');
+    target.reports = [...new Map([...(target.reports || []), ...(source.reports || []), target.previousReport, to].filter(Boolean).map(r => [key(r), r])).values()];
+  }
+  return changed;
 }
 
 function coverageFor(funds, directory, config, expectedCount = directory.fundCount) {
@@ -144,6 +183,8 @@ function coverageFor(funds, directory, config, expectedCount = directory.fundCou
     priceAvailable: funds.reduce((sum, fund) => sum + fund.rows.filter(row => row.current && row.priceRange.status === 'observed').length, 0),
     narrativeCount: funds.filter(fund => fund.narrative?.text).length,
     noEquitiesFundCount: funds.filter(fund => fund.status === 'no-equities').length,
+    notApplicableFundCount: funds.filter(fund => fund.notApplicableEvidence).length,
+    reportOnlyFundCount: funds.filter(fund => fund.selectedReport?.reportOnly).length,
     catalogStatus: directory.known ? 'available' : 'unavailable',
     limitations: ['目录总数不代表已完成采集。', '只有报告明确确认未持有股票才记为无股票持仓。',
       '区间最高最低价不是实际持仓成本。', '同组合仅凭公开主代码和份额证据去重，份额金额不叠加。'],
@@ -177,6 +218,11 @@ function splitCompanyFunds(funds, makeEnvelope, { maxBytes = MAX_COMPANY_BYTES, 
 }
 
 function finalObservation(fund) {
+  if (fund.notApplicableEvidence && !fund.selectedReport) return {
+    representativeCode: fund.code, companyCode: fund.companyId, status: 'not-applicable',
+    notApplicableEvidence: clone(fund.notApplicableEvidence), observedAt: fund.retrievedAt,
+    shareClassCodes: [fund.code], sourcePortfolioCode: null, portfolioSourceUrl: null,
+  };
   const stocks = new Map(fund.selectedReport.holdings.map(item => [`${item.market}:${item.stockCode}`,
     { stockCode: item.stockCode, market: item.market }]));
   const observed = new Set(fund.rows.filter(row => row.current && row.priceRange.status === 'observed')
@@ -186,7 +232,7 @@ function finalObservation(fund) {
     publishedAt: fund.selectedReport.publishedAt, observedAt: fund.retrievedAt };
   if (fund.status === 'no-equities') reportEvidence.noEquities = clone(fund.noEquitiesEvidence);
   return { representativeCode: fund.code, companyCode: fund.companyId,
-    status: fund.status === 'no-equities' ? 'no-equities' : 'complete', reportEvidence,
+    status: fund.status === 'no-equities' ? 'no-equities' : fund.status === 'ok' ? 'complete' : 'failed', reportEvidence,
     priceCoverage: { holdingCount: stocks.size, priceAvailable: stocks.size - missingStocks.length, missingStocks,
       holdingsIdentity: crypto.createHash('sha256').update([...stocks.keys()].sort().join('|')).digest('hex') },
     sourcePortfolioCode: fund.sourcePortfolioCode, portfolioSourceUrl: fund.portfolioSourceUrl,
@@ -236,7 +282,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
   for (const [companyCode, envelope] of Object.entries(previousCompanies)) {
     if (!COMPANY_FILE.test(companyCode) || !validEnvelope(envelope, currentTime, config)) { addError('INVALID_COMPANY_SNAPSHOT'); continue; }
     for (const item of envelope.funds) {
-      const fund = sanitizeFund(item, { now: currentTime, config, envelope });
+      let fund = sanitizeFund(item, { now: currentTime, config, envelope });
       if (!fund) { addError('INVALID_FUND'); continue; }
       const actual = mapCompany(fund, directoryMap);
       if (!actual) { addError('CATALOG_IDENTITY_MISMATCH'); continue; }
@@ -248,11 +294,21 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
     if (!validEnvelope(envelope, currentTime, config)) { addError('INVALID_PART'); continue; }
     for (const item of envelope.funds) {
       if (item?.dataStatus !== 'fresh') continue;
-      const fund = sanitizeFund(item, { now: currentTime, config, envelope });
+      let fund = sanitizeFund(item, { now: currentTime, config, envelope });
       if (!fund) { addError('INVALID_FUND'); continue; }
       if (!mapCompany(fund, directoryMap)) { addError('CATALOG_IDENTITY_MISMATCH'); continue; }
       const old = byCode.get(fund.code);
-      if (!shouldReplace(old, fund)) continue;
+      if (!shouldReplace(old, fund)) {
+        if (old && retainReportEvidence(old, fund)) {
+          const rebuilt = sanitizeFund(old, { now: currentTime, config, envelope: { asOf: old.asOf, retrievedAt: old.retrievedAt } });
+          if (rebuilt) { byCode.set(old.code, rebuilt); acceptedFreshFundCount += 1; }
+        }
+        continue;
+      }
+      if (retainReportEvidence(fund, old)) {
+        fund = sanitizeFund(fund, { now: currentTime, config, envelope });
+        if (!fund) continue;
+      }
       retainPrices(fund, old);
       byCode.set(fund.code, fund);
       acceptedFreshFundCount += 1;
@@ -298,7 +354,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
           .map(manager => manager.name)))].sort() });
     }
   }
-  const availableCodes = new Set(funds.flatMap(fund => fund.sourcePortfolioCode && publicUrl(fund.portfolioSourceUrl)
+  const availableCodes = new Set(funds.filter(fund => ['ok', 'no-equities'].includes(fund.status)).flatMap(fund => fund.sourcePortfolioCode && publicUrl(fund.portfolioSourceUrl)
     ? fund.shareClassCodes : [fund.code]));
   for (const company of directory.companies) {
     const records = directory.funds.filter(fund => fund.companyId === company.id);

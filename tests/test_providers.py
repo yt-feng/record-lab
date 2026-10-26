@@ -259,3 +259,100 @@ class CheckpointTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ReportRecoveryTests(unittest.TestCase):
+    def test_share_class_nav_sum_requires_known_exact_columns(self):
+        pages = ["基金主代码 000001\n下属分级基金的基金简称 示例A 示例C\n下属分级基金的交易代码 000001 000002\n4.期末基金资产净值 10,000,000.00 20,000,000.00\n5.期末基金份额净值 1.1234 1.3456"]
+        result = parse_pdf_pages(pages, "https://example.org/report.pdf", "2026-09-30", "quarterly")
+        self.assertEqual(result["navYuan"], 30000000)
+        wrong_columns = pages[0].replace(" 20,000,000.00", "")
+        self.assertIsNone(parse_pdf_pages([wrong_columns], "https://example.org/report.pdf", "2026-09-30", "quarterly")["navYuan"])
+
+    def test_pdf_table_fallback_is_section_bounded_and_keeps_units(self):
+        from providers import parse_pdf_holdings
+        text = "5.3 期末按公允价值占基金资产净值比例大小排序的前十名股票投资明细\n序号 股票代码 股票名称 数量（股） 公允价值（元） 占基金资产净值比例（%）\n1 600001 合成证券 1,000 20,000.00 2.50\n2 00700 合成港股 200 50,000.00 6.25\n5.4 期末按债券品种分类的债券投资组合\n1 110001 债券 10 100.00 1.00"
+        rows = parse_pdf_holdings([text])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["marketValueYuan"], 20000)
+        self.assertEqual(rows[1]["currency"], "HKD")
+        self.assertEqual(parse_pdf_holdings([text.replace("股票投资明细", "债券投资明细")]), [])
+
+    def test_pdf_recovery_preserves_no_equity_strategy_and_report_only_evidence(self):
+        report = {"title": "合成基金2026年第3季度报告", "periodEnd": "2026-09-30", "kind": "quarterly", "publishedAt": "2026-10-20", "sourceUrl": "https://example.org/report.pdf"}
+        class Source:
+            mode = "no-equities"
+            def overview(self, code): return {"name": "合成", "company": "机构", "managers": []}
+            def announcements(self, code, as_of): return [report]
+            def holdings(self, code, year): raise DataError("NO_HOLDINGS")
+            def report_details(self, document, **kwargs):
+                result = {"navYuan": 1000000, "narrative": {"text": "本基金本季度积极调整债券组合。", "page": 4,
+                          "sourceUrl": document["sourceUrl"], "periodStart": "2026-07-01", "periodEnd": "2026-09-30"},
+                          "parseMethod": "pypdf", "sourceTextHash": "a" * 64,
+                          "pageStats": {"charCount": 2000, "totalPages": 10, "processedPages": 10, "truncated": False, "textStatus": "usable"}}
+                if self.mode == "no-equities":
+                    result["noEquitiesEvidence"] = {**document, "confirmed": True, "page": 8, "text": "本基金本报告期末未持有股票。"}
+                if self.mode == "table":
+                    result["pdfHoldings"] = [{"stockCode": "600001", "stockName": "合成证券", "market": "CN", "currency": "CNY", "shares": 100, "weightPct": 1, "marketValueYuan": 10000}]
+                return result
+        source = Source()
+        item, errors = collect_fund({"code": "000001"}, "2026-10-26", provider=source, target_period="2026-09-30", baseline_period="2026-06-30")
+        self.assertTrue(item["reports"][0]["noEquitiesConfirmed"])
+        self.assertEqual(item["reports"][0]["narrative"]["periodStart"], "2026-07-01")
+        self.assertEqual(item["reports"][0]["parseMethod"], "pypdf")
+        source.mode = "report-only"
+        item, errors = collect_fund({"code": "000001"}, "2026-10-26", provider=source, target_period="2026-09-30")
+        self.assertTrue(item["reports"][0]["reportOnly"])
+        self.assertNotIn("noEquitiesEvidence", item)
+        self.assertIn("HOLDINGS_UNRESOLVED", [error["errorCode"] for error in errors])
+        source.mode = "table"
+        item, errors = collect_fund({"code": "000001"}, "2026-10-26", provider=source, target_period="2026-09-30")
+        self.assertEqual(item["reports"][0]["holdingsRetrieval"], "pdf-stock-table-text")
+        self.assertEqual(item["reports"][0]["holdingsSourceUrl"], report["sourceUrl"])
+
+class CoverageBoundaryTests(unittest.TestCase):
+    def test_explicit_foundation_date_exempts_only_post_period_products(self):
+        from providers import parse_overview
+        overview = parse_overview('<table><tr><th>基金简称</th><td>合成</td></tr><tr><th>成立日期/规模</th><td>2026年07月06日 / 10亿份</td></tr></table>')
+        self.assertEqual(overview["foundationDate"], "2026-07-06")
+        class NewFund:
+            def overview(self, code): return overview
+            def announcements(self, *args): raise AssertionError("No report due before establishment")
+        fund, errors = collect_fund({"code": "000001"}, "2026-10-26", provider=NewFund(), target_period="2026-06-30")
+        self.assertEqual(fund["notApplicableEvidence"]["reason"], "ESTABLISHED_AFTER_PERIOD")
+        self.assertEqual(fund["notApplicableEvidence"]["date"], "2026-07-06")
+        self.assertEqual(fund["reports"], [])
+
+    def test_announcements_paginate_past_first_hundred_and_deduplicate(self):
+        class Source(PublicProvider):
+            def __init__(self): self.calls = []
+            def get(self, url, **kwargs):
+                page = kwargs["params"]["pageIndex"]; self.calls.append(page)
+                if page == 1:
+                    row = {"TITLE": "合成2026年第3季度报告", "PUBLISHDATEDESC": "2026-10-20", "ART_CODE": "AN202610200000000001"}
+                    return json.dumps({"Data": [row] * 100})
+                return json.dumps({"Data": [{"TITLE": "合成2026年第2季度报告", "PUBLISHDATEDESC": "2026-07-20", "ART_CODE": "AN202607200000000001"}]})
+        source = Source()
+        reports = source.announcements("000001", "2026-10-26")
+        self.assertEqual(source.calls, [1, 2])
+        self.assertEqual([report["periodEnd"] for report in reports], ["2026-09-30", "2026-06-30"])
+
+class DiscardedHoldingTests(unittest.TestCase):
+    def test_mixed_and_all_unsupported_security_rows_keep_explicit_counts(self):
+        head = '<div class="box"><h4>2026年3季度股票投资明细</h4><table><thead><tr><th>股票代码</th><th>股票名称</th><th>占净值比例</th><th>持股数（股）</th><th>持仓市值（元）</th></tr></thead><tbody>'
+        tail = '</tbody></table></div>'
+        valid = '<tr><td>00700</td><td>合成港股</td><td>3%</td><td>100</td><td>20000</td></tr>'
+        unsupported = '<tr><td>AAPL</td><td>合成海外股票</td><td>5%</td><td>50</td><td>10000</td></tr>'
+        rows = parse_holdings_html(head + valid + unsupported + tail)["2026-09-30"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows.excluded_rows, 1)
+        all_unsupported = parse_holdings_html(head + unsupported + tail)["2026-09-30"]
+        self.assertEqual(len(all_unsupported), 0)
+        self.assertEqual(all_unsupported.excluded_rows, 1)
+        class Source:
+            def overview(self, code): return {"name": "合成", "company": "机构", "managers": []}
+            def announcements(self, code, as_of): return [{"title": "合成2026年第3季度报告", "periodEnd": "2026-09-30", "kind": "quarterly", "publishedAt": "2026-10-20", "sourceUrl": "https://example.org/report.pdf"}]
+            def holdings(self, code, year): return {"2026-09-30": rows}
+            def report_details(self, document): return {"navYuan": 1, "narrative": None}
+        fund, _errors = collect_fund({"code": "000001"}, "2026-10-26", provider=Source(), target_period="2026-09-30")
+        self.assertTrue(fund["reports"][0]["holdingsIncomplete"])
+        self.assertEqual(fund["reports"][0]["holdingsExcludedRowCount"], 1)

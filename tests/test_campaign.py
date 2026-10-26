@@ -1,0 +1,145 @@
+import gzip
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+from campaign import quarter_config, seed_quarter, selected_periods, plan, publish
+from traversal import atomic_json, read_json
+
+spec = importlib.util.spec_from_file_location('prepare_site', Path(__file__).resolve().parents[1] / 'scripts/prepare-site.py')
+site = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(site)
+
+
+class CampaignTests(unittest.TestCase):
+    def test_two_quarter_campaign_keeps_missing_parts_and_exemptions_in_their_phase(self):
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for directory in ('scripts', 'lib', 'config'):
+                shutil.copytree(source / directory, root / directory, ignore=shutil.ignore_patterns('__pycache__'))
+            catalog = {'schemaVersion': 1, 'asOf': '2026-10-26', 'retrievedAt': '2026-10-26T00:00:00Z',
+                'coverage': {'directoryComplete': True, 'companyCount': 1, 'fundCount': 2},
+                'companies': [{'code': 'co1', 'name': '合成公司', 'fundCount': 2, 'directoryStatus': 'complete'}],
+                'funds': [{'code': '000001', 'name': '合成甲', 'companyCode': 'co1'},
+                          {'code': '000002', 'name': '合成乙', 'companyCode': 'co1'}]}
+            atomic_json(root / 'web/data/catalog.json', catalog)
+            atomic_json(root / 'web/data/latest.json', {'schemaVersion': 1, 'sourceMode': 'actions',
+                'asOf': '2026-09-29', 'retrievedAt': '2026-09-29T12:00:00Z', 'targetPeriodEnd': '2026-06-30',
+                'baselinePeriodEnd': '2026-03-31', 'funds': [], 'companyFiles': [], 'coverage': {}})
+            original = Path.cwd()
+            real_run = subprocess.run
+            def portable_run(command, **kwargs):
+                command = [sys.executable, *command[1:]] if command[0] == 'python' else command
+                kwargs.setdefault('capture_output', True)
+                return real_run(command, **kwargs)
+            child_runtime = patch('campaign.subprocess.run', side_effect=portable_run)
+            try:
+                os.chdir(root)
+                child_runtime.start()
+                plan('both', '2026-10-26', shards=1, batch_size=2, refresh=False)
+                matrix = read_json('.cache/plan/matrix.json')
+                self.assertEqual([item['quarter'] for item in matrix], ['2026Q2', '2026Q3'])
+                self.assertEqual([item['id'] for item in matrix], ['0', '1'])
+                for item in matrix:
+                    batch = read_json('.cache/plan/' + item['config'])
+                    self.assertEqual(batch['traversal']['batchId'], item['id'])
+                    self.assertTrue(batch['requireReportQuality'])
+                    self.assertEqual(batch['collectorVersion'], 2)
+                # One new product is explicitly post-Q3; all other batch work
+                # is absent, as if a runner stopped before writing its artifact.
+                import datetime as dt
+                stamp = dt.datetime.now(dt.timezone.utc).isoformat()
+                atomic_json('raw/input.json', {'asOf': '2026-10-26', 'retrievedAt': stamp, 'funds': [{
+                    'code': '000002', 'name': '合成乙', 'reports': [], 'managers': [],
+                    'notApplicableEvidence': {'reason': 'ESTABLISHED_AFTER_PERIOD', 'date': '2026-10-01',
+                        'sourceUrl': 'https://fundf10.eastmoney.com/jbgk_000002.html',
+                        'periodEnd': '2026-09-30', 'fundCode': '000002'}}], 'barsByStock': {}, 'errors': []})
+                subprocess.run(['node', 'scripts/build-data.js', '--input', 'raw/input.json',
+                    '--output', '.cache/parts/part-1/part.json', '--config', '.cache/plan/batch-1.json'],
+                    check=True, capture_output=True)
+                result = publish()
+                self.assertEqual([item['quarter'] for item in result['quarters']], ['2026Q2', '2026Q3'])
+                q2 = read_json('web/data/periods/2026Q2/progress.json')
+                q3 = read_json('web/data/periods/2026Q3/progress.json')
+                self.assertEqual(q2['phase']['targetPeriodEnd'], '2026-06-30')
+                self.assertEqual(q3['phase']['targetPeriodEnd'], '2026-09-30')
+                self.assertEqual(q2['failedFunds'], 2)
+                self.assertEqual(q2['notApplicableFunds'], 0)
+                self.assertEqual(q3['failedFunds'], 1)
+                self.assertEqual(q3['notApplicableFunds'], 1)
+                self.assertEqual(q3['processedFunds'], 0)
+                self.assertTrue(result['continueRun'])
+                self.assertEqual(read_json('web/data/periods.json')['defaultPeriod'], '2026Q3')
+                self.assertEqual(read_json('web/data/latest.json')['targetPeriodEnd'], '2026-06-30')
+            finally:
+                child_runtime.stop()
+                os.chdir(original)
+
+    def test_quarters_have_independent_exact_baselines_and_fresh_cutoff(self):
+        base = {'funds': [{'code': '000001'}], 'asOf': '2026-09-29', 'maxWorkers': 2}
+        q2 = quarter_config(base, '2026Q2', '2026-10-26')
+        q3 = quarter_config(base, '2026Q3', '2026-10-26')
+        self.assertEqual((q2['targetPeriodEnd'], q2['baselinePeriodEnd']), ('2026-06-30', '2026-03-31'))
+        self.assertEqual((q3['targetPeriodEnd'], q3['baselinePeriodEnd']), ('2026-09-30', '2026-06-30'))
+        self.assertEqual(q3['asOf'], '2026-10-26')
+        self.assertTrue(q2['requireReportQuality'])
+        self.assertEqual(q2['collectorVersion'], 2)
+        self.assertEqual(base['asOf'], '2026-09-29')
+        self.assertEqual(selected_periods('both'), ['2026Q2', '2026Q3'])
+        with self.assertRaises(ValueError): selected_periods('../private')
+
+    def test_only_legacy_q2_is_seeded_once_without_refreshing_dates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            raw = b'{"targetPeriodEnd":"2026-06-30","retrievedAt":"2026-10-13T01:00:00Z"}\n'
+            (root / 'latest.json').write_bytes(raw)
+            (root / 'companies').mkdir()
+            (root / 'companies/co1.json').write_text('{"funds":[]}')
+            q2 = seed_quarter(root, '2026Q2')
+            self.assertEqual((q2 / 'latest.json').read_bytes(), raw)
+            self.assertTrue((q2 / 'companies/co1.json').exists())
+            (root / 'latest.json').write_text('{}')
+            seed_quarter(root, '2026Q2')
+            self.assertEqual((q2 / 'latest.json').read_bytes(), raw)
+            q3 = seed_quarter(root, '2026Q3')
+            self.assertFalse((q3 / 'latest.json').exists())
+
+    def test_site_compression_is_lossless_and_phase_paths_do_not_cross(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / 'web'
+            period = root / 'data/periods/2026Q3'
+            (period / 'companies').mkdir(parents=True)
+            raw = b'{"funds":[{"code":"000001"}]}'
+            (period / 'companies/co1.json').write_bytes(raw)
+            (period / 'latest.json').write_text(json.dumps({'companyFiles': [{'path': './data/companies/co1.json'}]}))
+            output = Path(temp) / 'site'
+            result = site.prepare(root, output)
+            self.assertEqual(result['files'], 2)
+            zipped = output / 'data/periods/2026Q3/companies/co1.json.gz'
+            self.assertEqual(gzip.decompress(zipped.read_bytes()), raw)
+            self.assertEqual((period / 'companies/co1.json').read_bytes(), raw)
+            body = json.loads((output / 'data/periods/2026Q3/latest.json').read_text())
+            self.assertEqual(body['companyFiles'][0]['path'], './data/companies/co1.json.gz')
+            with self.assertRaises(ValueError): site.prepare(root, output)
+
+    def test_staging_rejects_missing_part_and_excessive_bytes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / 'web'; root.mkdir()
+            (root / 'latest.json').write_text(json.dumps({'companyFiles': [{'path': './data/companies/absent.json'}]}))
+            with self.assertRaisesRegex(ValueError, 'MISSING_COMPANY_PART'):
+                site.prepare(root, Path(temp) / 'bad')
+            (root / 'latest.json').write_text('{}')
+            with self.assertRaisesRegex(ValueError, 'SITE_SIZE_EXCEEDED'):
+                site.prepare(root, Path(temp) / 'large', max_bytes=1)
+
+
+if __name__ == '__main__': unittest.main()

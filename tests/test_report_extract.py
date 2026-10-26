@@ -107,3 +107,35 @@ class ExtractionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ExtractionCoverageTests(unittest.TestCase):
+    def test_unmarked_markdown_does_not_invent_pdf_page_numbers(self):
+        text = "4.4 报告期内基金投资策略和运作分析\n本基金根据企业经营和估值调整组合。\n---\n后续说明"
+        self.assertEqual(markdown_page_records(text), [(None, text)])
+        class Parsed:
+            def parse_with_token(self, *_args):
+                return text
+        result = extract_report(b"synthetic", "https://example.org/report.pdf", "2026-09-30", "quarterly",
+                                parse_pages=lambda *args: {"navYuan": None, "narrative": {"text": "原文", "page": 1}},
+                                mineru_client=Parsed(), env={"MINER_U": "fixture"})
+        self.assertIsNone(result["narrative"]["page"])
+        self.assertIsNone(result["strategyExcerpts"][0]["page"])
+        self.assertFalse(result["pageStats"]["pageNumbersVerified"])
+        self.assertIsNone(result["pageStats"]["truncated"])
+
+    def test_empty_pdf_text_is_not_a_successful_parse(self):
+        with patch.object(report_extract, "_pypdf_pages", return_value=["", "  "]):
+            with self.assertRaises(report_extract.ExtractionError) as caught:
+                extract_report(b"synthetic", "https://example.org/report.pdf", "2026-06-30", "quarterly",
+                               parse_pages=lambda *args: {}, env={})
+        self.assertEqual(caught.exception.code, "PDF_TEXT_EMPTY")
+
+    def test_pypdf_total_pages_and_truncation_remain_explicit(self):
+        pages = report_extract.PDFPages(["本基金披露内容。" * 20] * 2, 3)
+        with patch.object(report_extract, "_pypdf_pages", return_value=pages):
+            result = extract_report(b"synthetic", "https://example.org/report.pdf", "2026-06-30", "quarterly",
+                                    parse_pages=lambda *args: {}, env={})
+        self.assertEqual(result["pageStats"]["processedPages"], 2)
+        self.assertEqual(result["pageStats"]["totalPages"], 3)
+        self.assertTrue(result["pageStats"]["truncated"])
+        self.assertEqual(result["pageStats"]["textStatus"], "usable")

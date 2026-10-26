@@ -345,3 +345,48 @@ test('CLI atomic write succeeds, while a failed later build preserves exact prio
     assert.deepEqual(fs.readdirSync(temporary).sort(), ['config.json', 'input.json', 'latest.json']);
   } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
 });
+
+test('full no-equity reports retain PDF strategy and NAV instead of being overwritten by bare evidence', () => {
+  const evidence = noEquitiesEvidence();
+  const full = report({ sourceUrl: evidence.sourceUrl, holdings: [], coverage: 'full', noEquitiesConfirmed: true,
+    noEquitiesEvidence: evidence, parseMethod: 'pypdf', sourceTextHash: 'b'.repeat(64),
+    reportPdfSourceUrl: evidence.sourceUrl, reportPdfPeriodEnd: evidence.periodEnd, reportPdfKind: 'quarterly',
+    pageStats: { pageCount: 10, totalPages: 10, processedPages: 10, charCount: 2000, truncated: false, textStatus: 'usable' },
+    narrative: { text: '本基金调整债券组合。', page: 4, sourceUrl: evidence.sourceUrl, periodStart: '2026-04-01', periodEnd: '2026-06-30' } });
+  const result = build(raw([fund('000001', { reports: [full], noEquitiesEvidence: evidence })]));
+  assert.equal(result.funds[0].status, 'no-equities');
+  assert.equal(result.funds[0].selectedReport.navYuan, 10000);
+  assert.equal(result.funds[0].selectedReport.parseMethod, 'pypdf');
+  assert.equal(result.funds[0].narrative.text, '本基金调整债券组合。');
+  assert.equal(result.funds[0].selectedReport.pageStats.truncated, false);
+});
+
+test('parsed report without equity table remains reviewable but never proves zero holdings or exit trades', () => {
+  const partial = report({ holdings: [], reportOnly: true, parseMethod: 'pypdf', sourceTextHash: 'c'.repeat(64),
+    pageStats: { pageCount: 10, totalPages: 10, processedPages: 10, charCount: 2000, truncated: false },
+    narrative: { text: '报告中的组合说明。', sourceUrl: 'https://example.org/report.pdf', page: null },
+    strategyExcerpts: [{ text: '报告中的组合说明。', sourceUrl: 'https://example.org/report.pdf', page: null }] });
+  const prior = report({ periodEnd: '2026-03-31', publishedAt: '2026-04-20', sourceUrl: 'https://example.org/prior.pdf' });
+  const result = build(raw([fund('000001', { reports: [partial, prior] })]));
+  assert.equal(result.funds[0].status, 'unavailable');
+  assert.equal(result.funds[0].selectedReport.reportOnly, true);
+  assert.equal(result.funds[0].rows.length, 0);
+  assert.equal(result.funds[0].selectedReport.strategyExcerpts[0].page, null);
+  assert.equal(result.batchResults[0].errorCode, 'HOLDINGS_UNRESOLVED');
+  assert.throws(() => build(raw([fund('000001', { reports: [{ ...partial, sourceTextHash: null }] })])), { code: 'NO_VALID_FRESH_FUNDS' });
+});
+
+test('establishment after the target quarter is a sourced exemption, never a missing report or an invented holding', () => {
+  const evidence = { reason: 'ESTABLISHED_AFTER_PERIOD', fundCode: '000001', periodEnd: '2026-06-30',
+    date: '2026-07-10', sourceUrl: 'https://example.org/overview' };
+  const input = raw([fund('000001', { reports: [], notApplicableEvidence: evidence })]);
+  const cfg = { funds: [{ code: '000001' }], targetPeriodEnd: '2026-06-30', baselinePeriodEnd: '2026-03-31' };
+  const result = build(input, { config: cfg });
+  assert.equal(result.funds[0].selectedReport, null);
+  assert.equal(result.funds[0].notApplicableEvidence.date, '2026-07-10');
+  assert.equal(result.batchResults[0].status, 'not-applicable');
+  assert.equal(result.coverage.notApplicableFundCount, 1);
+  assert.equal(result.coverage.failedFundCount, 0);
+  assert.throws(() => build(raw([fund('000001', { reports: [], notApplicableEvidence: { ...evidence, date: '2026-01-10' } })]), { config: cfg }), { code: 'NO_VALID_FRESH_FUNDS' });
+  assert.throws(() => build(input, { config: { ...cfg, targetPeriodEnd: '2026-09-30' } }), { code: 'NO_VALID_FRESH_FUNDS' });
+});

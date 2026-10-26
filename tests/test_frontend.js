@@ -217,3 +217,121 @@ test('no-equities records require report evidence and remain available without f
   assert.equal(ui.coverageOverview(fixtureCatalog(), null, fixtureData([fund])).coveredFunds, 2);
   assert.throws(() => ui.validateDataset(fixtureData([{ ...fund, noEquitiesEvidence: { confirmed: false } }])), /INVALID_DATASET/);
 });
+
+function fixturePeriods() {
+  return { schemaVersion: 1, defaultPeriod: '2026Q3', periods: [
+    { id: '2026Q2', label: '2026Q2', path: './data/periods/2026Q2/', targetPeriodEnd: '2026-06-30', baselinePeriodEnd: '2026-03-31' },
+    { id: '2026Q3', label: '2026Q3', path: './data/periods/2026Q3/', targetPeriodEnd: '2026-09-30', baselinePeriodEnd: '2026-06-30' }
+  ] };
+}
+
+test('published quarter selection never substitutes Q2 for an unpublished Q3 request', () => {
+  const manifest = ui.validatePeriods(fixturePeriods());
+  assert.equal(ui.selectQuarter(manifest).id, '2026Q3');
+  assert.equal(ui.selectQuarter(manifest, '2026Q2').targetPeriodEnd, '2026-06-30');
+  assert.equal(ui.selectQuarter(null).id, '2026Q2');
+  assert.equal(ui.selectQuarter(null, '2026Q3'), null);
+  assert.equal(ui.selectQuarter(manifest, '2026Q4'), null);
+  const wrong = fixturePeriods(); wrong.periods[1].targetPeriodEnd = '2026-06-30';
+  assert.throws(() => ui.validatePeriods(wrong), /INVALID_PERIODS/);
+  assert.throws(() => ui.validatePeriods({ ...manifest, defaultPeriod: '2026Q4' }), /INVALID_PERIODS/);
+  const duplicate = fixturePeriods(); duplicate.periods.push(duplicate.periods[0]);
+  assert.throws(() => ui.validatePeriods(duplicate), /INVALID_PERIODS/);
+});
+
+test('quarter paths are limited to the validated local period and company namespaces', () => {
+  const period = fixturePeriods().periods[1];
+  assert.equal(ui.periodDataPath(period, 'latest.json'), './data/periods/2026Q3/latest.json');
+  assert.equal(ui.periodDataPath(period, './data/companies/c1.json'), './data/periods/2026Q3/companies/c1.json');
+  assert.equal(ui.periodDataPath(period, './data/companies/c1.json.gz'), './data/periods/2026Q3/companies/c1.json.gz');
+  assert.equal(ui.periodDataPath(ui.selectQuarter(null), 'latest.json'), './data/latest.json');
+  for (const path of ['./data/periods/2026Q3/../', 'https://example.org/', './data/periods/2026Q2/']) {
+    assert.throws(() => ui.periodDataPath({ ...period, path }, 'latest.json'), /INVALID_PERIOD_PATH/);
+  }
+  for (const path of ['../latest.json', './data/companies/a.json.gz?x=1', './data/companies/a.json.gz/extra']) {
+    assert.throws(() => ui.periodDataPath(period, path), /INVALID_PERIOD_PATH/);
+  }
+});
+
+test('period dataset validation refuses a Q2 payload under the Q3 selector', () => {
+  const data = fixtureData(); data.targetPeriodEnd = '2026-06-30';
+  assert.equal(ui.validatePeriodDataset(data, fixturePeriods().periods[0]), data);
+  assert.throws(() => ui.validatePeriodDataset(data, fixturePeriods().periods[1]), /PERIOD_MISMATCH/);
+  data.targetPeriodEnd = '2026-09-30';
+  assert.throws(() => ui.validatePeriodDataset(data, fixturePeriods().periods[1]), /PERIOD_MISMATCH/);
+  const empty = fixtureData([]); empty.targetPeriodEnd = '2026-09-30';
+  assert.equal(ui.validatePeriodDataset(empty, fixturePeriods().periods[1]), empty);
+  empty.coverage.targetPeriodEnd = '2026-06-30';
+  assert.throws(() => ui.validatePeriodDataset(empty, fixturePeriods().periods[1]), /PERIOD_MISMATCH/);
+  empty.coverage.targetPeriodEnd = '2026-09-30'; empty.baselinePeriodEnd = '2026-03-31';
+  assert.throws(() => ui.validatePeriodDataset(empty, fixturePeriods().periods[1]), /PERIOD_MISMATCH/);
+});
+
+test('compressed company pages decode with browser streams and reject malformed gzip', async () => {
+  const { gzipSync } = require('node:zlib');
+  const text = JSON.stringify(fixtureData());
+  assert.equal(await ui.responseText(new Response(gzipSync(text)), './data/companies/c1.json.gz'), text);
+  assert.equal(await ui.responseText(new Response(text), './data/companies/c1.json'), text);
+  await assert.rejects(() => ui.responseText(new Response('broken archive'), './data/companies/c1.json.gz'));
+  await assert.rejects(() => ui.responseText(new Response(gzipSync(text)), './data/companies/c1.json.gz', {}), /GZIP_UNAVAILABLE/);
+});
+
+test('research completeness stays distinct from holdings completion and validates bounded counts', () => {
+  const progress = { schemaVersion: 1, updatedAt: '2026-10-26T01:00:00Z', totalCompanies: 1, totalFunds: 2,
+    processedFunds: 2, completedCompanies: 1, pendingFunds: 0, funds: [{ code: '000001', companyCode: 'c1', status: 'complete', quality: { status: 'exhausted', fields: { pdf: 'complete', strategy: 'missing' } } }],
+    companies: [{ code: 'c1', name: '甲公司', totalFunds: 2, processedFunds: 2, withHoldings: 2, withoutEquities: 0, failed: 0, pending: 0 }],
+    completionStatus: 'incomplete-exhausted', research: { enabled: true, completeFunds: 0, incompleteFunds: 2, pendingFunds: 0, exhaustedFunds: 2,
+      fieldCoverage: { pdf: 2, strategy: 0, nav: 1, baseline: 2, prices: 2 } } };
+  assert.equal(ui.validateProgress(progress), progress);
+  assert.equal(ui.researchOverview(progress).completeFunds, 0);
+  assert.equal(ui.researchOverview(progress).completionStatus, 'incomplete-exhausted');
+  assert.equal(ui.researchOverview(null), null);
+  assert.equal(ui.fundQuality(progress, fixtureFund()).fields.strategy, 'missing');
+  assert.equal(ui.fundQuality(progress, fixtureFund({ code: '000002' })), null);
+  progress.research.fieldCoverage.holdings = 1;
+  progress.funds[0].quality.fields.holdings = 'truncated';
+  assert.equal(ui.validateProgress(progress), progress);
+  assert.equal(ui.researchOverview(progress).fieldCoverage.holdings, 1);
+  assert.equal(ui.fundQuality(progress, fixtureFund()).fields.holdings, 'truncated');
+  progress.research.fieldCoverage.holdings = 3;
+  assert.throws(() => ui.validateProgress(progress), /INVALID_PROGRESS/);
+  delete progress.research.fieldCoverage.holdings;
+  progress.research.fieldCoverage.pdf = 3;
+  assert.throws(() => ui.validateProgress(progress), /INVALID_PROGRESS/);
+});
+
+test('period-after-inception exemption requires source proof and stays outside research completion', () => {
+  const evidence = { reason: 'ESTABLISHED_AFTER_PERIOD', date: '2026-07-20', sourceUrl: 'https://example.org/profile', periodEnd: '2026-06-30', fundCode: '000001' };
+  const fund = fixtureFund({ status: 'unavailable', selectedReport: null, previousReport: null, rows: [], notApplicableEvidence: evidence });
+  assert.equal(ui.validateDataset(fixtureData([fund])).funds[0], fund);
+  assert.equal(ui.coverageOverview(fixtureCatalog(), null, fixtureData([fund])).coveredFunds, 0);
+  assert.throws(() => ui.validateDataset(fixtureData([{ ...fund, notApplicableEvidence: { ...evidence, date: '2026-06-01' } }])), /INVALID_DATASET/);
+  assert.throws(() => ui.validateDataset(fixtureData([{ ...fund, notApplicableEvidence: { ...evidence, fundCode: '000002' } }])), /INVALID_DATASET/);
+  const data = fixtureData([fund]); data.targetPeriodEnd = '2026-09-30';
+  assert.throws(() => ui.validatePeriodDataset(data, fixturePeriods().periods[1]), /PERIOD_MISMATCH/);
+  const progress = { schemaVersion: 1, updatedAt: '2026-10-26T01:00:00Z', totalCompanies: 1, totalFunds: 2,
+    processedFunds: 1, completedCompanies: 1, pendingFunds: 0, notApplicableFunds: 1,
+    funds: [{ code: '000001', companyCode: 'c1', status: 'not-applicable' }], companies: [], completionStatus: 'complete',
+    research: { enabled: true, completeFunds: 1, incompleteFunds: 0, pendingFunds: 0, exhaustedFunds: 0, fieldCoverage: { pdf: 1, strategy: 1, nav: 1, baseline: 1, prices: 1 } } };
+  assert.equal(ui.validateProgress(progress), progress);
+  assert.equal(ui.researchOverview(progress).applicableFunds, 1);
+  assert.equal(ui.researchOverview(progress).completeFunds, 1);
+  assert.equal(ui.researchOverview(progress).notApplicableFunds, 1);
+});
+
+test('empty awaiting quarter accepts no observation dates without inventing a timestamp', () => {
+  const awaiting = { ...fixtureData([]), asOf: null, retrievedAt: null, targetPeriodEnd: '2026-09-30', companyFiles: [],
+    coverage: { ...fixtureData([]).coverage, status: 'awaiting-data', fundCount: 0 } };
+  assert.equal(ui.validateDataset(awaiting), awaiting);
+  assert.equal(ui.validatePeriodDataset(awaiting, fixturePeriods().periods[1]), awaiting);
+  const state = ui.observationState(awaiting, 'remote', false);
+  assert.match(state.badge, /等待首份有效数据/);
+  assert.match(state.dates, /尚无有效观察或采集时点/);
+  assert.doesNotMatch(state.dates, /null|undefined|UTC/);
+  for (const mutation of [d => { d.coverage.status = 'partial'; }, d => { d.funds = [fixtureFund()]; },
+    d => { d.coverage.fundCount = 1; }, d => { d.companyFiles = [{ companyCode: 'c1', companyName: '甲公司', path: './data/companies/c1.json', fundCount: 0 }]; },
+    d => { d.retrievedAt = '2026-10-26T01:00:00Z'; }, d => { d.targetPeriodEnd = null; }]) {
+    const data = structuredClone(awaiting); mutation(data);
+    assert.throws(() => ui.validateDataset(data), /INVALID_DATASET/);
+  }
+});

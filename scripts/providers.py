@@ -188,6 +188,13 @@ def js_literal(text, key):
     raise DataError("TRUNCATED_RESPONSE")
 
 
+class HoldingRows(list):
+    """List-compatible rows with parser coverage that the collector publishes."""
+    def __init__(self, rows, excluded_rows=0):
+        super().__init__(rows)
+        self.excluded_rows = excluded_rows
+
+
 def parse_holdings_html(text):
     content = js_literal(text, "content") if "apidata" in text else text
     soup = BeautifulSoup(content, "html.parser")
@@ -216,27 +223,31 @@ def parse_holdings_html(text):
         ix = {"code": index("股票代码"), "name": index("股票名称"), "weight": index("占净值"), "shares": index("持股数"), "value": index("持仓市值")}
         if any(ix[k] is None for k in ("code", "name", "weight", "shares", "value")):
             continue
-        holdings = []
+        holdings, excluded_rows = [], 0
         for row in table.select("tbody tr") or table.select("tr")[1:]:
             cells = [x.get_text(" ", strip=True) for x in row.select("td")]
             if len(cells) <= max(ix.values()):
+                if cells:
+                    excluded_rows += 1
                 continue
             code = cells[ix["code"]].strip()
             if not re.fullmatch(r"\d{5,6}", code):
+                excluded_rows += 1
                 continue
             market = "HK" if len(code) == 5 else "CN"
             shares, value, weight = (number(cells[ix[k]]) for k in ("shares", "value", "weight"))
             shares_factor = 10000 if "万股" in headers[ix["shares"]] else 1
             value_factor = 10000 if "万元" in headers[ix["value"]] else 1
             if weight is None or weight < 0 or weight > 100:
+                excluded_rows += 1
                 continue
             holdings.append({"stockCode": code, "stockName": cells[ix["name"]], "market": market,
                              "currency": "HKD" if market == "HK" else "CNY", "shares": shares * shares_factor if shares is not None else None,
                              "weightPct": weight, "marketValueYuan": value * value_factor if value is not None else None})
-        if holdings:
+        if holdings or excluded_rows:
             # Even a large requested topline does not prove the upstream omitted
             # nothing, so an interim/annual table never automatically means full.
-            result[period] = holdings
+            result[period] = HoldingRows(holdings, excluded_rows)
     if not result:
         raise DataError("NO_HOLDINGS")
     return result
@@ -256,6 +267,8 @@ def parse_overview(text):
         raise DataError("INVALID_FORMAT")
     manager_names = re.split(r"[、,，\s]+", fields.get("基金经理人", ""))
     return {"name": name, "company": fields.get("基金管理人", ""),
+            "foundationDate": next((iso_date(value) for key, value in fields.items()
+                                     if key.startswith("成立日期") and iso_date(value)), None),
             "managers": [{"name": n, "startDate": None, "endDate": None} for n in manager_names if n],
             "overviewNavYuan": number(nav_match[1]) * 1e8 if nav_match else None,
             "overviewNavDate": iso_date(nav_text)}
@@ -320,9 +333,19 @@ def parse_pdf_pages(pages, source_url, period_end, kind):
         # Multiple share-class columns must be summed, while a historical comparison
         # column must not be. Only accept a single quarterly NAV cell here.
         if nav is None and kind == "quarterly" and not multi_class:
-            m = re.search(r"期末基金资产净值\s*([\d,]+\.\d{2})([^\n]*)", compact)
+            m = re.search(r"期末基金资产净值\s*(?:[（(]\s*(?:人民币)?元\s*[）)]\s*)?([\d,]+\.\d{2})([^\n]*)", compact)
             if m and not re.search(r"\d[\d,]*\.\d{2}", m[2]):
                 nav = number(m[1])
+        elif nav is None and kind == "quarterly" and len(set(class_codes)) >= 2:
+            # Quarterly metric columns are share classes, not different dates.
+            # Sum only when the report itself identifies exactly those columns.
+            metric = re.search(r"期末基金资产净值([^\n]*(?:\n(?!\s*(?:\d+[.、]|期末基金份额净值))[^\n]*){0,5})", compact)
+            if metric:
+                values = re.findall(r"(?<![\d.])[\d,]+\.\d{2}(?!\d)", metric[1].split("期末基金份额净值")[0])
+                if len(values) == len(set(class_codes)):
+                    parsed = [number(value) for value in values]
+                    if all(value is not None and value >= 0 for value in parsed):
+                        nav = sum(parsed)
         # Skip the contents page. Sections differ between report templates.
         for m in re.finditer(r"(?:\d+\.){1,2}\d*\s*(?:报告期内基金的投资策略和运作分析|报告期内基金投资策略和运作分析|管理人对报告期内本基金的投资策略和业绩表现的说明)", compact):
             tail = compact[m.end():]
@@ -368,7 +391,7 @@ def parse_pdf_pages(pages, source_url, period_end, kind):
 
 
 def parse_no_equities(pages, report):
-    pattern = re.compile(r"(?:本基金)?(?:本报告期末|报告期末|截至(?:本)?报告期末)[，,:：]?(?:本基金)?(?:未持有|未投资于|未投资)股票(?=[。；，]|$)")
+    pattern = re.compile(r"(?:本基金)?(?:本报告期末|报告期末|截至(?:本)?报告期末)[，,:：]?(?:本基金)?(?:未持有|未投资于|未投资)股票(?:资产|投资|组合)?(?=[。；，]|$)")
     for page_num, page in enumerate(pages, 1):
         compact = re.sub(r"\s+", "", page)
         match = pattern.search(compact)
@@ -377,6 +400,44 @@ def parse_no_equities(pages, report):
                     "publishedAt": report["publishedAt"], "kind": report["kind"], "title": report["title"],
                     "page": page_num, "text": match[0][:200]}
     return None
+
+
+def parse_pdf_holdings(pages):
+    """Recover only explicit numeric stock rows inside a stock-detail section.
+
+    Text-layer extraction can leave table rows broken. Unrecognized rows remain
+    missing and the recovered subset is never declared the complete portfolio.
+    """
+    text = "\n".join(pages)
+    # Locate on whitespace-normalized text, keeping line breaks for row checks.
+    normalized = re.sub(r"[ \t]+", " ", text)
+    section = None
+    for heading in re.finditer(r"按公允价值占基金资产净值比例大小\s*(?:排序|排名)的\s*(?:所有|前十名|前十|前五名)?\s*股票投资明细", normalized):
+        candidate = normalized[heading.end():]
+        candidate = re.split(r"\n\s*(?:\d+\.){1,2}\d*\s*(?:报告期|期末|期货|投资组合|重大|基金|债券)", candidate, maxsplit=1)[0]
+        if all(word in candidate[:1200] for word in ("股票代码", "股票名称", "数量", "公允价值")):
+            section = candidate
+            break
+    if section is None:
+        return []
+    if re.search(r"数量\s*[（(]\s*万股|公允价值\s*[（(]\s*万元", section[:1200]):
+        return []
+    amount = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+    pattern = re.compile(r"^\s*(\d{1,4})\s+(\d{5,6})\s+([^\n]+?)\s+(" + amount + r")\s+(" + amount + r")\s+(\d+(?:\.\d+)?)\s*%?\s*$", re.M)
+    rows, seen = [], set()
+    for match in pattern.finditer(section):
+        rank, code, name, shares, value, weight = match.groups()
+        shares, value, weight = map(number, (shares, value, weight))
+        if code in seen or shares is None or value is None or weight is None or not 0 <= weight <= 100 or shares < 0 or value < 0:
+            continue
+        if not re.search(r"[\u4e00-\u9fffA-Za-z]", name) or len(name) > 80:
+            continue
+        seen.add(code)
+        market = "HK" if len(code) == 5 else "CN"
+        rows.append({"stockCode": code, "stockName": name.strip(), "market": market,
+                     "currency": "HKD" if market == "HK" else "CNY", "shares": shares,
+                     "marketValueYuan": value, "weightPct": weight})
+    return rows if sum(row["weightPct"] for row in rows) <= 100.1 else []
 
 
 class PublicProvider:
@@ -440,15 +501,38 @@ class PublicProvider:
         return parse_holdings_html(text)
 
     def announcements(self, code, as_of):
-        text = self.get("https://api.fund.eastmoney.com/f10/JJGG",
-                        params={"fundcode": code, "pageIndex": 1, "pageSize": 100, "type": 3},
-                        referer=f"https://fundf10.eastmoney.com/jjgg_{code}_3.html")
-        try:
-            return parse_announcements(json.loads(text), as_of, expected_code=code)
-        except (ValueError, TypeError):
-            raise DataError("INVALID_FORMAT") from None
+        reports, seen_pages = {}, set()
+        self.announcement_error_code = None
+        for page in range(1, 5):
+            try:
+                text = self.get("https://api.fund.eastmoney.com/f10/JJGG",
+                                params={"fundcode": code, "pageIndex": page, "pageSize": 100, "type": 3},
+                                referer=f"https://fundf10.eastmoney.com/jjgg_{code}_3.html")
+                payload = json.loads(text)
+                rows = payload.get("Data")
+                if not isinstance(rows, list):
+                    raise DataError("INVALID_FORMAT")
+                fingerprint = json.dumps(rows, sort_keys=True)
+                if fingerprint in seen_pages:
+                    self.announcement_error_code = "ANNOUNCEMENT_PAGINATION_STALLED"
+                    break
+                seen_pages.add(fingerprint)
+                parsed = parse_announcements(payload, as_of, expected_code=code)
+                reports.update({report["sourceUrl"]: report for report in parsed})
+                if len(rows) < 100 or parsed and min(report["periodEnd"] for report in parsed) < f"{int(as_of[:4])-1}-01-01":
+                    break
+                if page == 4:
+                    self.announcement_error_code = "ANNOUNCEMENT_PAGE_LIMIT"
+            except (ValueError, TypeError):
+                raise DataError("INVALID_FORMAT") from None
+            except DataError as error:
+                if not reports:
+                    raise
+                self.announcement_error_code = error.code
+                break
+        return sorted(reports.values(), key=lambda r: (r["periodEnd"], r["publishedAt"]), reverse=True)
 
-    def report_details(self, report, max_pages=80):
+    def report_details(self, report, max_pages=300):
         from report_extract import extract_report
 
         data = self.get(report["sourceUrl"], binary=True)
@@ -458,12 +542,15 @@ class PublicProvider:
             result = extract_report(data, report["sourceUrl"], report["periodEnd"], report["kind"],
                                     parse_pages=parse_pdf_pages, filename=report.get("title", "report.pdf"),
                                     max_pages=max_pages,
-                                    enrich_pages=lambda pages: {"noEquitiesEvidence": parse_no_equities(pages, report)})
+                                    enrich_pages=lambda pages: {"noEquitiesEvidence": parse_no_equities(pages, report),
+                                                                "pdfHoldings": parse_pdf_holdings(pages)})
         except Exception as error:
             code = getattr(error, "code", "PDF_PARSE_FAILED")
             raise DataError(code if re.fullmatch(r"[A-Z0-9_]+", str(code)) else "PDF_PARSE_FAILED") from None
         # Preserve the historical field while attaching page-cited MinerU/pypdf
         # metadata. MinerU markdown is consumed in memory and is never published.
+        result.update({"reportPdfSourceUrl": report["sourceUrl"], "reportPdfPeriodEnd": report["periodEnd"],
+                       "reportPdfKind": report["kind"]})
         return result
 
     def price_bars(self, code, market, start, end):

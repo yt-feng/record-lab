@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "scope": "2026Q2：全量目录生成前的首批验证，全部公司将分批补齐",
+  "scope": "全目录逐季度采集；此文件提供通用参数，季度任务由 campaign 配置生成",
   "funds": [
     {
       "code": "005827"
@@ -45,7 +45,9 @@
   "maxPriceSymbols": 1200,
   "maxPriceSeconds": 900,
   "maxBatchSeconds": 1500,
-  "targetPeriodEnd": "2026-06-30",
-  "baselinePeriodEnd": "2026-03-31",
-  "asOf": "2026-09-29"
+  "targetPeriodEnd": "2026-09-30",
+  "baselinePeriodEnd": "2026-06-30",
+  "asOf": "2026-10-26",
+  "collectorVersion": 2,
+  "requireReportQuality": true
 }

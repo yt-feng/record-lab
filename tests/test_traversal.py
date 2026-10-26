@@ -2,6 +2,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import tempfile
 import unittest
 
 spec = importlib.util.spec_from_file_location("traversal", Path(__file__).parents[1] / "scripts/traversal.py")
@@ -40,6 +41,184 @@ class TraversalTests(unittest.TestCase):
         stocks = [{"stockCode": "600001", "market": "CN"}, {"stockCode": "600002", "market": "CN"}]
         return {"holdingCount": 2, "priceAvailable": available, "missingStocks": stocks[available:],
                 "holdingsIdentity": "a" * 64}
+
+    def retained_fund(self):
+        return {"code": "000001", "companyId": "co1", "status": "ok", "dataStatus": "fresh",
+                "retrievedAt": "2026-09-29T10:00:00Z", "shareClassCodes": ["000001"],
+                "selectedReport": {**evidence(), "fundCode": "000001", "navYuan": 1000,
+                    "parseMethod": "pypdf", "sourceTextHash": "a" * 64,
+                    "pageStats": {"pageCount": 10, "totalPages": 10, "processedPages": 10,
+                                  "nonEmptyPages": 10, "charCount": 12000, "textStatus": "usable", "truncated": False},
+                    "holdings": [{"stockCode": "600001", "market": "CN"}]},
+                "previousReport": {"periodEnd": "2026-03-31", "publishedAt": "2026-04-20",
+                                   "sourceUrl": "https://example.org/baseline.pdf", "holdings": [{"stockCode": "600001"}]},
+                "narrative": {"text": "合成季度原文摘录", "sourceUrl": "https://example.org/report.pdf",
+                              "periodStart": "2026-04-01", "periodEnd": "2026-06-30", "page": None},
+                "rows": [{"stockCode": "600001", "market": "CN", "priceRange": {"status": "observed",
+                    "priceBasis": "unadjusted", "sourceUrl": "https://example.org/prices", "currency": "CNY", "low": 1, "high": 2}}]}
+
+    def test_quality_requires_full_text_quarter_strategy_nav_exact_baseline_and_prices(self):
+        fund = self.retained_fund()
+        fields = traversal.report_quality(fund, PHASE, traversal.utc_now(NOW))["fields"]
+        self.assertTrue(all(value == "complete" for value in fields.values()))
+        fund["selectedReport"]["pageStats"]["truncated"] = True
+        fund["narrative"]["periodStart"] = "2026-01-01"
+        fund["selectedReport"]["navYuan"] = None
+        fund["previousReport"]["periodEnd"] = "2025-12-31"
+        fund["rows"][0]["priceRange"]["priceBasis"] = "adjusted"
+        fields = traversal.report_quality(fund, PHASE, traversal.utc_now(NOW))["fields"]
+        self.assertEqual(fields, {"holdings": "complete", "pdf": "truncated", "strategy": "wrong-period", "nav": "missing",
+                                  "baseline": "missing", "prices": "missing"})
+
+    def test_legacy_pdf_stats_do_not_prove_complete_extraction(self):
+        fund = self.retained_fund()
+        del fund["selectedReport"]["pageStats"]["truncated"]
+        del fund["selectedReport"]["pageStats"]["textStatus"]
+        self.assertEqual(traversal.report_quality(fund, PHASE, traversal.utc_now(NOW))["fields"]["pdf"], "partial")
+        fund["selectedReport"]["sourceFundCode"] = "000099"
+        self.assertIsNone(traversal.report_quality(fund, PHASE, traversal.utc_now(NOW)))
+
+    def test_truncated_or_excluded_holdings_never_count_as_full_research(self):
+        for flag, expected in (("holdingsPossiblyTruncated", "truncated"), ("holdingsIncomplete", "partial")):
+            fund = self.retained_fund()
+            fund["selectedReport"][flag] = True
+            quality = traversal.report_quality(fund, PHASE, traversal.utc_now(NOW))
+            self.assertEqual(quality["fields"]["holdings"], expected)
+            state = traversal.normalize_quality(quality, "complete", traversal.utc_now(NOW))
+            self.assertEqual(state["missingFields"], ["holdings"])
+            self.assertEqual(state["status"], "pending")
+
+    def test_retained_snapshot_hydrates_and_requeues_missing_report_fields(self):
+        config = {**CONFIG, "collectorVersion": 2, "requireReportQuality": True}
+        first = event()
+        first["funds"][0]["priceCoverage"] = self.coverage(2)
+        progress = traversal.merge_progress(catalog(), None, config, [first], now=NOW)
+        complete_fund = self.retained_fund()
+        complete_plan = traversal.plan_batches(catalog(), progress, config, shards=1, batch_size=3, now=NOW, retained=[complete_fund])
+        self.assertEqual(complete_plan["meta"]["qualityCount"], 0)
+        self.assertNotIn("000001", [item["code"] for item in complete_plan["batches"]["batch-0.json"]["funds"]])
+        del complete_fund["narrative"]
+        missing_plan = traversal.plan_batches(catalog(), progress, config, shards=1, batch_size=3, now=NOW, retained=[complete_fund])
+        self.assertEqual(missing_plan["batches"]["batch-0.json"]["traversal"]["qualityCodes"], ["000001"])
+        self.assertNotIn("000001", missing_plan["batches"]["batch-0.json"]["traversal"]["enrichmentCodes"])
+        merged = traversal.merge_progress(catalog(), progress, config, [], now=NOW, retained=[complete_fund])
+        self.assertEqual(merged["research"]["completeFunds"], 0)
+        self.assertEqual(merged["funds"][0]["quality"]["missingFields"], ["strategy"])
+
+    def test_quality_retries_are_idempotent_and_never_downgrade_holdings(self):
+        config = {**CONFIG, "collectorVersion": 2, "requireReportQuality": True}
+        progress = traversal.merge_progress(catalog(), None, config, [event()], now=NOW)
+        for minute in (10, 20, 30):
+            retry = event(status="failed", at=f"2026-09-29T11:{minute:02}:00Z")
+            retry["funds"][0]["qualityAttempt"] = True
+            progress = traversal.merge_progress(catalog(), progress, config, [retry], now=NOW)
+            replay = traversal.merge_progress(catalog(), progress, config, [retry], now=NOW)
+            self.assertEqual(progress["funds"][0]["quality"]["attempts"], replay["funds"][0]["quality"]["attempts"])
+        self.assertEqual(progress["funds"][0]["status"], "complete")
+        self.assertEqual(progress["funds"][0]["quality"]["status"], "exhausted")
+        self.assertEqual(progress["research"]["exhaustedFunds"], 1)
+        self.assertEqual(progress["research"]["completeFunds"], 0)
+        self.assertNotIn("000001", traversal.quality_eligible({item["code"]: item for item in progress["funds"]}))
+
+    def test_collector_version_resets_exhausted_attempts_exactly_once(self):
+        prior = traversal.merge_progress(catalog(), None, CONFIG, [event(status="failed"),
+            event(status="failed", at="2026-09-29T11:10:00Z")], now=NOW)
+        self.assertEqual(prior["funds"][0]["attempts"], 2)
+        config = {**CONFIG, "collectorVersion": 2, "requireReportQuality": True}
+        resumed = traversal.merge_progress(catalog(), prior, config, [], now=NOW)
+        self.assertEqual(resumed["collectorVersion"], 2)
+        self.assertEqual(resumed["funds"][0]["attempts"], 0)
+        next_event = event(status="failed", at="2026-09-29T11:20:00Z")
+        failed = traversal.merge_progress(catalog(), resumed, config, [next_event], now=NOW)
+        self.assertEqual(failed["funds"][0]["attempts"], 1)
+        self.assertEqual(traversal.merge_progress(catalog(), failed, config, [], now=NOW)["funds"][0]["attempts"], 1)
+
+    def test_unmapped_fund_can_complete_directly_but_not_infer_alias_ownership(self):
+        raw = catalog(True)
+        direct = event(code="000003", company=None)
+        result = traversal.merge_progress(raw, None, CONFIG, [direct], now=NOW)
+        self.assertEqual(result["funds"][2]["status"], "complete")
+        self.assertIsNone(result["funds"][2]["companyCode"])
+        receipt = {"schemaVersion": 1, "phase": PHASE, "generatedAt": NOW, "funds": [{
+            "code": "000003", "representativeCode": "000003", "companyCode": "unknown", "status": "complete",
+            "reportEvidence": evidence(), "priceCoverage": self.coverage(2), "shareClassCodes": ["000003"]}]}
+        reconciled = traversal.reconcile_observations([direct], receipt, CONFIG, NOW)
+        self.assertEqual(reconciled[0]["funds"][0]["status"], "complete")
+        self.assertIsNone(reconciled[0]["funds"][0]["companyCode"])
+
+    def test_no_equities_still_requires_pdf_strategy_and_nav(self):
+        fund = self.retained_fund()
+        fund.update({"status": "no-equities", "previousReport": None, "rows": []})
+        fund["selectedReport"]["holdings"] = []
+        quality = traversal.report_quality(fund, PHASE, traversal.utc_now(NOW))
+        self.assertEqual(quality["fields"]["baseline"], "not-applicable")
+        self.assertEqual(quality["fields"]["prices"], "not-applicable")
+        fund["narrative"] = None
+        self.assertEqual(traversal.report_quality(fund, PHASE, traversal.utc_now(NOW))["fields"]["strategy"], "missing")
+
+    def test_manifest_loader_uses_only_referenced_quarter_files(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            traversal.atomic_json(root / "latest.json", {"schemaVersion": 1, "funds": [],
+                "companyFiles": [{"path": "./data/companies/co1.json"}]})
+            traversal.atomic_json(root / "companies/co1.json", {"schemaVersion": 1, "funds": [self.retained_fund()]})
+            traversal.atomic_json(root / "companies/stale.json", {"schemaVersion": 1, "funds": [{"code": "000009"}]})
+            self.assertEqual([fund["code"] for fund in traversal.load_retained_funds(root)], ["000001"])
+            traversal.atomic_json(root / "latest.json", {"schemaVersion": 1, "companyFiles": [{"path": "../../private.json"}]})
+            with self.assertRaises(traversal.TraversalError):
+                list(traversal.load_retained_funds(root))
+
+    def test_quality_flag_is_required_for_status_recovery(self):
+        batch = {**CONFIG, "funds": [{"code": "000001", "companyCode": "co1"}], "traversal": {"qualityCodes": ["000001"]}}
+        status = traversal.build_status(batch, None, NOW)
+        self.assertTrue(status["funds"][0]["qualityAttempt"])
+        self.assertTrue(traversal.valid_status(status, batch, NOW))
+        status["funds"][0]["qualityAttempt"] = False
+        self.assertFalse(traversal.valid_status(status, batch, NOW))
+
+    def test_post_period_inception_is_a_sourced_exemption_not_holdings_success(self):
+        config = {**CONFIG, "collectorVersion": 2, "requireReportQuality": True,
+                  "funds": [{"code": "000003", "companyCode": "co2"}]}
+        proof = {"reason": "ESTABLISHED_AFTER_PERIOD", "date": "2026-07-02", "fundCode": "000003",
+                 "periodEnd": "2026-06-30", "sourceUrl": "https://fundf10.eastmoney.com/jbgk_000003.html"}
+        snapshot = {"schemaVersion": 1, "sourceMode": "actions", "batchResults": [{"code": "000003", "status": "not-applicable"}],
+                    "funds": [{"code": "000003", "status": "unavailable", "dataStatus": "fresh", "retrievedAt": "2026-09-29T10:00:00Z",
+                               "selectedReport": None, "rows": [], "notApplicableEvidence": proof}]}
+        status = traversal.build_status(config, snapshot, NOW)
+        self.assertTrue(traversal.valid_status(status, config, NOW))
+        self.assertEqual(status["funds"][0]["status"], "not-applicable")
+        progress = traversal.merge_progress(catalog(), None, config, [status], NOW)
+        self.assertEqual(progress["notApplicableFunds"], 1)
+        self.assertEqual(progress["processedFunds"], 0)
+        self.assertEqual(progress["pendingFunds"], 2)
+        self.assertEqual(progress["research"]["applicableFunds"], 2)
+        self.assertEqual(progress["research"]["incompleteFunds"], 2)
+        self.assertEqual(progress["companies"][1]["notApplicable"], 1)
+        replay = traversal.merge_progress(catalog(), progress, config, [], NOW)
+        self.assertEqual(replay["funds"][2]["notApplicableEvidence"], proof)
+        self.assertNotIn("000003", traversal.eligible({item["code"]: item for item in replay["funds"]}))
+        receipt = {"schemaVersion": 1, "phase": PHASE, "generatedAt": NOW, "funds": [{
+            "code": "000003", "representativeCode": "000003", "companyCode": "co2", "status": "not-applicable",
+            "observedAt": "2026-09-29T10:00:00Z", "notApplicableEvidence": proof, "shareClassCodes": ["000003"]}]}
+        reconciled = traversal.reconcile_observations([status], receipt, config, NOW)
+        self.assertEqual(reconciled[0]["funds"][0]["status"], "not-applicable")
+        bad = json.loads(json.dumps(snapshot))
+        bad["funds"][0]["notApplicableEvidence"]["date"] = "2026-05-01"
+        self.assertEqual(traversal.build_status(config, bad, NOW)["funds"][0]["status"], "failed")
+
+    def test_within_quarter_inception_exempts_only_the_missing_baseline(self):
+        fund = self.retained_fund()
+        fund.update({"previousReport": None, "inceptionDate": "2026-05-02",
+                     "inceptionSourceUrl": "https://fundf10.eastmoney.com/jbgk_000001.html"})
+        quality = traversal.report_quality(fund, PHASE, traversal.utc_now(NOW))
+        self.assertEqual(quality["fields"]["baseline"], "not-applicable")
+        normalized = traversal.normalize_quality(quality, "complete", traversal.utc_now(NOW))
+        self.assertEqual(normalized["status"], "complete")
+        self.assertEqual(normalized["baselineExemption"]["date"], "2026-05-02")
+        fund["inceptionDate"] = "2026-03-02"
+        self.assertEqual(traversal.report_quality(fund, PHASE, traversal.utc_now(NOW))["fields"]["baseline"], "missing")
+        forged = {"fields": {key: "not-applicable" for key in traversal.QUALITY_FIELDS}}
+        self.assertEqual(traversal.normalize_quality(forged, "complete", traversal.utc_now(NOW))["missingFields"], list(traversal.QUALITY_FIELDS))
 
     def test_enrichment_prioritizes_missing_prices_without_replacing_report_state(self):
         first = event()
@@ -160,13 +339,14 @@ class TraversalTests(unittest.TestCase):
         status["funds"][0]["enrichmentAttempt"] = False
         self.assertFalse(traversal.valid_status(status, batch, NOW))
 
-    def test_plan_round_robin_mapped_only_and_bounded(self):
+    def test_plan_round_robin_includes_unmapped_codes_and_is_bounded(self):
         plan = traversal.plan_batches(catalog(), None, CONFIG, shards=1, batch_size=3, now=NOW)
         self.assertEqual([x["code"] for x in plan["batches"]["batch-0.json"]["funds"]], ["000001", "000003", "000002"])
         self.assertEqual(plan["matrix"], [{"id": "0", "config": "batch-0.json"}])
         self.assertEqual(plan["batches"]["batch-0.json"]["maxWorkers"], 2)
         partial = traversal.plan_batches(catalog(True), None, CONFIG, shards=1, batch_size=3, now=NOW)
-        self.assertEqual(partial["meta"]["selectedCount"], 2)
+        self.assertEqual(partial["meta"]["selectedCount"], 3)
+        self.assertIn("000003", [item["code"] for item in partial["batches"]["batch-0.json"]["funds"]])
         self.assertTrue(partial["meta"]["continueRun"])
 
     def test_missing_snapshot_marks_every_actual_batch_item_failed(self):
@@ -233,10 +413,17 @@ class TraversalTests(unittest.TestCase):
         for item in stopped["funds"]:
             if item["companyCode"]:
                 item.update({"status": "failed", "attempts": 2, "lastAttemptAt": "2026-09-29T11:00:00Z", "attempted": True})
+        remaining = traversal.merge_progress(raw, stopped, CONFIG, [], now=NOW)
+        self.assertTrue(remaining["continueRun"])
+        self.assertEqual(remaining["pendingFunds"], 1)
+        # Directory exhaustion cannot prevent direct collection by fund code.
+        stopped["funds"][2].update({"status": "failed", "attempts": 2,
+                                   "lastAttemptAt": "2026-09-29T11:00:00Z", "attempted": True})
         terminal = traversal.merge_progress(raw, stopped, CONFIG, [], now=NOW)
         self.assertFalse(terminal["continueRun"])
-        self.assertEqual(terminal["pendingFunds"], 1)
-        self.assertEqual(terminal["funds"][2]["status"], "pending")
+        self.assertEqual(terminal["pendingFunds"], 0)
+        self.assertEqual(terminal["funds"][2]["status"], "failed")
+        self.assertEqual(terminal["completionStatus"], "incomplete-exhausted")
 
     def test_future_wrong_phase_and_wrong_company_events_are_ignored(self):
         future = event(at="2026-10-01T00:00:00Z")

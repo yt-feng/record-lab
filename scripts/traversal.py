@@ -13,6 +13,11 @@ from urllib.parse import urlparse, parse_qsl
 FUND_CODE = re.compile(r"\d{6}\Z")
 COMPANY_CODE = re.compile(r"[A-Za-z0-9_-]{1,40}\Z")
 SUCCESS = {"complete", "no-equities"}
+TERMINAL = SUCCESS | {"not-applicable"}
+QUALITY_FIELDS = ("holdings", "pdf", "strategy", "nav", "baseline", "prices")
+QUALITY_VALUES = {"complete", "missing", "partial", "truncated", "wrong-period", "not-applicable"}
+QUALITY_ACCEPTED = {"complete", "not-applicable"}
+QUALITY_MAX_ATTEMPTS = 3
 ERROR_CODES = {
     "BATCH_FAILED", "FUND_FAILED", "NO_VALID_REPORTS", "TARGET_REPORT_MISSING", "FUND_NOT_COLLECTED",
     "NO_VALID_FRESH_FUNDS", "NO_REPORTS", "NO_DATED_HOLDINGS", "EMPTY_HOLDINGS", "OLDER_REPORT",
@@ -122,7 +127,16 @@ def catalog_records(catalog):
     return companies, funds
 
 
-def base_states(catalog, previous, phase, now):
+def collector_version(config):
+    value = config.get("collectorVersion", 1) if isinstance(config, dict) else 1
+    return value if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 1000 else 1
+
+
+def quality_enabled(config):
+    return isinstance(config, dict) and config.get("requireReportQuality") is True
+
+
+def base_states(catalog, previous, phase, now, config=None):
     companies, records = catalog_records(catalog)
     old = {}
     if isinstance(previous, dict) and previous.get("schemaVersion") == 1 and previous.get("phase") == phase:
@@ -130,19 +144,22 @@ def base_states(catalog, previous, phase, now):
             if isinstance(item, dict) and is_code(item.get("code")):
                 old[item["code"]] = item
     states = {}
+    version_changed = collector_version(config) > collector_version(previous)
     for code, record in records.items():
         prior = old.get(code, {})
         attempted_at = prior.get("lastAttemptAt")
         parsed = instant(attempted_at)
         valid_attempt = parsed is not None and parsed <= now + dt.timedelta(minutes=5)
-        status = prior.get("status") if prior.get("status") in SUCCESS | {"failed", "pending"} else "pending"
+        status = prior.get("status") if prior.get("status") in TERMINAL | {"failed", "pending"} else "pending"
         if status != "pending" and not valid_attempt:
             status = "pending"
-        # Unmapped ownership never counts as a completed company traversal.
-        if not record["companyCode"]:
+        exemption = prior.get("notApplicableEvidence")
+        if status == "not-applicable" and not valid_not_applicable(exemption, code, phase, now):
             status = "pending"
         failures = prior.get("attempts", 0)
         failures = max(0, min(2, failures)) if isinstance(failures, int) and not isinstance(failures, bool) else 0
+        if version_changed:
+            failures = 0
         states[code] = {"code": code, "companyCode": record["companyCode"], "status": status,
                         "attempts": failures, "lastAttemptAt": attempted_at if valid_attempt else None,
                         "errorCode": prior.get("errorCode") if status == "failed" and prior.get("errorCode") in ERROR_CODES else None,
@@ -150,7 +167,20 @@ def base_states(catalog, previous, phase, now):
                         "representativeCode": prior.get("representativeCode") if is_code(prior.get("representativeCode"))
                         and prior.get("representativeCode") in records and records[prior["representativeCode"]]["companyCode"] == record["companyCode"] else code,
                         "attribution": "portfolio-evidence" if prior.get("attribution") == "portfolio-evidence" else "direct"}
-        states[code]["enrichment"] = normalize_enrichment(prior.get("enrichment"), status, now)
+        prior_enrichment = prior.get("enrichment")
+        prior_quality = prior.get("quality")
+        if isinstance(prior_quality, dict) and isinstance(prior_quality.get("baselineExemption"), dict):
+            exemption_phase = prior_quality["baselineExemption"]
+            if (exemption_phase.get("periodEnd") != phase["targetPeriodEnd"]
+                    or exemption_phase.get("baselinePeriodEnd") != phase["baselinePeriodEnd"]):
+                prior_quality = {key: value for key, value in prior_quality.items() if key != "baselineExemption"}
+        if version_changed:
+            prior_enrichment = {**(prior_enrichment if isinstance(prior_enrichment, dict) else {}), "attempts": 0}
+            prior_quality = {**(prior_quality if isinstance(prior_quality, dict) else {}), "attempts": 0}
+        states[code]["enrichment"] = normalize_enrichment(prior_enrichment, status, now)
+        states[code]["quality"] = normalize_quality(prior_quality, status, now)
+        if status == "not-applicable":
+            states[code]["notApplicableEvidence"] = {key: exemption[key] for key in ("reason", "date", "sourceUrl", "periodEnd", "fundCode")}
     return companies, records, states
 
 
@@ -159,8 +189,10 @@ def directory_incomplete(companies, records):
 
 
 def eligible(states):
-    return [code for code, state in states.items() if state["companyCode"] and
-            state["status"] in {"pending", "failed"} and state["attempts"] < 2]
+    # Institution mapping is an independent catalogue task. A valid fund code
+    # can be collected directly even while its owner remains unresolved.
+    return [code for code, state in states.items()
+            if state["status"] in {"pending", "failed"} and state["attempts"] < 2]
 
 
 def stock_key(item):
@@ -250,7 +282,7 @@ def normalize_enrichment(previous, status, now):
 
 
 def enrichment_eligible(states):
-    return [code for code, state in states.items() if state["companyCode"] and state["status"] == "complete"
+    return [code for code, state in states.items() if state["status"] == "complete"
             and state["attribution"] != "portfolio-evidence" and state.get("representativeCode", code) == code
             and state["enrichment"]["status"] == "pending"
             and state["enrichment"]["attempts"] < 3]
@@ -270,6 +302,199 @@ def apply_coverage(state, coverage):
     current["errorCode"] = None if not missing else "PRICE_COVERAGE_INCOMPLETE"
 
 
+def normalize_quality(previous, status, now):
+    previous = previous if isinstance(previous, dict) else {}
+    raw_fields = previous.get("fields") if isinstance(previous.get("fields"), dict) else {}
+    if status == "not-applicable":
+        return {"fields": {key: "not-applicable" for key in QUALITY_FIELDS}, "missingFields": [],
+                "attempts": 0, "lastAttemptAt": None, "status": "not-applicable"}
+    fields = {key: raw_fields.get(key) if raw_fields.get(key) in QUALITY_VALUES else "missing"
+              for key in QUALITY_FIELDS}
+    if status == "no-equities":
+        fields.update({"holdings": "complete", "baseline": "not-applicable", "prices": "not-applicable"})
+    baseline_exemption = previous.get("baselineExemption")
+    baseline_exempt = valid_baseline_exemption(baseline_exemption, now)
+    for key in QUALITY_FIELDS:
+        if fields[key] == "not-applicable" and not ((status == "no-equities" and key in {"baseline", "prices"})
+                                                    or key == "baseline" and baseline_exempt):
+            fields[key] = "missing"
+    attempts = previous.get("attempts", 0)
+    attempts = max(0, min(QUALITY_MAX_ATTEMPTS, attempts)) if isinstance(attempts, int) and not isinstance(attempts, bool) else 0
+    last = previous.get("lastAttemptAt")
+    if not instant(last) or instant(last) > now + dt.timedelta(minutes=5):
+        last = None
+    missing = [key for key in QUALITY_FIELDS if fields[key] not in QUALITY_ACCEPTED]
+    result = {"fields": fields, "missingFields": missing, "attempts": attempts, "lastAttemptAt": last,
+              "status": "complete" if not missing else "exhausted" if attempts >= QUALITY_MAX_ATTEMPTS else "pending"}
+    if baseline_exempt and fields["baseline"] == "not-applicable":
+        result["baselineExemption"] = {key: baseline_exemption[key] for key in ("reason", "date", "sourceUrl", "fundCode", "baselinePeriodEnd", "periodEnd")}
+    return result
+
+
+def valid_baseline_exemption(evidence, now):
+    if not isinstance(evidence, dict) or evidence.get("reason") != "ESTABLISHED_AFTER_BASELINE" or not is_code(evidence.get("fundCode")):
+        return False
+    established, baseline, target = (date(evidence.get(key)) for key in ("date", "baselinePeriodEnd", "periodEnd"))
+    return (bool(established and baseline and target) and baseline < established <= target <= now.date()
+            and public_url(evidence.get("sourceUrl"))
+            and urlparse(evidence["sourceUrl"]).path.endswith(f"jbgk_{evidence['fundCode']}.html"))
+
+
+def quarter_start(period_end):
+    value = date(period_end)
+    return dt.date(value.year, ((value.month - 1) // 3) * 3 + 1, 1).isoformat() if value else None
+
+
+def report_quality(fund, phase, now):
+    """Measure retained source evidence, not a collector's success flag."""
+    if not isinstance(fund, dict) or not is_code(fund.get("code")):
+        return None
+    report = fund.get("selectedReport")
+    observed = instant(fund.get("retrievedAt"))
+    if (not isinstance(report, dict) or report.get("periodEnd") != phase["targetPeriodEnd"]
+            or not public_url(report.get("sourceUrl")) or not observed or observed > now + dt.timedelta(minutes=5)):
+        return None
+    published = date(report.get("publishedAt"))
+    if not published or published < date(report["periodEnd"]) or published > observed.date():
+        return None
+    if report.get("fundCode") not in (None, fund["code"]) or report.get("sourceFundCode") not in (None, fund["code"]):
+        return None
+    fields = {key: "missing" for key in QUALITY_FIELDS}
+    if fund.get("status") == "no-equities":
+        fields["holdings"] = "complete"
+    elif fund.get("status") == "ok" and isinstance(report.get("holdings"), list) and report["holdings"]:
+        fields["holdings"] = ("truncated" if report.get("holdingsPossiblyTruncated") is True else
+                              "partial" if report.get("holdingsIncomplete") is True else "complete")
+    stats = report.get("pageStats") if isinstance(report.get("pageStats"), dict) else {}
+    fingerprint = report.get("sourceTextHash")
+    if (report.get("parseMethod") in {"pypdf", "pypdf-fallback", "mineru", "ocr"}
+            and isinstance(fingerprint, str) and re.fullmatch(r"[a-f0-9]{64}", fingerprint)
+            and isinstance(stats.get("charCount"), int) and stats["charCount"] > 0
+            and isinstance(stats.get("nonEmptyPages"), int) and stats["nonEmptyPages"] > 0):
+        if stats.get("truncated") is True:
+            fields["pdf"] = "truncated"
+        elif stats.get("truncated") is False and stats.get("textStatus") == "usable":
+            fields["pdf"] = "complete"
+        else:
+            fields["pdf"] = "partial"
+    narrative = fund.get("narrative") or report.get("narrative") or {}
+    if isinstance(narrative, dict) and isinstance(narrative.get("text"), str) and narrative["text"].strip() and public_url(narrative.get("sourceUrl")):
+        fields["strategy"] = "complete" if (narrative.get("periodStart") == quarter_start(phase["targetPeriodEnd"])
+                                                and narrative.get("periodEnd") == phase["targetPeriodEnd"]) else "wrong-period"
+    if fields["strategy"] != "complete":
+        excerpts = report.get("strategyExcerpts")
+        if isinstance(excerpts, list) and any(isinstance(item, dict) and isinstance(item.get("text"), str)
+                and item["text"].strip() and public_url(item.get("sourceUrl"))
+                and item.get("periodStart") == quarter_start(phase["targetPeriodEnd"])
+                and item.get("periodEnd") == phase["targetPeriodEnd"] for item in excerpts):
+            fields["strategy"] = "complete"
+    nav = report.get("navYuan")
+    if isinstance(nav, (float, int)) and not isinstance(nav, bool) and 0 < nav < float("inf"):
+        fields["nav"] = "complete"
+    baseline_exemption = {"reason": "ESTABLISHED_AFTER_BASELINE", "date": fund.get("inceptionDate"),
+                          "sourceUrl": fund.get("inceptionSourceUrl"), "fundCode": fund["code"],
+                          "baselinePeriodEnd": phase["baselinePeriodEnd"], "periodEnd": phase["targetPeriodEnd"]}
+    if fund.get("status") == "no-equities":
+        fields.update({"baseline": "not-applicable", "prices": "not-applicable"})
+    else:
+        baseline = fund.get("previousReport")
+        if (isinstance(baseline, dict) and baseline.get("periodEnd") == phase["baselinePeriodEnd"]
+                and public_url(baseline.get("sourceUrl")) and date(baseline.get("publishedAt"))
+                and date(baseline["publishedAt"]) >= date(baseline["periodEnd"])
+                and date(baseline["publishedAt"]) <= observed.date()
+                and (baseline.get("holdings") or baseline.get("noEquitiesConfirmed") is True)):
+            fields["baseline"] = "complete"
+        elif valid_baseline_exemption(baseline_exemption, now):
+            fields["baseline"] = "not-applicable"
+        coverage = price_coverage(fund)
+        if valid_price_coverage(coverage) and coverage["holdingCount"] > 0:
+            fields["prices"] = "complete" if coverage["priceAvailable"] == coverage["holdingCount"] else "partial" if coverage["priceAvailable"] else "missing"
+    result = {"fields": fields}
+    if fields["baseline"] == "not-applicable" and valid_baseline_exemption(baseline_exemption, now):
+        result["baselineExemption"] = baseline_exemption
+    return result
+
+
+def quality_eligible(states):
+    return [code for code, state in states.items() if state["status"] in SUCCESS
+            and state["attribution"] != "portfolio-evidence" and state.get("representativeCode", code) == code
+            and state["quality"]["status"] == "pending" and state["quality"]["attempts"] < QUALITY_MAX_ATTEMPTS]
+
+
+def valid_quality(value, phase=None):
+    valid = (isinstance(value, dict) and isinstance(value.get("fields"), dict)
+            and set(value["fields"]) == set(QUALITY_FIELDS)
+            and all(item in QUALITY_VALUES for item in value["fields"].values()))
+    if valid and value.get("baselineExemption") is not None:
+        exemption = value["baselineExemption"]
+        valid = isinstance(exemption, dict) and (phase is None or (
+            exemption.get("periodEnd") == phase["targetPeriodEnd"]
+            and exemption.get("baselinePeriodEnd") == phase["baselinePeriodEnd"]))
+    return valid
+
+
+def hydrate_quality(states, retained, phase, now):
+    """Recompute quality from the merger's effective observations on every pass."""
+    for fund in retained or []:
+        quality = report_quality(fund, phase, now)
+        if quality is None:
+            continue
+        coverage = price_coverage(fund)
+        codes = [fund["code"]]
+        classes = fund.get("shareClassCodes")
+        canonical = fund.get("sourcePortfolioCode")
+        if (isinstance(classes, list) and canonical in classes and fund["code"] in classes
+                and is_code(canonical) and public_url(fund.get("portfolioSourceUrl"))):
+            codes = [code for code in classes if is_code(code)]
+        for code in codes:
+            state = states.get(code)
+            if not state:
+                continue
+            # Direct records can remain unmapped. Alias expansion still needs
+            # one proven owner and may not bridge unknown catalogue mappings.
+            if code != fund["code"] and (not state["companyCode"] or state["companyCode"] != fund.get("companyId")):
+                continue
+            state["quality"] = normalize_quality({**state["quality"], **quality}, state["status"], now)
+            if state["status"] == "complete" and valid_price_coverage(coverage):
+                apply_coverage(state, coverage)
+
+
+def load_retained_funds(data_root):
+    """Read only manifest-referenced company files within this quarter root."""
+    if not data_root:
+        return
+    root = Path(data_root)
+    if root.is_symlink():
+        raise TraversalError("READ_FAILED")
+    if (root / "companies").is_symlink():
+        raise TraversalError("READ_FAILED")
+    manifest = read_json(root / "latest.json", optional=True)
+    if manifest is None:
+        return
+    if not isinstance(manifest, dict) or manifest.get("schemaVersion") != 1:
+        raise TraversalError("INVALID_PROGRESS")
+    funds = manifest.get("funds") or []
+    files = manifest.get("companyFiles") or []
+    if not isinstance(files, list) or not isinstance(funds, list) or len(files) > 10000 or len(funds) > 150000:
+        raise TraversalError("INVALID_PROGRESS")
+    count = len(funds)
+    yield from funds
+    seen = set()
+    for item in files:
+        value = item.get("path") if isinstance(item, dict) else None
+        match = re.fullmatch(r"\./data/companies/([A-Za-z0-9_-]{1,64})\.json", value or "")
+        if not match or match[1] in seen:
+            raise TraversalError("INVALID_PROGRESS")
+        seen.add(match[1])
+        document = read_json(root / "companies" / (match[1] + ".json"))
+        if not isinstance(document, dict) or document.get("schemaVersion") != 1 or not isinstance(document.get("funds"), list):
+            raise TraversalError("INVALID_PROGRESS")
+        count += len(document["funds"])
+        if count > 150000:
+            raise TraversalError("INVALID_PROGRESS")
+        yield from document["funds"]
+
+
 def no_equities_text(text):
     if not isinstance(text, str):
         return False
@@ -278,18 +503,32 @@ def no_equities_text(text):
         re.search(r"(?:未持有|未投资于?)股票(?:资产|投资|组合)?(?:[。；，,.;：:]|$)", excerpt))
 
 
-def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None):
+def valid_not_applicable(evidence, code, phase, now):
+    if not isinstance(evidence, dict) or evidence.get("reason") != "ESTABLISHED_AFTER_PERIOD":
+        return False
+    established = date(evidence.get("date"))
+    return (evidence.get("fundCode") == code and evidence.get("periodEnd") == phase["targetPeriodEnd"]
+            and established is not None and date(phase["targetPeriodEnd"]) < established <= now.date()
+            and public_url(evidence.get("sourceUrl"))
+            and urlparse(evidence["sourceUrl"]).path.endswith(f"jbgk_{code}.html"))
+
+
+def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, retained=()):
     current = utc_now(now)
     phase = phase_for(config)
     if not isinstance(shards, int) or not isinstance(batch_size, int) or not 1 <= shards <= 32 or not 1 <= batch_size <= 100:
         raise TraversalError("INVALID_ARGUMENTS")
-    companies, records, states = base_states(catalog, previous, phase, current)
+    companies, records, states = base_states(catalog, previous, phase, current, config)
+    hydrate_quality(states, retained, phase, current)
     selected = []
     enrich_codes = set(enrichment_eligible(states))
-    for pool in (enrich_codes, eligible(states)):
+    quality_codes = set(quality_eligible(states)) if quality_enabled(config) else set()
+    pools = (eligible(states), quality_codes, enrich_codes) if quality_enabled(config) else (enrich_codes, eligible(states))
+    for pool in pools:
         queues = {}
         for code in sorted(pool):
-            queues.setdefault(states[code]["companyCode"], deque()).append(code)
+            if code not in selected:
+                queues.setdefault(states[code]["companyCode"] or "~unmapped", deque()).append(code)
         order = deque(sorted(queues))
         while order and len(selected) < shards * batch_size:
             company = order.popleft()
@@ -301,9 +540,10 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None):
         batch = {key: value for key, value in config.items() if key not in {"funds", "traversal"}}
         batch_codes = selected[start:start + batch_size]
         batch["funds"] = [{**records[code], **({"priceTargets": states[code]["enrichment"]["missingStocks"]}
-                          if code in enrich_codes and states[code]["enrichment"]["missingStocks"] else {})} for code in batch_codes]
+                          if code in enrich_codes and code not in quality_codes and states[code]["enrichment"]["missingStocks"] else {})} for code in batch_codes]
         batch["traversal"] = {"phase": phase, "batchId": str(index), "plannedAt": current.isoformat(),
-                              "enrichmentCodes": [code for code in batch_codes if code in enrich_codes]}
+                              "enrichmentCodes": [code for code in batch_codes if code in enrich_codes and code not in quality_codes],
+                              "qualityCodes": [code for code in batch_codes if code in quality_codes]}
         filename = f"batch-{index}.json"
         batches[filename] = batch
         matrix.append({"id": str(index), "config": filename})
@@ -312,7 +552,8 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None):
     continuing = bool(selected) or directory_incomplete(companies, records) and passes < 12
     return {"batches": batches, "matrix": matrix,
             "meta": {"hasWork": bool(selected), "continueRun": continuing, "selectedCount": len(selected),
-                     "enrichmentCount": sum(code in enrich_codes for code in selected), "phase": phase}}
+                     "enrichmentCount": sum(code in enrich_codes and code not in quality_codes for code in selected),
+                     "qualityCount": sum(code in quality_codes for code in selected), "phase": phase}}
 
 
 def report_evidence(fund, phase, now, planned_at=None):
@@ -353,8 +594,9 @@ def build_status(config, snapshot=None, now=None):
     wanted = {item["code"]: item for item in config.get("funds", []) if isinstance(item, dict) and is_code(item.get("code"))}
     if not wanted:
         raise TraversalError("INVALID_CONFIG")
-    observed, aliases, results = {}, [], {}
+    observed, aliases, results, qualities, exemptions = {}, [], {}, {}, {}
     enrich_codes = set(config.get("traversal", {}).get("enrichmentCodes", []))
+    quality_codes = set(config.get("traversal", {}).get("qualityCodes", []))
     snapshot_ok = isinstance(snapshot, dict) and snapshot.get("schemaVersion") == 1 and snapshot.get("sourceMode") == "actions"
     if snapshot_ok and snapshot.get("targetPeriodEnd") not in (None, phase["targetPeriodEnd"]):
         snapshot_ok = False
@@ -363,6 +605,14 @@ def build_status(config, snapshot=None, now=None):
             if isinstance(item, dict) and item.get("code") in wanted:
                 results[item["code"]] = item
         for fund in snapshot.get("funds", []):
+            if (isinstance(fund, dict) and fund.get("dataStatus") == "fresh"
+                    and instant(fund.get("retrievedAt")) and (not planned or instant(fund["retrievedAt"]) >= planned)
+                    and instant(fund["retrievedAt"]) <= current + dt.timedelta(minutes=5)
+                    and valid_not_applicable(fund.get("notApplicableEvidence"), fund.get("code"), phase, current)):
+                exemptions[fund["code"]] = fund["notApplicableEvidence"]
+            quality = report_quality(fund, phase, current)
+            if quality is not None:
+                qualities[fund["code"]] = quality
             proof = report_evidence(fund, phase, current, planned)
             if not proof:
                 continue
@@ -378,11 +628,17 @@ def build_status(config, snapshot=None, now=None):
                                 "status": status, "reportEvidence": evidence, "priceCoverage": coverage})
                 for code in codes:
                     observed.setdefault(code, (status, evidence, coverage))
+                    if quality is not None:
+                        qualities.setdefault(code, quality)
     rows = []
     for code, item in wanted.items():
         declared = results.get(code, {})
         proof = observed.get(code)
-        if proof and declared.get("status") in SUCCESS:
+        if code in exemptions and declared.get("status") == "not-applicable":
+            row = {"code": code, "companyCode": item.get("companyCode") or item.get("companyId"),
+                   "status": "not-applicable", "errorCode": None,
+                   "notApplicableEvidence": {key: exemptions[code][key] for key in ("reason", "date", "sourceUrl", "periodEnd", "fundCode")}}
+        elif proof and declared.get("status") in SUCCESS:
             status, evidence, coverage = proof
             row = {"code": code, "companyCode": item.get("companyCode") or item.get("companyId"),
                    "status": status, "errorCode": None, "reportEvidence": evidence, "priceCoverage": coverage}
@@ -391,6 +647,9 @@ def build_status(config, snapshot=None, now=None):
             row = {"code": code, "companyCode": item.get("companyCode") or item.get("companyId"), "status": "failed",
                    "errorCode": error if error in ERROR_CODES else "FUND_FAILED" if snapshot_ok else "BATCH_FAILED"}
         row["enrichmentAttempt"] = code in enrich_codes
+        row["qualityAttempt"] = code in quality_codes
+        if code in qualities:
+            row["reportQuality"] = qualities[code]
         rows.append(row)
     return {"schemaVersion": 1, "phase": phase, "attemptedAt": current.isoformat(), "funds": rows, "portfolioAliases": aliases}
 
@@ -427,17 +686,25 @@ def valid_status(document, config, now=None):
         return False
     seen = set()
     enrich_codes = set(config.get("traversal", {}).get("enrichmentCodes", []))
+    quality_codes = set(config.get("traversal", {}).get("qualityCodes", []))
     for item in rows:
         if not isinstance(item, dict) or item.get("code") not in wanted or item["code"] in seen:
             return False
         seen.add(item["code"])
-        if item.get("companyCode") != wanted[item["code"]] or item.get("status") not in SUCCESS | {"failed"}:
+        if item.get("companyCode") != wanted[item["code"]] or item.get("status") not in TERMINAL | {"failed"}:
             return False
         if bool(item.get("enrichmentAttempt")) != (item["code"] in enrich_codes):
             return False
+        if bool(item.get("qualityAttempt")) != (item["code"] in quality_codes):
+            return False
+        if item.get("reportQuality") is not None and not valid_quality(item["reportQuality"], phase):
+            return False
         if item.get("priceCoverage") is not None and not valid_price_coverage(item["priceCoverage"]):
             return False
-        if item["status"] == "failed":
+        if item["status"] == "not-applicable":
+            if not valid_not_applicable(item.get("notApplicableEvidence"), item["code"], phase, attempted):
+                return False
+        elif item["status"] == "failed":
             if item.get("errorCode") not in ERROR_CODES:
                 return False
         elif not valid_event_evidence(item.get("reportEvidence"), item["status"], phase, attempted):
@@ -465,6 +732,12 @@ def reconcile_observations(statuses, receipt, config, now=None):
         raise TraversalError("INVALID_PROGRESS")
     observations = {}
     for item in receipt["funds"]:
+        if (isinstance(item, dict) and is_code(item.get("code")) and item.get("status") == "not-applicable"
+                and item.get("representativeCode") == item["code"]
+                and instant(item.get("observedAt")) and instant(item["observedAt"]) <= generated
+                and valid_not_applicable(item.get("notApplicableEvidence"), item["code"], phase_for(config), generated)):
+            observations[item["code"]] = item
+            continue
         if (not isinstance(item, dict) or not is_code(item.get("code")) or not is_code(item.get("representativeCode"))
                 or not valid_event_evidence(item.get("reportEvidence"), item.get("status"), phase_for(config), generated)
                 or not valid_price_coverage(item.get("priceCoverage"))):
@@ -481,11 +754,21 @@ def reconcile_observations(statuses, receipt, config, now=None):
                 continue
             row = dict(original)
             observation = observations.get(row.get("code"))
-            if row.get("status") in SUCCESS:
-                if not observation or observation.get("companyCode") != row.get("companyCode"):
+            if row.get("status") in TERMINAL:
+                observed_company = observation.get("companyCode") if observation else None
+                if observed_company == "unknown":
+                    observed_company = None
+                exempt = row.get("status") == "not-applicable"
+                if (not observation or observed_company != row.get("companyCode")
+                        or exempt != (observation.get("status") == "not-applicable")):
                     row.update({"status": "failed", "errorCode": "FUND_FAILED"})
                     row.pop("priceCoverage", None)
                     row.pop("reportEvidence", None)
+                    row.pop("reportQuality", None)
+                    row.pop("notApplicableEvidence", None)
+                elif exempt:
+                    row["notApplicableEvidence"] = observation["notApplicableEvidence"]
+                    row["errorCode"] = None
                 else:
                     row.update({key: observation[key] for key in ("status", "reportEvidence", "priceCoverage", "representativeCode")})
                     row["errorCode"] = None
@@ -505,10 +788,10 @@ def reconcile_observations(statuses, receipt, config, now=None):
     return reconciled
 
 
-def merge_progress(catalog, previous, config, statuses=(), now=None):
+def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()):
     current = utc_now(now)
     phase = phase_for(config)
-    companies, records, states = base_states(catalog, previous, phase, current)
+    companies, records, states = base_states(catalog, previous, phase, current, config)
     matching_previous = isinstance(previous, dict) and previous.get("schemaVersion") == 1 and previous.get("phase") == phase
     events = []
     for document in statuses:
@@ -524,10 +807,24 @@ def merge_progress(catalog, previous, config, statuses=(), now=None):
             if not isinstance(item, dict) or item.get("code") not in states:
                 continue
             state = states[item["code"]]
-            if not state["companyCode"] or item.get("companyCode") != state["companyCode"]:
+            if item.get("companyCode") != state["companyCode"]:
                 continue
             status = item.get("status")
-            if status not in SUCCESS | {"failed"}:
+            if status not in TERMINAL | {"failed"}:
+                continue
+            if status == "not-applicable":
+                if not valid_not_applicable(item.get("notApplicableEvidence"), item["code"], phase, attempted):
+                    continue
+                prior_attempt = instant(state["lastAttemptAt"])
+                if state["status"] in SUCCESS or prior_attempt and attempted <= prior_attempt:
+                    continue
+                state.update({"status": status, "lastAttemptAt": document["attemptedAt"], "attempted": True,
+                              "attribution": "direct", "errorCode": None,
+                              "notApplicableEvidence": {key: item["notApplicableEvidence"][key] for key in ("reason", "date", "sourceUrl", "periodEnd", "fundCode")}})
+                state["quality"] = normalize_quality(None, status, current)
+                state["enrichment"] = normalize_enrichment(None, status, current)
+                continue
+            if state["status"] == "not-applicable":
                 continue
             if status in SUCCESS and not valid_event_evidence(item.get("reportEvidence"), status, phase, attempted):
                 continue
@@ -535,6 +832,24 @@ def merge_progress(catalog, previous, config, statuses=(), now=None):
             if representative in states and states[representative]["companyCode"] == state["companyCode"]:
                 state["representativeCode"] = representative
             prior_attempt = instant(state["lastAttemptAt"])
+            if state["status"] in SUCCESS and item.get("qualityAttempt") is True:
+                quality = state["quality"]
+                prior_quality = instant(quality["lastAttemptAt"]) or prior_attempt
+                if prior_quality and attempted <= prior_quality:
+                    continue
+                quality["attempts"] = min(QUALITY_MAX_ATTEMPTS, quality["attempts"] + 1)
+                quality["lastAttemptAt"] = document["attemptedAt"]
+                state["lastAttemptAt"] = document["attemptedAt"]
+                state["attempted"] = True
+                if valid_quality(item.get("reportQuality"), phase):
+                    quality.update(item["reportQuality"])
+                state["quality"] = normalize_quality(quality, state["status"], current)
+                if status in SUCCESS:
+                    if status == "complete":
+                        apply_coverage(state, item.get("priceCoverage"))
+                    accepted_success.add(item["code"])
+                # Failed PDF enrichment must never erase a valid holding report.
+                continue
             if state["status"] == "complete" and item.get("enrichmentAttempt") is True:
                 extra = state["enrichment"]
                 prior_extra = instant(extra["lastAttemptAt"]) or prior_attempt
@@ -556,12 +871,15 @@ def merge_progress(catalog, previous, config, statuses=(), now=None):
                     accepted_success.add(item["code"])
                 continue
             state.update({"lastAttemptAt": document["attemptedAt"], "attempted": True, "attribution": "direct"})
+            if valid_quality(item.get("reportQuality"), phase):
+                state["quality"] = normalize_quality({**state["quality"], **item["reportQuality"]}, status, current)
             if status == "failed":
                 state.update({"status": "failed", "attempts": min(2, state["attempts"] + 1),
                               "errorCode": item.get("errorCode") if item.get("errorCode") in ERROR_CODES else "FUND_FAILED"})
             else:
                 state.update({"status": status, "errorCode": None})
                 state["enrichment"] = normalize_enrichment(state["enrichment"], status, current)
+                state["quality"] = normalize_quality(state["quality"], status, current)
                 if status == "complete":
                     apply_coverage(state, item.get("priceCoverage"))
                 accepted_success.add(item["code"])
@@ -581,16 +899,22 @@ def merge_progress(catalog, previous, config, statuses=(), now=None):
             if representative not in codes or representative not in states:
                 representative = proof["sourcePortfolioCode"] if proof["sourcePortfolioCode"] in accepted_success else min(accepted_success.intersection(codes))
             portfolio_attempts = max((states[code]["enrichment"]["attempts"] for code in codes if code in states), default=0)
+            quality_attempts = max((states[code]["quality"]["attempts"] for code in codes if code in states), default=0)
+            representative_quality = states[representative]["quality"]
             for code in codes:
+                if code in states and states[code]["status"] == "not-applicable":
+                    continue
                 if code in states:
                     states[code]["representativeCode"] = representative
                     states[code]["enrichment"]["attempts"] = portfolio_attempts
+                    states[code]["quality"] = normalize_quality({**representative_quality, "attempts": quality_attempts}, status, current)
                 if code in states and states[code]["status"] not in SUCCESS:
                     states[code].update({"status": status, "lastAttemptAt": document["attemptedAt"], "errorCode": None,
                                          "attribution": "portfolio-evidence"})
                     states[code]["enrichment"] = normalize_enrichment(states[code]["enrichment"], status, current)
                 if code in states and states[code]["status"] == "complete" and status == "complete":
                     apply_coverage(states[code], proof.get("priceCoverage"))
+    hydrate_quality(states, retained, phase, current)
     passes = previous.get("directoryPasses", 0) if matching_previous else 0
     passes = min(12, max(0, passes)) if isinstance(passes, int) else 0
     last_directory = previous.get("lastDirectoryObservedAt") if matching_previous else None
@@ -605,28 +929,45 @@ def merge_progress(catalog, previous, config, statuses=(), now=None):
         complete = sum(item["status"] == "complete" for item in members)
         noeq = sum(item["status"] == "no-equities" for item in members)
         failed = sum(item["status"] == "failed" for item in members)
+        not_applicable = sum(item["status"] == "not-applicable" for item in members)
         total = company["fundCount"] if company["directoryStatus"] == "complete" else None
         if total is not None:
             total = max(total, len(members))
-        pending = max(0, total - complete - noeq - failed) if total is not None else sum(item["status"] == "pending" for item in members)
+        pending = max(0, total - complete - noeq - failed - not_applicable) if total is not None else sum(item["status"] == "pending" for item in members)
         last = max((item["lastAttemptAt"] for item in members if item["lastAttemptAt"]), default=None)
         company_rows.append({"code": code, "name": company["name"], "totalFunds": total,
                              "processedFunds": complete + noeq, "withHoldings": complete, "withoutEquities": noeq,
-                             "failed": failed, "pending": pending, "lastAttemptAt": last,
+                             "failed": failed, "pending": pending, "notApplicable": not_applicable, "lastAttemptAt": last,
                              "enrichmentPending": sum(item["attribution"] != "portfolio-evidence" and item["representativeCode"] == item["code"] and item["enrichment"]["status"] == "pending" for item in members),
                              "enrichmentExhausted": sum(item["attribution"] != "portfolio-evidence" and item["representativeCode"] == item["code"] and item["enrichment"]["status"] == "exhausted" for item in members),
+                             "researchComplete": sum(item["status"] in SUCCESS and item["quality"]["status"] == "complete" for item in members),
                              "directoryStatus": company["directoryStatus"]})
     all_states = sorted(states.values(), key=lambda state: state["code"])
     processed = sum(state["status"] in SUCCESS for state in all_states)
     failed = sum(state["status"] == "failed" for state in all_states)
-    continuing = bool(eligible(states) or enrichment_eligible(states)) or directory_incomplete(companies, records) and passes < 12
+    not_applicable = sum(state["status"] == "not-applicable" for state in all_states)
+    continuing = bool(eligible(states) or enrichment_eligible(states)
+                      or quality_enabled(config) and quality_eligible(states)) or directory_incomplete(companies, records) and passes < 12
     enrichment_states = [state["enrichment"] for state in all_states if state["status"] == "complete" and state["attribution"] != "portfolio-evidence" and state["representativeCode"] == state["code"]]
-    return {"schemaVersion": 1, "phase": phase, "updatedAt": current.isoformat(),
+    research_complete = sum(state["status"] in SUCCESS and state["quality"]["status"] == "complete" for state in all_states)
+    research_pending = sum(state["status"] in SUCCESS and state["quality"]["status"] == "pending" for state in all_states)
+    research_exhausted = sum(state["status"] in SUCCESS and state["quality"]["status"] == "exhausted" for state in all_states)
+    applicable = len(records) - not_applicable
+    completed = research_complete == applicable if quality_enabled(config) else processed == applicable
+    return {"schemaVersion": 1, "phase": phase, "updatedAt": current.isoformat(), "collectorVersion": collector_version(config),
             "totalCompanies": len(companies), "totalFunds": len(records), "processedFunds": processed,
             "attemptedFunds": sum(state["attempted"] for state in all_states),
-            "completedCompanies": sum(company["directoryStatus"] == "complete" and company["totalFunds"] == company["processedFunds"] for company in company_rows),
-            "pendingFunds": len(records) - processed - failed, "failedFunds": failed,
-            "retryableFailedFunds": sum(state["status"] == "failed" and state["attempts"] < 2 and bool(state["companyCode"]) for state in all_states),
+            "completedCompanies": sum(company["directoryStatus"] == "complete" and company["totalFunds"] == company["processedFunds"] + company["notApplicable"] for company in company_rows),
+            "pendingFunds": len(records) - processed - failed - not_applicable, "failedFunds": failed,
+            "notApplicableFunds": not_applicable,
+            "retryableFailedFunds": sum(state["status"] == "failed" and state["attempts"] < 2 for state in all_states),
+            "unmappedFunds": sum(state["companyCode"] is None for state in all_states),
+            "completionStatus": "complete" if completed else "incomplete-running" if continuing else "incomplete-exhausted",
+            "research": {"enabled": quality_enabled(config), "applicableFunds": applicable, "completeFunds": research_complete,
+                         "incompleteFunds": applicable - research_complete, "pendingFunds": research_pending,
+                         "exhaustedFunds": research_exhausted, "maxAttempts": QUALITY_MAX_ATTEMPTS,
+                         "fieldCoverage": {key: sum(state["status"] != "not-applicable" and state["quality"]["fields"][key] in QUALITY_ACCEPTED for state in all_states)
+                                           for key in QUALITY_FIELDS}},
             "enrichment": {"pendingFunds": sum(item["status"] == "pending" for item in enrichment_states),
                            "completeFunds": sum(item["status"] == "complete" for item in enrichment_states),
                            "exhaustedFunds": sum(item["status"] == "exhausted" for item in enrichment_states),
@@ -671,6 +1012,7 @@ def main(argv=None):
         plan.add_argument("--" + name, default=default)
     plan.add_argument("--shards", type=int, default=4)
     plan.add_argument("--batch-size", type=int, default=25)
+    plan.add_argument("--data-root", help="Quarter directory containing the retained published snapshot.")
     status = commands.add_parser("status")
     status.add_argument("--config", required=True)
     status.add_argument("--snapshot", default="web/data/part.json")
@@ -679,10 +1021,12 @@ def main(argv=None):
     for name, default in (("parts", ".cache/parts"), ("catalog", "web/data/catalog.json"),
                           ("progress", "web/data/progress.json"), ("config", "config/universe.json")):
         merge.add_argument("--" + name, default=default)
+    merge.add_argument("--data-root", help="Quarter directory containing the merger's effective snapshot.")
     args = parser.parse_args(argv)
     config = read_json(args.config)
     if args.command == "plan":
-        result = plan_batches(read_json(args.catalog), read_json(args.progress, optional=True), config, args.shards, args.batch_size)
+        result = plan_batches(read_json(args.catalog), read_json(args.progress, optional=True), config, args.shards, args.batch_size,
+                              retained=load_retained_funds(args.data_root))
         output = Path(args.output)
         for filename, batch in result["batches"].items():
             atomic_json(output / filename, batch)
@@ -708,7 +1052,8 @@ def main(argv=None):
             except TraversalError:
                 continue
         statuses = reconcile_observations(statuses, read_json(parts / "merge-receipt.json"), config)
-        result = merge_progress(read_json(args.catalog), read_json(args.progress, optional=True), config, statuses)
+        result = merge_progress(read_json(args.catalog), read_json(args.progress, optional=True), config, statuses,
+                                retained=load_retained_funds(args.data_root))
         atomic_json(args.progress, result)
         print(json.dumps({"status": "merged", "processedFunds": result["processedFunds"], "failedFunds": result["failedFunds"], "pendingFunds": result["pendingFunds"], "continueRun": result["continueRun"]}))
 

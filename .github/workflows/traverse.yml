@@ -2,21 +2,28 @@ name: Traverse records
 on:
   workflow_dispatch:
     inputs:
+      quarter:
+        description: Quarter collection scope
+        type: choice
+        options: [both, 2026Q2, 2026Q3]
+        default: both
       continue_chain:
         description: Continue remaining batches automatically
         type: boolean
         default: true
   schedule:
-    - cron: '23 22 * * 0,3'
+    - cron: '17 */12 * * *'
 concurrency:
   group: published-records
   cancel-in-progress: false
 permissions:
   contents: read
+env:
+  NODE_OPTIONS: --max-old-space-size=5120
 jobs:
   plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 18
+    timeout-minutes: 40
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       has_work: ${{ steps.plan.outputs.has_work }}
@@ -36,18 +43,25 @@ jobs:
           npm test
           python -m unittest discover -s tests -p 'test_*.py'
           python scripts/publication_guard.py --root .
-      - name: Discover public directory
-        run: python scripts/discover.py --output web/data/catalog.json --state raw/catalog-state.json --as-of 2026-09-29 --allow-partial --max-companies 30
-      - name: Plan bounded batches
+      - name: Plan isolated quarter batches
         id: plan
+        env:
+          QUARTER: ${{ inputs.quarter || 'both' }}
         run: |
-          python scripts/traversal.py plan --catalog web/data/catalog.json --progress web/data/progress.json --config config/universe.json --output .cache/plan --shards 8 --batch-size 50
+          python scripts/campaign.py plan --quarter "$QUARTER" --shards 4 --batch-size 50
           node scripts/workflow-outputs.js .cache/plan >> "$GITHUB_OUTPUT"
       - run: python scripts/publication_guard.py --root . --plan-dir .cache/plan
       - uses: actions/upload-artifact@v4
         with:
           name: plan
           path: .cache/plan/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: campaign
+          path: .cache/campaign/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 2
@@ -71,6 +85,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          sparse-checkout: |
+            scripts
+            lib
+            config
+            tests
+            .github
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -91,7 +111,9 @@ jobs:
           MINER_U_KEYS: ${{ secrets.MINER_U_KEYS }}
           MINER_U: ${{ secrets.MINER_U }}
           MINERU_API_KEY: ${{ secrets.MINERU_API_KEY }}
-        run: python scripts/collect.py --config ".cache/plan/$BATCH_CONFIG" --output raw/input.json --as-of 2026-09-29
+        run: |
+          AS_OF=$(node -p 'JSON.parse(require("fs").readFileSync(".cache/plan/" + process.env.BATCH_CONFIG)).asOf')
+          python scripts/collect.py --config ".cache/plan/$BATCH_CONFIG" --output raw/input.json --as-of "$AS_OF"
       - name: Build batch
         id: build
         if: always()
@@ -123,7 +145,7 @@ jobs:
     needs: [plan, batch]
     if: always() && needs.plan.result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 18
+    timeout-minutes: 40
     permissions:
       contents: write
       pages: read
@@ -153,16 +175,17 @@ jobs:
         with:
           pattern: part-*
           path: .cache/parts
-      - name: Complete bounded attempt records
-        run: python scripts/complete-status.py
+      - uses: actions/download-artifact@v4
+        with:
+          name: campaign
+          path: .cache/campaign
       - name: Merge source-linked results
         id: history
         env:
           GH_TOKEN: ${{ github.token }}
           PUBLICATION_CACHE_OUTPUT: ${{ runner.temp }}/publication-history.json
         run: |
-          node scripts/merge-parts.js --parts .cache/parts --data web/data --catalog web/data/catalog.json --config config/universe.json
-          python scripts/traversal.py merge --parts .cache/parts --catalog web/data/catalog.json --progress web/data/progress.json --config config/universe.json
+          python scripts/campaign.py publish
           python scripts/publication_guard.py --root . --history
       - name: Save verified publication history
         if: success() && github.ref == 'refs/heads/main' && steps.history.outputs.cache_artifact_name != ''
@@ -182,19 +205,21 @@ jobs:
             git commit -m 'Update public observations and coverage'
             git push origin HEAD:main
           fi
-      - run: node scripts/summarize.js >> "$GITHUB_STEP_SUMMARY"
+      - name: Prepare compressed public site
+        run: python scripts/prepare-site.py
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v4
         with:
-          path: web
+          path: .cache/site
       - name: Continue unfinished traversal
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           CONTINUE_CHAIN: ${{ github.event_name == 'schedule' || inputs.continue_chain }}
         run: |
-          if [ "$CONTINUE_CHAIN" = 'true' ] && [ "$(node -p 'JSON.parse(require("fs").readFileSync("web/data/progress.json")).continueRun')" = 'true' ]; then
-            gh workflow run traverse.yml --ref main -f continue_chain=true
+          if [ "$CONTINUE_CHAIN" = 'true' ] && [ "$(node -p 'JSON.parse(require("fs").readFileSync(".cache/campaign/result.json")).continueRun')" = 'true' ]; then
+            QUARTER=$(node -p 'JSON.parse(require("fs").readFileSync(".cache/campaign/result.json")).selection')
+            gh workflow run traverse.yml --ref main -f continue_chain=true -f quarter="$QUARTER"
           fi
   deploy:
     needs: publish

@@ -252,3 +252,11 @@ test('report parser evidence survives strict normalization with bounded fields',
   assert.equal(result.selectedReport.strategyExcerpts[0].text.length, 260);
   assert.deepEqual(result.selectedReport.strategyThemes, ['调仓/交易']);
 });
+
+test('unsupported holdings rows remain an explicit source coverage gap after normalization', () => {
+  const result = analyzeFund(fund([report({ holdingsIncomplete: true, holdingsExcludedRowCount: 3,
+    holdingsIncompleteReason: 'UNSUPPORTED_OR_INVALID_SECURITY_ROWS' })]), options());
+  assert.equal(result.selectedReport.holdingsIncomplete, true);
+  assert.equal(result.selectedReport.holdingsExcludedRowCount, 3);
+  assert.equal(result.selectedReport.holdingsIncompleteReason, 'UNSUPPORTED_OR_INVALID_SECURITY_ROWS');
+});

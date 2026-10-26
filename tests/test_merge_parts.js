@@ -82,6 +82,51 @@ test('rejected shrinking reports cannot replace the final price coverage receipt
   assert.equal(second.receipt.funds[0].reportEvidence.observedAt, '2026-09-29T09:00:00Z');
 });
 
+test('recovered strategy enriches a retained stronger holdings table without shrinking it', () => {
+  const large = report('000001', { navYuan: null });
+  large.holdings.push({ ...large.holdings[0], stockCode: '600002' });
+  const first = merge({ snapshots: [snapshot(['000001'], { overrides: { reports: [large] }, retrievedAt: '2026-09-29T09:00:00Z' })] });
+  const recovered = report('000001', { narrative: { text: '本基金依据企业经营和估值调整行业配置。',
+    sourceUrl: 'https://example.org/report.pdf', page: 4, periodStart: '2026-04-01', periodEnd: '2026-06-30' },
+    parseMethod: 'pypdf', sourceTextHash: 'b'.repeat(64),
+    pageStats: { pageCount: 12, totalPages: 12, processedPages: 12, nonEmptyPages: 12, charCount: 5000,
+      truncated: false, textStatus: 'usable', pageNumbersVerified: true } });
+  const result = merge({ snapshots: [snapshot(['000001'], { overrides: { reports: [recovered] } })],
+    previousCompanies: first.companySnapshots, previousManifest: first.manifest });
+  assert.equal(result.changed, true);
+  const fund = result.companySnapshots.co1.funds[0];
+  assert.equal(fund.selectedReport.holdings.length, 2);
+  assert.equal(fund.narrative.text, recovered.narrative.text);
+  assert.equal(fund.selectedReport.navYuan, 10000);
+  assert.equal(fund.retrievedAt, '2026-09-29T09:00:00Z');
+});
+
+test('retains parsed report-only evidence without counting it as collected holdings', () => {
+  const parsed = report('000001', { holdings: [], reportOnly: true, parseMethod: 'pypdf', sourceTextHash: 'b'.repeat(64),
+    pageStats: { pageCount: 2, charCount: 100, nonEmptyPages: 2 }, narrative: { text: '报告原文策略。' } });
+  const result = merge({ snapshots: [snapshot(['000001'], { overrides: { reports: [parsed] } })] });
+  assert.equal(result.companySnapshots.co1.funds[0].status, 'unavailable');
+  assert.equal(result.receipt.funds[0].status, 'failed');
+  assert.equal(result.manifest.coverage.catalogAvailableFundCount, 0);
+  assert.equal(result.manifest.coverage.reportOnlyFundCount, 1);
+});
+
+test('post-period inception evidence survives partitions and receipts without invented reports', () => {
+  const exempt = snapshot(['000001'], { overrides: { reports: [], notApplicableEvidence: {
+    reason: 'ESTABLISHED_AFTER_PERIOD', fundCode: '000001', date: '2026-08-01', periodEnd: '2026-06-30',
+    sourceUrl: 'https://fundf10.eastmoney.com/jbgk_000001.html' } } });
+  const result = merge({ snapshots: [exempt] });
+  const fund = result.companySnapshots.co1.funds[0];
+  assert.equal(fund.status, 'unavailable');
+  assert.equal(fund.selectedReport, null);
+  assert.equal(result.receipt.funds[0].status, 'not-applicable');
+  assert.equal(result.receipt.funds[0].notApplicableEvidence.date, '2026-08-01');
+  assert.equal(result.manifest.coverage.notApplicableFundCount, 1);
+  assert.equal(result.manifest.coverage.catalogAvailableFundCount, 0);
+  const replay = merge({ previousCompanies: result.companySnapshots, previousManifest: result.manifest });
+  assert.equal(replay.changed, false);
+});
+
 test('missing or failed parts preserve old observations and do not refresh the manifest timestamp', () => {
   const first = merge({ snapshots: [snapshot()] });
   const result = merge({ snapshots: [null], previousCompanies: first.companySnapshots, previousManifest: first.manifest });

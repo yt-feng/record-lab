@@ -170,6 +170,8 @@ class MinerUClient:
 
 
 def _full_markdown_from_zip(raw: bytes) -> str:
+    if len(raw) > 32 * 1024 * 1024:
+        raise ExtractionError("MINERU_ZIP_TOO_LARGE")
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             names = [name for name in archive.namelist() if not name.endswith("/")]
@@ -179,6 +181,8 @@ def _full_markdown_from_zip(raw: bytes) -> str:
             if not candidates:
                 raise ExtractionError("MINERU_FULL_MD_MISSING")
             name = max(candidates, key=lambda candidate: archive.getinfo(candidate).file_size)
+            if archive.getinfo(name).file_size > 20 * 1024 * 1024:
+                raise ExtractionError("MINERU_MARKDOWN_TOO_LARGE")
             text = archive.read(name).decode("utf-8", errors="replace")
     except ExtractionError:
         raise
@@ -200,27 +204,24 @@ def markdown_pages(text: str) -> list[str]:
     return [page for _number, page in markdown_page_records(text)]
 
 
-def markdown_page_records(text: str) -> list[tuple[int, str]]:
+def markdown_page_records(text: str) -> list[tuple[int | None, str]]:
     """Return ``(original_page_number, text)`` pairs from MinerU markdown."""
     matches = list(_PAGE_MARKER.finditer(text))
     if not matches:
-        # A page break is a useful fallback for older MinerU exports, but do
-        # not pretend ordinary paragraphs have independently verified pages.
-        blocks = [block.strip() for block in re.split(r"\n\s*\f\s*\n|\n-{3,}\n", text) if block.strip()]
-        return [(index, block) for index, block in enumerate(blocks, 1)] or [(1, text.strip())]
-    pages: list[str] = []
+        # Markdown headings/rules are not PDF page boundaries.
+        return [(None, text.strip())]
     prefix = text[: matches[0].start()].strip()
+    numbers = [int(marker.group(1)) for marker in matches]
+    verified = all(number > 0 for number in numbers) and numbers == sorted(set(numbers))
+    records: list[tuple[int | None, str]] = []
     if prefix:
-        pages.append(prefix)
-    records: list[tuple[int, str]] = []
-    if prefix:
-        records.append((1, prefix))
+        records.append((None, prefix))
     for index, marker in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         body = text[marker.end():end].strip()
         if body:
-            records.append((int(marker.group(1)), body))
-    return records or [(1, text.strip())]
+            records.append((int(marker.group(1)) if verified else None, body))
+    return records or [(None, text.strip())]
 
 
 _STRATEGY_HEADING = re.compile(
@@ -288,13 +289,21 @@ def _period_start(period_end: str, kind: str) -> str:
     return f"{period_end[:4]}-01-01"
 
 
+class PDFPages(list):
+    def __init__(self, pages, total_pages):
+        super().__init__(pages)
+        self.total_pages = total_pages
+
+
 def _pypdf_pages(pdf_bytes: bytes, max_pages: int) -> list[str]:
     try:
         from pypdf import PdfReader
 
         logging.getLogger("pypdf").setLevel(logging.CRITICAL)
         reader = PdfReader(io.BytesIO(pdf_bytes))
-        return [page.extract_text() or "" for page in reader.pages[:max(1, min(max_pages, 80))]]
+        total = len(reader.pages)
+        pages = [page.extract_text() or "" for page in reader.pages[:max(1, min(max_pages, 300))]]
+        return PDFPages(pages, total)
     except Exception:
         raise ExtractionError("PDF_PARSE_FAILED") from None
 
@@ -302,24 +311,39 @@ def _pypdf_pages(pdf_bytes: bytes, max_pages: int) -> list[str]:
 def _details_for_pages(pages: list[str], source_url: str, period_end: str, kind: str,
                       parse_pages: Callable[[list[str], str, str, str], dict[str, Any]],
                       enrich_pages: Callable[[list[str]], Mapping[str, Any]] | None = None,
-                      page_numbers: list[int] | None = None) -> dict[str, Any]:
+                      page_numbers: list[int | None] | None = None,
+                      total_pages: int | None = None) -> dict[str, Any]:
     parsed = dict(parse_pages(pages, source_url, period_end, kind))
+    if enrich_pages:
+        parsed.update(dict(enrich_pages(pages)))
+    # The common parser uses block ordinals. Map them to verified PDF pages,
+    # including explicit unknowns for unpaginated MinerU markdown.
+    if page_numbers is not None:
+        for field in ("narrative", "noEquitiesEvidence"):
+            value = parsed.get(field)
+            if isinstance(value, dict):
+                ordinal = value.get("page")
+                value["page"] = page_numbers[ordinal - 1] if isinstance(ordinal, int) and 1 <= ordinal <= len(page_numbers) else None
     normalized = "\n\n".join(page.strip() for page in pages if page and page.strip())
+    if not normalized:
+        raise ExtractionError("PDF_TEXT_EMPTY")
     excerpts = strategy_excerpts(pages, source_url, period_end, kind,
                                  fallback_narrative=parsed.get("narrative"), page_numbers=page_numbers)
     parsed.update({"sourceTextHash": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
-                   "pageStats": {"pageCount": len(pages), "nonEmptyPages": sum(bool(page.strip()) for page in pages),
-                                  "charCount": len(normalized)},
+                   "pageStats": {"pageCount": len(pages), "processedPages": len(pages), "totalPages": total_pages,
+                                  "nonEmptyPages": sum(bool(page.strip()) for page in pages),
+                                  "charCount": len(normalized),
+                                  "truncated": len(pages) < total_pages if total_pages is not None else None,
+                                  "pageNumbersVerified": page_numbers is None or all(isinstance(n, int) and n > 0 for n in page_numbers),
+                                  "textStatus": "usable" if len(normalized) >= 100 else "sparse"},
                    "strategyExcerpts": excerpts, "strategyThemes": strategy_themes(excerpts)})
-    if enrich_pages:
-        parsed.update(dict(enrich_pages(pages)))
     return parsed
 
 
 def extract_report(pdf_bytes: bytes, source_url: str, period_end: str, kind: str,
                    *, parse_pages: Callable[[list[str], str, str, str], dict[str, Any]],
                    mineru_client: MinerUClient | None = None, filename: str = "report.pdf",
-                   max_pages: int = 80, env: Mapping[str, str] | None = None,
+                   max_pages: int = 300, env: Mapping[str, str] | None = None,
                    enrich_pages: Callable[[list[str]], Mapping[str, Any]] | None = None) -> dict[str, Any]:
     """Parse a report with MinerU when configured, falling back to pypdf."""
     tokens = mineru_tokens_from_env(env)
@@ -347,7 +371,8 @@ def extract_report(pdf_bytes: bytes, source_url: str, period_end: str, kind: str
                 mineru_error = "MINERU_UNEXPECTED_ERROR"
     try:
         pages = _pypdf_pages(pdf_bytes, max_pages)
-        result = _details_for_pages(pages, source_url, period_end, kind, parse_pages, enrich_pages)
+        result = _details_for_pages(pages, source_url, period_end, kind, parse_pages, enrich_pages,
+                                    total_pages=getattr(pages, "total_pages", len(pages)))
         result["parseMethod"] = "pypdf-fallback" if mineru_error else "pypdf"
         if mineru_error:
             result["parseErrorCode"] = mineru_error

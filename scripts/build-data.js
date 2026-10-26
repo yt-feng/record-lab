@@ -18,15 +18,16 @@ const BUILD_CODES = new Set([
   'INVALID_ARGUMENTS', 'INPUT_READ_FAILED', 'OUTPUT_WRITE_FAILED',
   'NO_REPORTS', 'INVALID_FORMAT', 'TRUNCATED_RESPONSE', 'NO_HOLDINGS', 'INVALID_URL',
   'HTTP_REJECTED', 'RESPONSE_TOO_LARGE', 'EMPTY_RESPONSE', 'TLS_FAILED', 'INVALID_PDF',
-  'PDF_PARSE_FAILED', 'UNSUPPORTED_MARKET', 'INVALID_PRICE_FORMAT', 'NO_PRICE_DATA',
+  'PDF_PARSE_FAILED', 'PDF_TEXT_EMPTY', 'HOLDINGS_UNRESOLVED', 'UNSUPPORTED_MARKET', 'INVALID_PRICE_FORMAT', 'NO_PRICE_DATA',
   'PARSE_FAILED', 'NAV_NOT_DISCLOSED_OR_UNRESOLVED', 'NARRATIVE_UNRESOLVED', 'NO_DATED_HOLDINGS',
   'INVALID_CATALOG', 'NOT_IN_CURRENT_BATCH', 'PORTFOLIO_IDENTITY_CONFLICT',
   'INVALID_NO_EQUITIES_EVIDENCE', 'CONTRADICTORY_NO_EQUITIES',
   'TARGET_REPORT_MISSING',
   'TIMEOUT', 'NETWORK_ERROR', 'HTTP_ERROR', 'TARGET_REPORT_UNAVAILABLE', 'BATCH_REQUIRES_ACTIONS',
+  'ANNOUNCEMENT_PAGE_LIMIT', 'ANNOUNCEMENT_PAGINATION_STALLED',
 ]);
 const STAGES = new Set(['metadata', 'announcements', 'holdings', 'report', 'nav', 'narrative',
-  'join', 'prices', 'build', 'collection', 'target-report', 'no-equities-report']);
+  'join', 'prices', 'build', 'collection', 'target-report', 'no-equities-report', 'quarterly-report']);
 const fundCode = value => typeof value === 'string' && /^\d{6}$/.test(value);
 const clone = value => JSON.parse(JSON.stringify(value));
 
@@ -94,12 +95,24 @@ function noEquitiesReport(evidence, code) {
     noEquitiesConfirmed: true, noEquitiesEvidence: normalizedEvidence };
 }
 
+function isValidNotApplicable(evidence, { asOf, code, periodEnd } = {}) {
+  return Boolean(evidence && evidence.reason === 'ESTABLISHED_AFTER_PERIOD' && evidence.fundCode === code
+    && publicUrl(evidence.sourceUrl) && validDate(evidence.date) && validDate(evidence.periodEnd)
+    && validDate(asOf) && evidence.date > evidence.periodEnd && evidence.date <= asOf
+    && (!periodEnd || evidence.periodEnd === periodEnd));
+}
+
+function cleanNotApplicable(evidence) {
+  return { reason: 'ESTABLISHED_AFTER_PERIOD', fundCode: evidence.fundCode, date: evidence.date,
+    periodEnd: evidence.periodEnd, sourceUrl: evidence.sourceUrl };
+}
+
 function cleanReport(raw, code, asOf, addError) {
   if (!raw || (raw.fundCode !== undefined && raw.fundCode !== null && raw.fundCode !== code)
     || (raw.sourceFundCode !== undefined && raw.sourceFundCode !== null && raw.sourceFundCode !== code)) {
     addError('REPORT_IDENTITY_MISMATCH', code); return null;
   }
-  if (!publicUrl(raw.sourceUrl) || ['officialSourceUrl', 'navSourceUrl', 'holdingsSourceUrl']
+  if (!publicUrl(raw.sourceUrl) || ['officialSourceUrl', 'navSourceUrl', 'holdingsSourceUrl', 'reportPdfSourceUrl']
     .some(key => raw[key] !== undefined && raw[key] !== null && !publicUrl(raw[key]))) {
     addError('INVALID_REPORT_SOURCE', code); return null;
   }
@@ -107,19 +120,26 @@ function cleanReport(raw, code, asOf, addError) {
   if (!report) { addError('INVALID_REPORT', code); return null; }
   if (report.periodEnd > asOf || report.publishedAt > asOf) { addError('FUTURE_REPORT', code); return null; }
   if (!report.holdings.length) {
-    if (!report.noEquitiesConfirmed || !isValidNoEq(raw.noEquitiesEvidence, { asOf, code })
+    if (report.reportOnly) {
+      if (report.noEquitiesConfirmed || !report.parseMethod || !report.sourceTextHash || !report.pageStats?.charCount) {
+        addError('INVALID_REPORT', code); return null;
+      }
+    } else if (!report.noEquitiesConfirmed || !isValidNoEq(raw.noEquitiesEvidence, { asOf, code })
       || raw.noEquitiesEvidence.periodEnd !== report.periodEnd
       || raw.noEquitiesEvidence.publishedAt !== report.publishedAt
       || raw.noEquitiesEvidence.sourceUrl !== report.sourceUrl) {
       addError(report.noEquitiesConfirmed ? 'INVALID_NO_EQUITIES_EVIDENCE' : 'EMPTY_HOLDINGS', code); return null;
     }
-  } else if (report.noEquitiesConfirmed) { addError('CONTRADICTORY_NO_EQUITIES', code); return null; }
+  } else if (report.noEquitiesConfirmed || report.reportOnly) { addError('CONTRADICTORY_NO_EQUITIES', code); return null; }
   if (report.holdings.some(holding => !['CN', 'HK'].includes(holding.market)
     || !/^\d{5,6}$/.test(holding.stockCode)
     || holding.currency !== (holding.market === 'CN' ? 'CNY' : 'HKD'))) {
     addError('INVALID_REPORT', code); return null;
   }
   if (report.narrative.text && !publicUrl(report.narrative.sourceUrl)) {
+    addError('INVALID_REPORT_SOURCE', code); return null;
+  }
+  if (report.strategyExcerpts?.some(item => !publicUrl(item.sourceUrl))) {
     addError('INVALID_REPORT_SOURCE', code); return null;
   }
   report.fundCode = code;
@@ -188,7 +208,11 @@ function previousFunds(previous, asOf, addError) {
   if (previous.schemaVersion !== 1 || !Array.isArray(previous.funds)) throw new SafeBuildError('INVALID_PREVIOUS_SNAPSHOT');
   for (const item of previous.funds) {
     if (!item || !fundCode(item.code) || !timestamp(item.retrievedAt) || !validDate(item.asOf)
-      || item.asOf > asOf || !item.selectedReport || !Array.isArray(item.rows)) continue;
+      || item.asOf > asOf || !Array.isArray(item.rows)) continue;
+    if (!item.selectedReport && !item.rows.length && isValidNotApplicable(item.notApplicableEvidence, { asOf, code: item.code })) {
+      result.set(item.code, item); continue;
+    }
+    if (!item.selectedReport) continue;
     const selected = cleanReport(item.selectedReport, item.code, asOf, addError);
     const prior = item.previousReport ? cleanReport(item.previousReport, item.code, asOf, addError) : null;
     if (!selected || (item.previousReport && !prior)) continue;
@@ -256,7 +280,7 @@ function deduplicatePortfolios(funds, addError) {
   for (const fund of funds) {
     const identities = evidence.get(fund.code);
     const candidate = identities && identities.size === 1 ? [...identities][0] : null;
-    const identity = candidate && !conflicted.has(candidate) ? candidate : null;
+    const identity = candidate && !conflicted.has(candidate) && !fund.notApplicableEvidence ? candidate : null;
     const key = identity ? `portfolio:${identity}` : `fund:${fund.code}`;
     if (!groups.has(key)) groups.set(key, { identity, members: [] });
     groups.get(key).members.push(fund);
@@ -346,7 +370,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
   const cached = previousFunds(previous, raw.asOf, addError);
   if (config.targetPeriodEnd) {
     for (const [code, item] of cached) {
-      if (item.selectedReport.periodEnd !== config.targetPeriodEnd) cached.delete(code);
+      if ((item.selectedReport?.periodEnd || item.notApplicableEvidence?.periodEnd) !== config.targetPeriodEnd) cached.delete(code);
     }
   }
   const barsByStock = cleanBars(raw.barsByStock, addError);
@@ -384,9 +408,27 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
         addError('CONTRADICTORY_NO_EQUITIES', code); continue;
       }
       const normalized = cleanReport(noEquitiesReport(item.noEquitiesEvidence, code), code, raw.asOf, addError);
-      if (normalized) reports.set(reportKey(normalized), normalized);
+      if (normalized && !reports.has(reportKey(normalized))) reports.set(reportKey(normalized), normalized);
     }
     if (!reports.size) {
+      const exempt = items.find(item => isValidNotApplicable(item.notApplicableEvidence,
+        { asOf: raw.asOf, code, periodEnd: config.targetPeriodEnd }));
+      if (exempt && !old?.selectedReport) {
+        const entry = directoryFunds.get(code);
+        const result = analyzeFund({ code, name: exempt.name, company: exempt.company, managers: [],
+          companyId: exempt.companyId || exempt.companyCode || entry?.companyId || null,
+          metadataSourceUrl: exempt.notApplicableEvidence.sourceUrl,
+          inceptionDate: exempt.notApplicableEvidence.date, inceptionSourceUrl: exempt.notApplicableEvidence.sourceUrl,
+          shareClassCodes: [code], reports: [] }, analysisOptions);
+        result.notApplicableEvidence = cleanNotApplicable(exempt.notApplicableEvidence);
+        result.retrievedAt = raw.retrievedAt;
+        result.dataStatus = 'fresh';
+        result.reports = [];
+        result.warnings = ['公开成立日期晚于本期末，该产品不适用本期报告。'];
+        funds.push(result); freshFundCount += 1;
+        batchResults.push({ code, status: 'not-applicable', errorCode: null });
+        continue;
+      }
       const reason = items.length ? 'NO_VALID_REPORTS' : 'FUND_NOT_COLLECTED';
       addError(reason, code); failedFundCount += 1;
       batchResults.push({ code, status: 'failed', errorCode: reason });
@@ -402,6 +444,8 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
       sourcePortfolioCode: fundCode(item.sourcePortfolioCode) ? item.sourcePortfolioCode : oldPortfolio && oldPortfolio.sourcePortfolioCode,
       portfolioSourceUrl: publicUrl(item.portfolioSourceUrl) ? item.portfolioSourceUrl : oldPortfolio && oldPortfolio.portfolioSourceUrl,
       metadataSourceUrl: publicUrl(item.metadataSourceUrl) ? item.metadataSourceUrl : null,
+      inceptionDate: validDate(item.inceptionDate) && item.inceptionDate <= raw.asOf ? item.inceptionDate : null,
+      inceptionSourceUrl: publicUrl(item.inceptionSourceUrl) ? item.inceptionSourceUrl : null,
       managerSourceUrl: publicUrl(item.managerSourceUrl) ? item.managerSourceUrl : null,
       managersAsOf: validDate(item.managersAsOf) && item.managersAsOf <= raw.asOf ? item.managersAsOf : null,
       managerScope: item.managerScope === 'current-profile' ? item.managerScope : null,
@@ -418,8 +462,8 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
       continue;
     }
     let reason = null;
-    if (old && current.selectedReport.periodEnd < old.selectedReport.periodEnd) reason = 'OLDER_REPORT';
-    if (old && current.selectedReport.periodEnd === old.selectedReport.periodEnd) {
+    if (old?.selectedReport && current.selectedReport.periodEnd < old.selectedReport.periodEnd) reason = 'OLDER_REPORT';
+    if (old?.selectedReport && current.selectedReport.periodEnd === old.selectedReport.periodEnd) {
       if (current.selectedReport.noEquitiesConfirmed !== old.selectedReport.noEquitiesConfirmed
         && (current.selectedReport.noEquitiesConfirmed || old.selectedReport.noEquitiesConfirmed)) reason = 'CONTRADICTORY_NO_EQUITIES';
       else if (current.selectedReport.holdings.length < old.selectedReport.holdings.length) reason = 'HOLDING_COVERAGE_REGRESSION';
@@ -458,7 +502,9 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
     }
     preservePrices(finalFund, old, raw.retrievedAt);
     funds.push(finalFund); freshFundCount += 1;
-    batchResults.push({ code, status: finalFund.status === 'no-equities' ? 'no-equities' : 'complete', errorCode: null });
+    if (finalFund.selectedReport.reportOnly) failedFundCount += 1;
+    batchResults.push({ code, status: finalFund.status === 'no-equities' ? 'no-equities' : finalFund.selectedReport.reportOnly ? 'failed' : 'complete',
+      errorCode: finalFund.selectedReport.reportOnly ? 'HOLDINGS_UNRESOLVED' : null });
   }
   if (!freshFundCount) throw new SafeBuildError('NO_VALID_FRESH_FUNDS');
   let retainedFundCount = 0;
@@ -502,6 +548,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
       catalogAvailableFundCount, catalogStatus: directory.known ? 'available' : 'unavailable',
       batchRequestedFundCount: requested.length, batchFreshFundCount: freshFundCount,
       noEquitiesFundCount: publishedFunds.filter(fund => fund.status === 'no-equities').length,
+      notApplicableFundCount: publishedFunds.filter(fund => fund.notApplicableEvidence).length,
       batchNoEquitiesFundCount,
       failedFundCount, retainedFundCount,
       shareClassDeduplicatedCount: funds.length - publishedFunds.length,
@@ -558,4 +605,4 @@ function main(argv = process.argv.slice(2)) {
 
 if (require.main === module) process.exitCode = main();
 
-module.exports = { buildSnapshot, catalogDetails, deduplicatePortfolios, isValidNoEq, main, publicUrl, safeError, SafeBuildError };
+module.exports = { buildSnapshot, catalogDetails, deduplicatePortfolios, isValidNoEq, isValidNotApplicable, main, publicUrl, safeError, SafeBuildError };

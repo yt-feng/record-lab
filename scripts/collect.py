@@ -44,10 +44,21 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         fund.update({k: overview[k] for k in ("name", "company", "managers")})
     except Exception as error:
         errors.append(safe_error(code, "metadata", error))
+    foundation = overview.get("foundationDate")
+    if isinstance(foundation, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", foundation) and foundation <= as_of:
+        fund["inceptionDate"] = foundation
+        fund["inceptionSourceUrl"] = fund["metadataSourceUrl"]
+    if target_period and isinstance(foundation, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", foundation) and foundation > target_period and foundation <= as_of:
+        fund["notApplicableEvidence"] = {"reason": "ESTABLISHED_AFTER_PERIOD", "date": foundation,
+                                         "sourceUrl": fund["metadataSourceUrl"], "periodEnd": target_period,
+                                         "fundCode": code}
+        return fund, errors
     if expired():
         return fund, errors
     try:
         reports = source.announcements(code, as_of)
+        if getattr(source, "announcement_error_code", None):
+            errors.append({"code": code, "stage": "announcements", "errorCode": source.announcement_error_code})
         if not reports:
             raise DataError("NO_REPORTS")
     except Exception as error:
@@ -73,74 +84,107 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
     if not target_reports:
         errors.append({"code": code, "stage": "target-report", "errorCode": "TARGET_REPORT_UNAVAILABLE"})
         return fund, errors
-    if not snapshots or (target_period and target_period not in snapshots):
-        if expired():
-            return fund, errors
-        # Absence of a holdings table does not prove absence of equity positions.
-        # Only an explicit report statement can resolve a no-equities record.
-        candidate = next((r for r in target_reports if r["kind"] == "quarterly"), target_reports[0])
-        try:
-            details = source.report_details(candidate, max_pages=80)
-            evidence = details.get("noEquitiesEvidence")
-            main_code = details.get("portfolioCode")
-            identity_matches = not main_code or main_code == code or code in details.get("shareClassCodes", [])
-            if evidence and identity_matches:
-                fund["noEquitiesEvidence"] = {**evidence, "fundCode": code}
-                return fund, [e for e in errors if e["stage"] != "holdings"]
-        except Exception as error:
-            errors.append(safe_error(code, "no-equities-report", error))
-    selected_periods = sorted({r["periodEnd"] for r in reports if r["periodEnd"] in snapshots}, reverse=True)[:max(2, min(max_reports, 4))]
+    extraction_keys = ("parseMethod", "parseErrorCode", "sourceTextHash", "pageStats",
+                       "strategyExcerpts", "strategyThemes", "reportPdfSourceUrl",
+                       "reportPdfPeriodEnd", "reportPdfKind")
+
+    def identity_matches(details):
+        main_code = details.get("portfolioCode")
+        return not main_code or main_code == code or code in details.get("shareClassCodes", [])
+
+    def attach_details(report, details, document):
+        report.update({key: details.get(key) for key in ("navYuan", "narrative")})
+        for key in extraction_keys:
+            if key in details:
+                report[key] = details[key]
+        if details.get("parseMethod"):
+            report.update({"reportPdfSourceUrl": document["sourceUrl"],
+                           "reportPdfPeriodEnd": document["periodEnd"], "reportPdfKind": document["kind"],
+                           "evidenceRetrievedAt": dt.datetime.now(dt.timezone.utc).isoformat()})
+        if details.get("navYuan") is not None:
+            report["navRetrievedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        if details.get("portfolioCode"):
+            fund.update({"portfolioCode": details["portfolioCode"], "sourcePortfolioCode": details["portfolioCode"],
+                         "portfolioSourceUrl": document["sourceUrl"]})
+        if details.get("shareClassCodes"):
+            fund["shareClassCodes"] = details["shareClassCodes"]
+
+    # A missing structured table must not prevent reading the product's PDF.
+    selected_periods = sorted({r["periodEnd"] for r in reports}, reverse=True)[:max(2, min(max_reports, 4))]
     for period in selected_periods:
         if expired():
             return fund, errors
         alternatives = [r for r in reports if r["periodEnd"] == period]
-        # The newest report provides the latest narrative; the raw holdings subset
-        # is conservatively classified and may be incomplete even for an interim report.
         selected = max(alternatives, key=lambda r: r["publishedAt"])
         report = {k: selected[k] for k in ("title", "periodEnd", "kind", "publishedAt", "sourceUrl")}
         report["fundCode"] = code
-        report["holdingsSourceUrl"] = f"https://fundf10.eastmoney.com/ccmx_{code}.html"
-        report["holdingsRetrieval"] = "eastmoney-fundarchives-year-table"
-        report["holdingsRequestedLimit"] = HOLDINGS_TOPLINE
-        report["holdingsPossiblyTruncated"] = len(snapshots[period]) >= HOLDINGS_TOPLINE
         if selected.get("sourceFundCode"):
             report["sourceFundCode"] = selected["sourceFundCode"]
-        report.update({"coverage": "top10" if len(snapshots[period]) <= 10 else "unknown",
-                       "holdings": snapshots[period], "navYuan": None, "narrative": None})
-        # Overview scale is rounded and may describe a share class, so it is never
-        # silently used as a portfolio-wide NAV. Exact report NAV is preferred.
+        holdings = snapshots.get(period, [])
+        report.update({"coverage": "top10" if 0 < len(holdings) <= 10 else "unknown",
+                       "holdings": holdings, "navYuan": None, "narrative": None,
+                       "holdingsSourceUrl": f"https://fundf10.eastmoney.com/ccmx_{code}.html" if holdings else None,
+                       "holdingsRetrieval": "eastmoney-fundarchives-year-table" if holdings else None,
+                       "holdingsRequestedLimit": HOLDINGS_TOPLINE,
+                       "holdingsPossiblyTruncated": len(holdings) >= HOLDINGS_TOPLINE,
+                       "holdingsIncomplete": getattr(holdings, "excluded_rows", 0) > 0,
+                       "holdingsExcludedRowCount": getattr(holdings, "excluded_rows", 0),
+                       "holdingsIncompleteReason": "UNSUPPORTED_OR_INVALID_SECURITY_ROWS" if getattr(holdings, "excluded_rows", 0) else None})
+        details = {}
         try:
             details = source.report_details(selected)
-            report.update({k: details[k] for k in ("navYuan", "narrative")})
-            for key in ("parseMethod", "parseErrorCode", "sourceTextHash", "pageStats", "strategyExcerpts", "strategyThemes"):
-                if key in details:
-                    report[key] = details[key]
-            if details.get("portfolioCode"):
-                if details["portfolioCode"] != code and code not in details.get("shareClassCodes", []):
-                    errors.append({"code": code, "stage": "report", "errorCode": "REPORT_IDENTITY_MISMATCH"})
-                    continue
-                fund["portfolioCode"] = details["portfolioCode"]
-                fund["sourcePortfolioCode"] = details["portfolioCode"]
-                fund["portfolioSourceUrl"] = selected["sourceUrl"]
-            if details.get("shareClassCodes"):
-                fund["shareClassCodes"] = details["shareClassCodes"]
+            if not identity_matches(details):
+                errors.append({"code": code, "stage": "report", "errorCode": "REPORT_IDENTITY_MISMATCH"})
+                continue
+            attach_details(report, details, selected)
+            pdf_holdings = details.get("pdfHoldings") or []
+            # Prefer a larger disclosed PDF table when all old securities remain
+            # represented; otherwise retain the structured table and its source.
+            if pdf_holdings and (not holdings or len(pdf_holdings) > len(holdings)
+                                 and {h["stockCode"] for h in holdings}.issubset({h["stockCode"] for h in pdf_holdings})):
+                holdings = pdf_holdings
+                report.update({"holdings": holdings, "coverage": "unknown", "holdingsSourceUrl": selected["sourceUrl"],
+                               "holdingsRetrieval": "pdf-stock-table-text", "holdingsPossiblyTruncated": True})
         except Exception as error:
             errors.append(safe_error(code, "report", error))
-        # Quarter-specific operations use the quarter report even when the newer
-        # interim report supplies same-date NAV and the latest holdings table.
+        evidence = details.get("noEquitiesEvidence")
+        if evidence and (holdings or report["holdingsExcludedRowCount"]):
+            errors.append({"code": code, "stage": "report", "errorCode": "CONTRADICTORY_NO_EQUITIES"})
+            continue
+        if not holdings:
+            if evidence and isinstance(evidence.get("page"), int) and evidence["page"] > 0:
+                report.update({"noEquitiesConfirmed": True, "noEquitiesEvidence": {**evidence, "fundCode": code},
+                               "coverage": "full"})
+                if not target_period or period == target_period:
+                    fund["noEquitiesEvidence"] = report["noEquitiesEvidence"]
+            elif details.get("sourceTextHash") and details.get("parseMethod"):
+                report["reportOnly"] = True
+                errors.append({"code": code, "stage": "holdings", "errorCode": "HOLDINGS_UNRESOLVED"})
+            else:
+                continue
+        # Quarter-specific strategy uses its own PDF, never the interim period
+        # merely because interim NAV and holdings refer to the same date.
         quarterly = next((r for r in alternatives if r["kind"] == "quarterly" and r != selected), None)
         if quarterly and not (deadline is not None and time.monotonic() >= deadline):
             try:
-                quarterly_details = source.report_details(quarterly)
-                if quarterly_details.get("narrative"):
-                    report["narrative"] = quarterly_details["narrative"]
+                quarter_details = source.report_details(quarterly)
+                if not identity_matches(quarter_details):
+                    raise DataError("REPORT_IDENTITY_MISMATCH")
+                report["narrative"] = quarter_details.get("narrative")
+                if report["narrative"]:
                     report["narrative"]["reportKind"] = "quarterly"
-                for key in ("parseMethod", "parseErrorCode", "sourceTextHash", "pageStats", "strategyExcerpts", "strategyThemes"):
-                    if key in quarterly_details:
-                        report[key] = quarterly_details[key]
+                for key in extraction_keys:
+                    if key in quarter_details:
+                        report[key] = quarter_details[key]
+                if quarter_details.get("parseMethod"):
+                    report.update({"reportPdfSourceUrl": quarterly["sourceUrl"],
+                                   "reportPdfPeriodEnd": period, "reportPdfKind": "quarterly",
+                                   "evidenceRetrievedAt": dt.datetime.now(dt.timezone.utc).isoformat()})
                 if report["navYuan"] is None:
-                    report["navYuan"] = quarterly_details["navYuan"]
+                    report["navYuan"] = quarter_details.get("navYuan")
                     report["navSourceUrl"] = quarterly["sourceUrl"]
+                    if report["navYuan"] is not None:
+                        report["navRetrievedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
             except Exception as error:
                 errors.append(safe_error(code, "quarterly-report", error))
         if report["navYuan"] is None:
