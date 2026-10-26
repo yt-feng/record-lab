@@ -10,6 +10,8 @@ const { compareHolding, estimatePosition, normalizeHolding, validDate } = requir
 const { publicUrl, isValidNotApplicable } = require('./build-data');
 const { validCompletePrice, retainedCoverage } = require('../lib/price-coverage');
 const { strategySectionCoverageFor, strategyAnalysisFor } = require('../lib/strategy-sections');
+const { strategyClaimsFor } = require('../lib/strategy-claims');
+const { strategyEvidenceBudgetFor } = require('../lib/strategy-evidence-pool');
 const { normalizeManagers, verifiedReportManagers, managerCoverageFor, completeManagerCoverage, overlaps: managerOverlaps } = require('../lib/report-managers');
 const { chinaDate } = require('../web/source-dates');
 
@@ -56,17 +58,28 @@ function strategyFor(fund, phase) {
   const observed = stamp(strategyObserved) && stamp(phase.generation || fund.retrievedAt)
     && Date.parse(strategyObserved) <= Date.parse(phase.generation || fund.retrievedAt) + 300000;
   const proof = sourceProof?.periodStart === phase.start && sourceProof.kind === 'quarterly'
-    && observed && sourceProof.publishedAt <= chinaDate(strategyObserved) ? sourceProof : null;
-  const analysis = proof ? strategyAnalysisFor(report.strategyAnalysis, proof) : null;
+    && observed && sourceProof.publishedAt <= chinaDate(strategyObserved)
+    && (!phase.asOf || sourceProof.publishedAt <= phase.asOf) ? sourceProof : null;
+  const pooled = report.strategyEvidencePool != null;
+  const poolVerified = pooled && strategyEvidenceBudgetFor(report, phase.generation || fund.retrievedAt).status === 'verified';
+  const analysis = proof && (!pooled || poolVerified) ? strategyAnalysisFor(report.strategyAnalysis, proof) : null;
+  const claims = proof ? strategyClaimsFor(report, { code: fund.code,
+    now: phase.generation || fund.retrievedAt, asOf: phase.asOf || chinaDate(phase.generation || fund.retrievedAt) }) : null;
+  // These are scan accounting facts, never a certificate of full interpretation.
+  const ruleScan = claims ? { method: claims.method, source: claims.source, coverage: claims.coverage,
+    ruleScanComplete: true, semanticAnalysisComplete: false, explainsIndividualStockTrades: false } : null;
   const candidates = [...(Array.isArray(report.strategyExcerpts) ? report.strategyExcerpts : [])];
   if (narrative?.text) candidates.push(narrative);
   const unique = new Map();
   for (const item of candidates) {
     if (!item || item.periodStart !== phase.start || item.periodEnd !== phase.target
       || !publicUrl(item.sourceUrl) || !text(item.text)) continue;
-    const excerpt = { text: text(item.text, 260), sourceUrl: item.sourceUrl,
+    if (pooled && (!poolVerified || !report.strategyEvidencePool.quotes.some(quote => quote.id === item.evidencePoolId
+      && quote.text === item.text && quote.page === item.page && item.sourceUrl === report.strategyEvidencePool.source.sourceUrl))) continue;
+    const excerpt = { text: pooled ? item.text : Array.from(item.text.trim()).slice(0, 260).join(''), sourceUrl: item.sourceUrl,
       page: Number.isInteger(item.page) && item.page > 0 && item.page <= 10000 ? item.page : null,
       periodStart: phase.start, periodEnd: phase.target };
+    if (pooled) excerpt.evidencePoolId = item.evidencePoolId;
     unique.set(`${excerpt.sourceUrl}\0${excerpt.text}`, excerpt);
   }
   const all = analysis?.evidence.length ? analysis.evidence : [...unique.values()];
@@ -75,7 +88,8 @@ function strategyFor(fund, phase) {
   return { scope: 'report-level-selected-evidence', status: all.length ? proof?.complete ? 'available' : 'partial-source' : 'missing',
     sectionCoverage: proof, sectionStatus: proof?.complete ? 'complete' : all.length || proof ? 'partial' : sourceProof ? 'wrong-period' : 'missing',
     evidenceRetrievedAt: observed ? strategyObserved : null,
-    analysis, analysisCoverage: analysis?.analysisCoverage || 'legacy-excerpts', semanticAnalysisComplete: false,
+    analysis, analysisCoverage: analysis?.analysisCoverage || 'legacy-excerpts', ruleScan,
+    ruleScanComplete: Boolean(ruleScan), semanticAnalysisComplete: false,
     themes: THEMES.filter(([, pattern]) => pattern.test(combined)).map(([label]) => label),
     excerpts: all.slice(0, limit), availableExcerptCount: all.length, excerptLimit: limit,
     explainsIndividualStockTrades: false };
@@ -229,6 +243,7 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
   if (manifest.priceUpdatedAt != null && (!stamp(manifest.priceUpdatedAt)
     || Date.parse(manifest.priceUpdatedAt) > currentTime.getTime() + 300000)) fail('ANALYSIS_FUTURE_OBSERVATION');
   phase.generation = currentTime.toISOString();
+  phase.asOf = manifest.asOf;
   if (!Number.isInteger(maxPartBytes) || maxPartBytes < 2000 || maxPartBytes > PART_LIMIT) fail('INVALID_ANALYSIS_LIMIT');
   if (progress && (progress.phase?.targetPeriodEnd !== phase.target || progress.phase?.baselinePeriodEnd !== phase.baseline)) fail('ANALYSIS_PROGRESS_PERIOD_MISMATCH');
   const seenFiles = new Set(), records = [];
@@ -256,6 +271,8 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
   const selectedByRef = new Map(selected.map(item => [`${item.file}\0${item.index}`, item]));
   const stocks = new Map(), portfolios = spool ? null : [], themes = new Map();
   const portfolioCounts = { analyzedRecords: 0, strategySectionCompleteRecords: 0, strategySectionIncompleteRecords: 0,
+    strategyRuleScanCompleteRecords: 0, strategyRuleScanPendingRecords: 0, strategySemanticAnalysisCompleteRecords: 0,
+    strategySemanticAnalysisPendingRecords: 0,
     strategySelectedEvidenceRecords: 0, reportManagerRecords: 0, reportManagerPartialRecords: 0,
     tenureOverlapManagerRecords: 0, managerEvidenceMissingRecords: 0, currentProfileOnlyManagerRecords: 0 };
   let invalidRows = 0, reportOnlyRecords = 0, noEquityRecords = 0, unknownIdentityRecords = 0,
@@ -276,6 +293,9 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
       portfolioCounts.analyzedRecords++;
       portfolioCounts.strategySectionCompleteRecords += Number(strategy.sectionStatus === 'complete');
       portfolioCounts.strategySectionIncompleteRecords += Number(strategy.sectionStatus !== 'complete');
+      portfolioCounts.strategyRuleScanCompleteRecords += Number(strategy.ruleScanComplete);
+      portfolioCounts.strategyRuleScanPendingRecords += Number(!strategy.ruleScanComplete);
+      portfolioCounts.strategySemanticAnalysisPendingRecords++;
       portfolioCounts.strategySelectedEvidenceRecords += Number(Boolean(strategy.analysis?.evidence.length));
       portfolioCounts.reportManagerRecords += Number(managers.managerCoverageStatus === 'complete');
       portfolioCounts.reportManagerPartialRecords += Number(managers.managerCoverageStatus === 'partial');
@@ -400,7 +420,7 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
     stockCount: ordered.length, contributionCount: ordered.reduce((sum, stock) => sum + Object.values(stock.changes).reduce((a, b) => a + b, 0), 0),
     identityUnresolvedRecords: unknownIdentityRecords, identityUnresolvedHoldingRecords: unknownIdentityHoldingRecords,
     identityConflictGroups: conflicts, invalidRows, strategyRecords, observedPriceRows: priceRows,
-    strategySemanticAnalysisComplete: false,
+    collectionEvidenceComplete: false, strategySemanticAnalysisComplete: false,
     completePriceStocks: ordered.filter(stock => stock.priceRange.completeness === 'complete').length,
     incompletePriceStocks: ordered.filter(stock => stock.priceRange.completeness !== 'complete').length,
     sourceCatalogShareCodes: manifest.coverage?.catalogFundCount ?? null,
@@ -420,8 +440,10 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
     && Number.isInteger(research?.applicableFunds) && research.completeFunds === research.applicableFunds
     && !unknownIdentityHoldingRecords && !conflicts && !invalidRows && !reportOnlyRecords && !coverage.managerEvidenceMissingRecords
     && !coverage.incompletePriceStocks && !coverage.strategySectionIncompleteRecords
-    && inputRecords === manifest.coverage?.fundCount) { coverage.status = 'complete'; coverage.complete = true; }
-  const output = { schemaVersion: 1, analysisVersion: 7, kind: 'quarter-analysis', targetPeriodEnd: phase.target, baselinePeriodEnd: phase.baseline,
+    && inputRecords === manifest.coverage?.fundCount) coverage.collectionEvidenceComplete = true;
+  if (coverage.collectionEvidenceComplete && coverage.analyzedRecords > 0 && coverage.strategySemanticAnalysisComplete
+    && !coverage.strategySemanticAnalysisPendingRecords) { coverage.status = 'complete'; coverage.complete = true; }
+  const output = { schemaVersion: 1, analysisVersion: 8, kind: 'quarter-analysis', targetPeriodEnd: phase.target, baselinePeriodEnd: phase.baseline,
     asOf: manifest.asOf, retrievedAt: manifest.retrievedAt, priceUpdatedAt: manifest.priceUpdatedAt || null,
     generatedAt: phase.generation, generation: phase.generation, coverage,
     stocks: ordered, portfolioFiles,

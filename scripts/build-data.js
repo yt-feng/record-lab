@@ -33,6 +33,7 @@ const BUILD_CODES = new Set([
   'LIFECYCLE_PARSE_FAILED', 'LIFECYCLE_ANNOUNCEMENT_FORMAT', 'LIFECYCLE_ARGUMENTS',
   'LIFECYCLE_DEADLINE_REACHED', 'LIFECYCLE_PAGINATION_STALLED', 'LIFECYCLE_ANNOUNCEMENT_PAGE_LIMIT',
   'LIFECYCLE_INVALID_PDF', 'LIFECYCLE_PDF_TOO_LARGE', 'LIFECYCLE_PDF_PAGE_LIMIT', 'LIFECYCLE_NOT_CONFIRMED',
+  'INVALID_STRATEGY_CLAIMS', 'INVALID_STRATEGY_QUOTE_BUDGET',
 ]);
 const STAGES = new Set(['metadata', 'announcements', 'holdings', 'report', 'nav', 'narrative',
   'join', 'prices', 'build', 'collection', 'budget', 'target-report', 'no-equities-report', 'quarterly-report', 'lifecycle']);
@@ -137,7 +138,7 @@ function cleanNotApplicable(evidence, asOf) {
     periodEnd: evidence.periodEnd, sourceUrl: evidence.sourceUrl };
 }
 
-function cleanReport(raw, code, asOf, addError) {
+function cleanReport(raw, code, asOf, addError, now = new Date()) {
   if (!raw || (raw.fundCode !== undefined && raw.fundCode !== null && raw.fundCode !== code)
     || (raw.sourceFundCode !== undefined && raw.sourceFundCode !== null && raw.sourceFundCode !== code)) {
     addError('REPORT_IDENTITY_MISMATCH', code); return null;
@@ -147,11 +148,13 @@ function cleanReport(raw, code, asOf, addError) {
     || (raw.holdingsPdfEvidence != null && !publicUrl(raw.holdingsPdfEvidence.sourceUrl))) {
     addError('INVALID_REPORT_SOURCE', code); return null;
   }
-  const report = normalizeReport(raw.sourceLocatorEvidence != null ? { ...raw, fundCode: code } : raw);
+  const report = normalizeReport({ ...raw, fundCode: code }, { code, asOf, now });
   if (!report) { addError('INVALID_REPORT', code); return null; }
   if (raw.sourceLocatorEvidence != null && !report.sourceLocatorEvidence) {
     addError('REPORT_IDENTITY_MISMATCH', code); return null;
   }
+  if (raw.strategyClaims?.ruleScanComplete === true && !report.strategyClaims) addError('INVALID_STRATEGY_CLAIMS', code);
+  if (raw.strategyEvidencePool != null && report.strategyEvidenceBudget?.status !== 'verified') addError('INVALID_STRATEGY_QUOTE_BUDGET', code);
   if (report.periodEnd > asOf || report.publishedAt > asOf) { addError('FUTURE_REPORT', code); return null; }
   if (!report.holdings.length) {
     if (report.reportOnly) {
@@ -250,7 +253,7 @@ function preservePrices(current, previous, retrievedAt) {
   current.summary.observedPriceCount = current.rows.filter(row => row.priceRange.status === 'observed').length;
 }
 
-function previousFunds(previous, asOf, addError) {
+function previousFunds(previous, asOf, addError, now = new Date()) {
   const result = new Map();
   if (!previous) return result;
   if (previous.schemaVersion !== 1 || !Array.isArray(previous.funds)) throw new SafeBuildError('INVALID_PREVIOUS_SNAPSHOT');
@@ -261,8 +264,8 @@ function previousFunds(previous, asOf, addError) {
       result.set(item.code, item); continue;
     }
     if (!item.selectedReport) continue;
-    const selected = cleanReport(item.selectedReport, item.code, asOf, addError);
-    const prior = item.previousReport ? cleanReport(item.previousReport, item.code, asOf, addError) : null;
+    const selected = cleanReport(item.selectedReport, item.code, asOf, addError, now);
+    const prior = item.previousReport ? cleanReport(item.previousReport, item.code, asOf, addError, now) : null;
     if (!selected || (item.previousReport && !prior)) continue;
     if (!result.has(item.code)) result.set(item.code, item);
   }
@@ -415,7 +418,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
   for (const issue of Array.isArray(raw.errors) ? raw.errors : []) {
     errors.push(safeError(issue, issue && issue.stage, issue && issue.code));
   }
-  const cached = previousFunds(previous, raw.asOf, addError);
+  const cached = previousFunds(previous, raw.asOf, addError, nowValue);
   if (config.targetPeriodEnd) {
     for (const [code, item] of cached) {
       if ((item.selectedReport?.periodEnd || item.notApplicableEvidence?.periodEnd) !== config.targetPeriodEnd) cached.delete(code);
@@ -427,7 +430,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
   const pricePatches = priceItems.map(item => normalizePatch(
     (Array.isArray(raw.pricePatches) ? raw.pricePatches : []).find(patch => patch?.code === item.code),
     item, barsByStock, config, raw.retrievedAt, config.traversal?.plannedAt));
-  const analysisOptions = { asOf: raw.asOf, barsByStock,
+  const analysisOptions = { asOf: raw.asOf, barsByStock, now: nowValue,
     periodEnd: config.targetPeriodEnd, baselinePeriodEnd: config.baselinePeriodEnd };
   const groups = new Map();
   for (const item of raw.funds) {
@@ -461,7 +464,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
     const rawReports = items.flatMap(item => Array.isArray(item.reports) ? item.reports : []);
     const reports = new Map();
     for (const item of rawReports) {
-      const normalized = cleanReport(item, code, raw.asOf, addError);
+      const normalized = cleanReport(item, code, raw.asOf, addError, nowValue);
       if (!normalized) continue;
       const key = reportKey(normalized);
       if (!reports.has(key) || reports.get(key).holdings.length < normalized.holdings.length) reports.set(key, normalized);
@@ -474,7 +477,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
       if ([...reports.values()].some(report => report.periodEnd === item.noEquitiesEvidence.periodEnd && report.holdings.length)) {
         addError('CONTRADICTORY_NO_EQUITIES', code); continue;
       }
-      const normalized = cleanReport(noEquitiesReport(item.noEquitiesEvidence, code), code, raw.asOf, addError);
+      const normalized = cleanReport(noEquitiesReport(item.noEquitiesEvidence, code), code, raw.asOf, addError, nowValue);
       if (normalized && !reports.has(reportKey(normalized))) reports.set(reportKey(normalized), normalized);
     }
     if (!reports.size) {
@@ -565,7 +568,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
     // gates above, so history can never disguise an entirely failed collection.
     const history = new Map();
     for (const historical of old ? (old.reports || [old.selectedReport, old.previousReport]).filter(Boolean) : []) {
-      const normalized = cleanReport(historical, code, raw.asOf, addError);
+      const normalized = cleanReport(historical, code, raw.asOf, addError, nowValue);
       if (normalized) history.set(reportKey(normalized), normalized);
     }
     for (const [key, normalized] of reports) {

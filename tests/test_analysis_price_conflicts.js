@@ -54,7 +54,7 @@ function analyzeBoth(input) {
     assert.deepEqual(input.docs, original, 'analysis must preserve original price intervals and evidence');
     assert.deepEqual(memory.stocks[0].priceRange.sourceUrls, [...input.sources].sort());
     assert.equal(memory.stocks[0].priceRange.sourceCount, input.sources.length);
-    assert.equal(memory.analysisVersion, 7);
+    assert.equal(memory.analysisVersion, 8);
     assert.equal(memory.coverage.contributionCount, input.sources.length);
     assert.equal(memory.stocks[0].priceRange.isCost, false);
     return memory;

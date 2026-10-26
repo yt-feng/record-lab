@@ -8,6 +8,7 @@ const { buildSnapshot, catalogDetails, deduplicatePortfolios, publicUrl } = requ
 const { validDate } = require('../lib/fund-analysis');
 const { verifiedReportManagers, normalizeManagers, evidenceFor, managerKey, managerCoverageFor, completeManagerCoverage } = require('../lib/report-managers');
 const { strategySectionCoverageFor, strategyAnalysisFor } = require('../lib/strategy-sections');
+const { retainStrategyClaims } = require('../lib/strategy-claims');
 const { VERSION: PRICE_COVERAGE_VERSION, calendar, validCompletePrice, validUsableCompletePrice, validUsableCompleteQuarterPrice, retainedCoverage } = require('../lib/price-coverage');
 const { normalizeConflict } = require('../lib/price-consistency');
 const { bindingFor, validPatch, canReplacePrice, key: priceKey } = require('../lib/price-patches');
@@ -176,7 +177,7 @@ function retainPrices(candidate, old, now) {
 
 // Fill independently sourced gaps without replacing a stronger holdings table.
 // A recovered narrative keeps its own source, period, extraction time and PDF hash.
-function retainReportEvidence(target, source) {
+function retainReportEvidence(target, source, now = new Date()) {
   if (!target?.selectedReport || !source?.selectedReport || target.selectedReport.periodEnd !== source.selectedReport.periodEnd) return false;
   let changed = false;
   const to = target.selectedReport, from = source.selectedReport;
@@ -232,6 +233,9 @@ function retainReportEvidence(target, source) {
     to.strategyAnalysis = strategyAnalysisFor(from.strategyAnalysis, newStrategy);
     to.strategyEvidenceRetrievedAt = from.strategyEvidenceRetrievedAt || source.retrievedAt;
     for (const key of ['strategyExcerpts', 'strategyThemes', 'narrative']) if (from[key] !== undefined) to[key] = clone(from[key]);
+    target.narrative = clone(to.narrative); changed = true;
+  }
+  if (retainStrategyClaims(to, from, { code: target.code, now, asOf: target.asOf })) {
     target.narrative = clone(to.narrative); changed = true;
   }
   if (!to.narrative?.text && from.narrative?.text) {
@@ -425,14 +429,14 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
       if (!mapCompany(fund, directoryMap)) { addError('CATALOG_IDENTITY_MISMATCH'); continue; }
       const old = byCode.get(fund.code);
       if (!shouldReplace(old, fund)) {
-        if (old && retainReportEvidence(old, fund)) {
+        if (old && retainReportEvidence(old, fund, currentTime)) {
           const rebuilt = sanitizeFund(old, { now: currentTime, config,
             envelope: { asOf: old.asOf, retrievedAt: old.retrievedAt, priceUpdatedAt: old.priceUpdatedAt } });
           if (rebuilt) { byCode.set(old.code, rebuilt); acceptedFreshFundCount += 1; }
         }
         continue;
       }
-      if (retainReportEvidence(fund, old)) {
+      if (retainReportEvidence(fund, old, currentTime)) {
         fund = sanitizeFund(fund, { now: currentTime, config, envelope });
         if (!fund) continue;
       }

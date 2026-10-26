@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 from unittest.mock import patch
 
 from portfolio_identity import normalize_portfolio_identity
@@ -19,6 +20,88 @@ from verify_locators import FixedPdfProvider, SAMPLES
 
 OUTPUT = Path('.cache/strategy-claims-verification/result.json')
 MAX_OUTPUT_BYTES = 40_000
+ROOT = Path(__file__).resolve().parents[1]
+MAX_BRIDGE_BYTES = 80_000
+NODE_ADMISSION = r"""const fs=require('node:fs');
+try {
+ const {strategyClaimsFor}=require('./lib/strategy-claims');
+ const {normalizeStrategyEvidencePool,strategyEvidenceBudgetFor}=require('./lib/strategy-evidence-pool');
+ const {chinaDate}=require('./web/source-dates');
+ const x=JSON.parse(fs.readFileSync(0,'utf8')), r=x.report;
+ const pool=normalizeStrategyEvidencePool(r.strategyEvidencePool,r.strategySectionCoverage,{},x.now);
+ const budget=strategyEvidenceBudgetFor(r,x.now);
+ const claims=strategyClaimsFor(r,{code:r.fundCode,now:x.now,asOf:chinaDate(x.now)});
+ process.stdout.write(JSON.stringify({admitted:Boolean(claims),poolVerified:Boolean(pool),
+  projectionVerified:budget.status==='verified',sourceMatches:Boolean(claims&&JSON.stringify(claims.source)===JSON.stringify(r.strategyClaims.source)),
+  originalTimeMatches:Boolean(claims&&claims.source.retrievedAt===r.strategyEvidenceRetrievedAt),
+  semanticLimited:Boolean(claims&&claims.semanticAnalysisComplete===false),
+  admittedClaimCount:claims?.claims?.length??0,admittedEvidenceCount:claims?.evidence?.length??0,
+  poolQuoteCount:pool?.usedQuotes??0,poolQuoteChars:pool?.usedQuoteChars??0,
+  sourceDigest:claims?.source?.digest??null,poolDigest:pool?.digest??null}));
+} catch (_) {process.stdout.write('{}');process.exitCode=1;}
+"""
+ADMISSION_BOOLEANS = ('admitted', 'poolVerified', 'projectionVerified', 'sourceMatches', 'originalTimeMatches', 'semanticLimited')
+ADMISSION_COUNTS = ('admittedClaimCount', 'admittedEvidenceCount', 'poolQuoteCount', 'poolQuoteChars')
+
+
+def integration_report(details, document):
+    """Only the already-public bounded report fields cross the stdin bridge."""
+    fields = ('strategySectionCoverage', 'strategyAnalysis', 'strategyClaims', 'strategyEvidencePool',
+              'strategyEvidenceBudget', 'strategyEvidenceRetrievedAt', 'strategyClaimsIdentityEvidence', 'narrative', 'strategyExcerpts')
+    report = {key: details.get(key) for key in fields}
+    report.update({key: document[key] for key in ('fundCode', 'sourceUrl', 'periodEnd', 'kind', 'publishedAt')})
+    # Fail closed before serialization if an unexpected full-text field entered
+    # a public strategy container. Do not silently prune and then admit it.
+    allowed = {
+        'strategyClaims': {'schemaVersion', 'method', 'status', 'source', 'sourceSectionComplete', 'ruleScanComplete',
+            'semanticAnalysisComplete', 'scanScope', 'publicEvidenceScope', 'managerAttribution', 'explainsIndividualStockTrades',
+            'coverage', 'unknownReasonCounts', 'reasonCodes', 'claims', 'evidence', 'publicQuoteBudget'},
+        'strategyAnalysis': {'schemaVersion', 'scope', 'method', 'status', 'analysisCoverage', 'semanticAnalysisComplete',
+            'sourceSectionComplete', 'sentenceCount', 'categorySentenceCounts', 'categoryCountsOverlap', 'selectedSentenceCount',
+            'omittedSentenceCount', 'maxQuotes', 'maxQuoteChars', 'evidence', 'explainsIndividualStockTrades', 'securityMentionsProveTrades'},
+    }
+    for key, names in allowed.items():
+        if not isinstance(report[key], dict) or set(report[key]) - names:
+            raise ValueError('INTEGRATION_PUBLIC_FIELDS_INVALID')
+    if not bounded_evidence(report['strategyClaims'], report.get('strategySectionCoverage') or {}):
+        raise ValueError('INTEGRATION_PUBLIC_FIELDS_INVALID')
+    # These projection fields have no full-source text permission. Their
+    # complete schemas and source binding are then checked by JS admission.
+    def bounded_public_tree(value, key=None):
+        if isinstance(value, dict):
+            return all(name not in ('fullText', 'rawText', 'markdown', 'raw', 'sectionsText')
+                       and bounded_public_tree(item, name) for name, item in value.items())
+        if isinstance(value, list):
+            return len(value) <= 1000 and all(bounded_public_tree(item, key) for item in value)
+        if isinstance(value, str):
+            limit = 2048 if key in ('sourceUrl', 'labelContext') else 300 if key in ('heading', 'endHeading') else 160
+            return len(value) <= limit
+        return value is None or type(value) in (int, float, bool)
+    if not bounded_public_tree(report):
+        raise ValueError('INTEGRATION_PUBLIC_FIELDS_INVALID')
+    return report
+
+
+def production_admission(details, document, now):
+    report = integration_report(details, document)
+    raw = json.dumps({'report': report, 'now': now}, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
+    if len(raw.encode()) > MAX_BRIDGE_BYTES:
+        raise ValueError('INTEGRATION_PUBLIC_FIELDS_INVALID')
+    try:
+        result = subprocess.run(['node', '-e', NODE_ADMISSION], cwd=ROOT, input=raw, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+        if result.returncode or len(result.stdout.encode()) > 4096:
+            raise ValueError('INTEGRATION_ADMISSION_FAILED')
+        value = json.loads(result.stdout)
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        raise ValueError('INTEGRATION_ADMISSION_FAILED') from None
+    if (not isinstance(value, dict) or set(value) != {*ADMISSION_BOOLEANS, *ADMISSION_COUNTS, 'sourceDigest', 'poolDigest'}
+            or any(type(value[key]) is not bool for key in ADMISSION_BOOLEANS)
+            or any(type(value[key]) is not int or not 0 <= value[key] <= (1280 if key == 'poolQuoteChars' else 8) for key in ADMISSION_COUNTS)
+            or any(value[key] is not None and (not isinstance(value[key], str) or len(value[key]) != 64
+                or any(c not in '0123456789abcdef' for c in value[key])) for key in ('sourceDigest', 'poolDigest'))):
+        raise ValueError('INTEGRATION_ADMISSION_FAILED')
+    return value
 KNOWN_Q2_VIEWPOINT = '在本报告期我们持续看好人工智能方向'
 KNOWN_Q2_SENTENCE = KNOWN_Q2_VIEWPOINT + '，包括算力基础建设和AI 应用方面的发展。'
 
@@ -99,10 +182,10 @@ def scan_accounting(claims, proof):
             and coverage['omittedSentenceCount'] + coverage['selectedSentenceCount'] == coverage['sentenceCount'])
 
 
-def run_sample(sample, *, provider_factory=None):
+def run_sample(sample, *, provider_factory=None, verify_integration=False):
     if os.environ.get('GITHUB_ACTIONS') != 'true':
         raise ValueError('ACTIONS_REQUIRED')
-    if sample not in SAMPLES or mineru_tokens_from_env():
+    if sample not in SAMPLES or mineru_tokens_from_env() or type(verify_integration) is not bool:
         raise ValueError('FIXED_SAMPLE_CONFIGURATION_INVALID')
     from strategy_claims import parse_strategy_claims, METHOD
     import strategy_sections
@@ -162,10 +245,42 @@ def run_sample(sample, *, provider_factory=None):
             private_sections = getattr(sections, 'sections', ())
             original_text = private_sections[0].get('text') if len(private_sections) == 1 else None
             checks['knownViewpointControl'] = known_viewpoint_control(claims, sample, original_text)
-        return {'code': document['fundCode'], 'quarter': sample['targetPeriod'], 'sourceUrl': sample['sourceUrl'],
+        integration = None
+        if verify_integration:
+            from strategy_evidence_pool import strategy_evidence_budget_for
+            now = dt.datetime.now(dt.timezone.utc).isoformat()
+            production = details.get('strategyClaims') or {}
+            # The only integration-added claim field is a canonical pool ref.
+            comparable = {**production, 'evidence': [{key: value for key, value in item.items() if key != 'evidencePoolId'}
+                for item in production.get('evidence', []) if isinstance(item, dict)]}
+            pool, sidecar = details.get('strategyEvidencePool') or {}, details.get('strategyClaimsIdentityEvidence') or {}
+            checks.update({
+                'productionClaimsEqualIndependentScan': comparable == claims,
+                'productionSectionProofPreserved': details.get('strategySectionCoverage') == proof,
+                'productionOriginalTimePreserved': details.get('strategyEvidenceRetrievedAt') == identity['retrievedAt']
+                    and (pool.get('source') or {}).get('retrievedAt') == identity['retrievedAt']
+                    and sidecar.get('retrievedAt') == identity['retrievedAt'],
+                'productionQuarterIdentityPreserved': sidecar == identity,
+                'productionSharedBudgetVerified': strategy_evidence_budget_for(details, now)['status'] == 'verified',
+                'oneStrategySectionExtraction': len(captured) == 1,
+            })
+            integration = production_admission(details, document, now)
+            checks['jsProductionAdmissionVerified'] = all(integration[key] is True for key in ADMISSION_BOOLEANS)
+            checks['jsProductionCountsAndDigestsPreserved'] = (
+                integration['admittedClaimCount'] == len(production.get('claims', []))
+                and integration['admittedEvidenceCount'] == len(production.get('evidence', []))
+                and integration['poolQuoteCount'] == pool.get('usedQuotes')
+                and integration['poolQuoteChars'] == pool.get('usedQuoteChars')
+                and integration['sourceDigest'] == (production.get('source') or {}).get('digest')
+                and integration['poolDigest'] == pool.get('digest'))
+            checks['noAdditionalPdfRequest'] = source.pdf_requests == 1
+        result = {'code': document['fundCode'], 'quarter': sample['targetPeriod'], 'sourceUrl': sample['sourceUrl'],
                 'pdfSha256': source.pdf_sha256, 'pdfRequestCount': source.pdf_requests,
                 'knownViewpointRequired': known_required,
                 'checks': checks, 'strategyClaims': claims, 'passed': all(checks.values())}
+        if integration is not None:
+            result['productionIntegration'] = integration
+        return result
     finally:
         source.session.close()
 
@@ -200,7 +315,7 @@ def main():
     results = []
     for sample in SAMPLES:
         try:
-            results.append(run_sample(sample))
+            results.append(run_sample(sample, verify_integration=True))
         except Exception:
             # No provider response, local path or raw exception is public output.
             results.append({'code': sample['codes'][0], 'quarter': sample['targetPeriod'],

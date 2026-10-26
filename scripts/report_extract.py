@@ -357,9 +357,11 @@ def _details_for_pages(pages: list[str], source_url: str, period_end: str, kind:
     excerpts = strategy_excerpts(pages, source_url, period_end, kind,
                                  fallback_narrative=parsed.get("narrative"), page_numbers=page_numbers)
     from strategy_sections import parse_strategy_sections
-    parsed.update(parse_strategy_sections(pages,
-        {"sourceUrl": source_url, "periodEnd": period_end, "kind": kind, "publishedAt": published_at},
-        page_numbers=page_numbers, securities=parsed.get("pdfHoldings")))
+    strategy_report = {"sourceUrl": source_url, "periodEnd": period_end, "kind": kind,
+                       "publishedAt": published_at, "retrievedAt": retrieved_at}
+    sections_result = parse_strategy_sections(pages, strategy_report,
+        page_numbers=page_numbers, securities=parsed.get("pdfHoldings"))
+    parsed.update(sections_result)
     parsed.update({"sourceTextHash": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
                    "pageStats": {"pageCount": len(pages), "processedPages": len(pages), "totalPages": total_pages,
                                   "nonEmptyPages": sum(bool(page.strip()) for page in pages),
@@ -368,6 +370,22 @@ def _details_for_pages(pages: list[str], source_url: str, period_end: str, kind:
                                   "pageNumbersVerified": page_numbers is None or all(isinstance(n, int) and n > 0 for n in page_numbers),
                                   "textStatus": "usable" if len(normalized) >= 100 else "sparse"},
                    "strategyExcerpts": excerpts, "strategyThemes": strategy_themes(excerpts)})
+    # Scan the same complete private section. No second PDF extraction and no
+    # external inference call; all public text shares one source quote budget.
+    if kind == "quarterly":
+        from strategy_claims import parse_strategy_claims
+        from strategy_evidence_pool import apply_strategy_evidence_budget
+        parsed.update(parse_strategy_claims(pages, strategy_report, page_numbers=page_numbers,
+            securities=parsed.get("pdfHoldings"), sections_result=sections_result))
+        parsed.update(apply_strategy_evidence_budget(parsed, pages, strategy_report,
+            sections_result=sections_result, page_numbers=page_numbers))
+        if parsed.get("strategyEvidenceBudget", {}).get("status") == "verified":
+            parsed["strategyThemes"] = strategy_themes(parsed["strategyExcerpts"])
+            # This identity belongs to the strategy PDF, which can differ from
+            # the interim holdings PDF selected later by collection.
+            parsed["strategyClaimsIdentityEvidence"] = parsed.get("portfolioIdentityEvidence")
+    if retrieved_at:
+        parsed["strategyEvidenceRetrievedAt"] = retrieved_at
     return parsed
 
 

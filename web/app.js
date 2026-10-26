@@ -161,7 +161,7 @@
     if (!progress) return { label: '研究完整度待核验', detail: '' };
     if (progress.quarterUniverse?.required === true && progress.quarterUniverse.historicalUniverseVerified !== true
       && progress.completionAudit?.knownDirectoryComplete === true) return { label: '已知目录字段齐全，历史范围待核验', detail: '' };
-    if (progress.completionStatus === 'complete') return { label: '适用产品研究字段已齐', detail: '' };
+    if (progress.completionStatus === 'complete') return { label: '适用产品采集证据已齐', detail: '' };
     const scheduled = validTimestamp(progress.nextRetryAt);
     const detail = scheduled ? `后续复查不早于 ${formatRetryAt(progress.nextRetryAt)}，具体执行以任务运行记录为准。` : '';
     if (scheduled && (progress.continueRun === false || progress.completionStatus === 'incomplete-exhausted')) return { label: '本轮结束，等待复查', detail };
@@ -682,14 +682,15 @@
       if (research) {
         const retry = retryState(state.progress);
         const managerAudited = countValue(research.fieldCoverage.managers);
-        quality.append(el('strong', '', `${managerAudited ? '七项研究字段齐全' : '原六项研究字段齐全'} ${formatNumber(research.completeFunds, 0)} / ${formatNumber(research.applicableFunds, 0)} 只适用份额 · ${retry.label}`));
+        quality.append(el('strong', '', `${managerAudited ? '七项采集证据齐全' : '原六项采集证据齐全'} ${formatNumber(research.completeFunds, 0)} / ${formatNumber(research.applicableFunds, 0)} 只适用份额 · ${retry.label}`));
+        quality.append(el('p', '', '采集证据齐全不代表基金经理观点的全文语义解读已完成；解读进度单独列示。'));
         if (countValue(research.sixFieldsCompleteFunds)) quality.append(el('p', '', `六项基础字段齐全 ${formatNumber(research.sixFieldsCompleteFunds, 0)}（按当前校验）；七项口径另要求完整的报告经理表证据。`));
         if (!managerAudited) quality.append(el('p', '', '报告经理证据尚未纳入这一版完整度，仍待回补核验。'));
         quality.append(el('span', '', `待补 ${formatNumber(research.pendingFunds, 0)} · 本轮重试已用完 ${formatNumber(research.exhaustedFunds, 0)}`));
         if (retry.detail) quality.append(el('p', '', retry.detail));
         if (state.progress?.deferredFunds) quality.append(el('p', '', `本批未轮到 ${formatNumber(state.progress.deferredFunds, 0)} 只：保留原状态与尝试次数，不记为一次新的抓取失败；该数可能与原有待处理或失败状态重叠。`));
         if (research.notApplicableFunds) quality.append(el('span', '', `另有 ${exemptionText}，按对应公开证据单列，不计为无股票持仓或研究已完成。`));
-        const labels = { holdings: '持仓披露表', pdf: 'PDF', strategy: '季报策略', nav: '净资产', baseline: '上期基准', prices: '行情', managers: '报告经理' };
+        const labels = { holdings: '持仓披露表', pdf: 'PDF', strategy: '策略章节', nav: '净资产', baseline: '上期基准', prices: '行情', managers: '报告经理' };
         quality.append(el('p', '', Object.entries(labels).map(([key, label]) => `${label} ${formatNumber(research.fieldCoverage[key], 0)}`).join(' · ')));
       } else {
         quality.append(el('p', '', '研究完整度尚未核验；取得持仓或无股票证据不代表 PDF、策略、规模和比较基准都已齐全。'));
@@ -867,7 +868,7 @@
       }
       const quality = fundQuality(state.progress, fund);
       if (quality?.fields) {
-        const labels = { holdings: '持仓披露表', pdf: 'PDF', strategy: '季报策略', nav: '净资产', baseline: '上期基准', prices: '行情', managers: '报告经理' };
+        const labels = { holdings: '持仓披露表', pdf: 'PDF', strategy: '策略章节', nav: '净资产', baseline: '上期基准', prices: '行情', managers: '报告经理' };
         const statuses = { complete: '齐全', missing: '缺失', partial: '部分', truncated: '截断', 'wrong-period': '期间不符', 'not-applicable': '不适用' };
         const qualityRow = el('div', 'fund-metadata research-fields');
         for (const [key, label] of Object.entries(labels)) addMetadata(qualityRow, label, statuses[quality.fields[key]] || '待核验');

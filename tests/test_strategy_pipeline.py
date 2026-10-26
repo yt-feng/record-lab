@@ -27,7 +27,8 @@ class Source:
     def report_details(self, document):
         text = document["title"] + "\n4.4 报告期内基金的投资策略和运作分析\n本基金在报告期内基于估值变化增加中国平安配置。\n4.5 报告期内基金的业绩表现\n本期基金净值增长。"
         return _details_for_pages([text], document["sourceUrl"], document["periodEnd"], document["kind"],
-            lambda *args: {**parse_pdf_pages(*args), "navYuan": 10000}, published_at=document["publishedAt"])
+            lambda *args: {**parse_pdf_pages(*args), "navYuan": 10000}, published_at=document["publishedAt"],
+            retrieved_at="2026-09-01T10:00:00.123456+00:00")
 
 
 class StrategyPipelineTests(unittest.TestCase):
@@ -43,7 +44,7 @@ class StrategyPipelineTests(unittest.TestCase):
                          ("https://example.org/quarter.pdf", "2026-07-20", "2026-04-01"))
         self.assertEqual(current["strategyAnalysis"]["analysisCoverage"], "selected-evidence")
         self.assertEqual(previous["strategySectionCoverage"]["periodEnd"], "2026-03-31")
-        self.assertIn("strategyEvidenceRetrievedAt", current)
+        self.assertEqual(current["strategyEvidenceRetrievedAt"], "2026-09-01T10:00:00.123456+00:00")
 
     def test_unpaginated_extraction_keeps_legacy_excerpt_but_has_no_complete_section(self):
         document = Source().announcements("000001", "2026-10-26")[1]

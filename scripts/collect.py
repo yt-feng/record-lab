@@ -219,7 +219,8 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         if (needed and needed.issubset(snapshots)) or (not needed and len([p for p in snapshots if p <= as_of]) >= 2):
             break
     extraction_keys = ("parseMethod", "parseErrorCode", "sourceTextHash", "pageStats",
-                       "strategyExcerpts", "strategyThemes", "strategySectionCoverage", "strategyAnalysis", "reportPdfSourceUrl",
+                       "strategyExcerpts", "strategyThemes", "strategySectionCoverage", "strategyAnalysis",
+                       "strategyClaims", "strategyEvidencePool", "strategyEvidenceBudget", "strategyEvidenceRetrievedAt", "reportPdfSourceUrl",
                        "reportPdfPeriodEnd", "reportPdfKind")
 
     def identity_matches(details):
@@ -244,8 +245,9 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         for key in extraction_keys:
             if key in details:
                 report[key] = details[key]
-        if details.get("strategySectionCoverage"):
-            report["strategyEvidenceRetrievedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        if details.get("strategyClaimsIdentityEvidence"):
+            report["strategyClaimsIdentityEvidence"] = normalize_portfolio_identity(
+                details["strategyClaimsIdentityEvidence"], {**document, "fundCode": code})
         if details.get("parseMethod"):
             report.update({"reportPdfSourceUrl": document["sourceUrl"],
                            "reportPdfPeriodEnd": document["periodEnd"], "reportPdfKind": document["kind"],
@@ -380,8 +382,9 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
                 for key in extraction_keys:
                     if key in quarter_details:
                         report[key] = quarter_details[key]
-                if quarter_details.get("strategySectionCoverage"):
-                    report["strategyEvidenceRetrievedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
+                if quarter_details.get("strategyClaimsIdentityEvidence"):
+                    report["strategyClaimsIdentityEvidence"] = normalize_portfolio_identity(
+                        quarter_details["strategyClaimsIdentityEvidence"], {**quarterly, "fundCode": code})
                 if quarter_details.get("parseMethod"):
                     report.update({"reportPdfSourceUrl": quarterly["sourceUrl"],
                                    "reportPdfPeriodEnd": period, "reportPdfKind": "quarterly",

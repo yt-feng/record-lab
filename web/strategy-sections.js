@@ -12,7 +12,7 @@ const date = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(va
 const count = value => Number.isInteger(value) && value >= 0 && value <= 240000;
 const page = value => Number.isInteger(value) && value > 0 && value <= 10000;
 const hash = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
-const plain = (value, limit) => typeof value === 'string' && value.trim() && value.length <= limit ? value.trim() : null;
+const plain = (value, limit) => typeof value === 'string' && value.trim() && Array.from(value).length <= limit ? value.trim() : null;
 function source(value) {
   if (typeof value !== 'string' || value.length > 2048) return false;
   try {

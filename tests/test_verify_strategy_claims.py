@@ -197,6 +197,68 @@ class StrategyClaimVerificationTests(unittest.TestCase):
         self.assertEqual(result['pdfSha256'], hashlib.sha256(b'%PDF synthetic claim fixture').hexdigest())
         extract.assert_called_once()
 
+    def test_production_extraction_pool_and_js_admission_share_the_original_two_pdf_inputs(self):
+        from report_extract import PDFPages
+        for sample in verify.SAMPLES:
+            known = sample['targetPeriod'] == '2026Q2'
+            pages = PDFPages([sample['title'], '§2 基金产品概况\n2.1 基金基本情况\n基金主代码 ' + sample['codes'][0] + '\n',
+                '§3 主要财务指标和基金净值表现\n', *(['合成前页', '合成前页'] if known else []),
+                '4.4 报告期内基金的投资策略和运作分析\n' + BODY + (KNOWN_VIEWPOINT_SENTENCE if known else '')
+                + '\n4.5 报告期内基金的业绩表现\n'], 6 if known else 4)
+            with patch('report_extract._pypdf_pages', return_value=pages) as extract, patch('manager_cells.enrich_manager_details'):
+                result = verify.run_sample(sample, verify_integration=True)
+            self.assertTrue(result['passed'], result['checks']); extract.assert_called_once()
+            self.assertEqual(result['pdfRequestCount'], 1)
+            self.assertTrue(all(result['productionIntegration'][key] for key in verify.ADMISSION_BOOLEANS))
+            self.assertLessEqual(result['productionIntegration']['poolQuoteCount'], 8)
+            self.assertLessEqual(result['productionIntegration']['poolQuoteChars'], 1280)
+            self.assertNotIn('strategyEvidencePool', result)
+            self.assertNotIn(BODY, json.dumps(result, ensure_ascii=False))
+
+    def test_wrong_pool_is_rejected_by_actual_js_bridge_without_a_second_request(self):
+        from report_extract import PDFPages
+        sample = verify.SAMPLES[1]
+        pages = PDFPages([sample['title'], '§2 基金产品概况\n基金主代码 159366\n',
+            '§3 主要财务指标和基金净值表现\n',
+            '4.4 报告期内基金的投资策略和运作分析\n本基金增配科技行业。\n4.5 报告期内基金的业绩表现\n'], 4)
+        class WrongPool(verify.FixedPdfProvider):
+            def report_details(self, report, max_pages=80):
+                details = super().report_details(report, max_pages)
+                details['strategyEvidencePool']['quotes'][0]['text'] = '伪造来源观点'
+                return details
+        with patch('report_extract._pypdf_pages', return_value=pages) as extract, patch('manager_cells.enrich_manager_details'):
+            result = verify.run_sample(sample, provider_factory=WrongPool, verify_integration=True)
+        extract.assert_called_once(); self.assertEqual(result['pdfRequestCount'], 1)
+        self.assertFalse(result['passed']); self.assertFalse(result['checks']['productionSharedBudgetVerified'])
+        self.assertFalse(result['checks']['jsProductionAdmissionVerified'])
+        self.assertFalse(result['productionIntegration']['admitted'])
+        self.assertNotIn('伪造来源观点', json.dumps(result, ensure_ascii=False))
+
+    def test_admission_bridge_is_bounded_and_never_relays_child_output_or_unexpected_full_text(self):
+        from report_extract import PDFPages
+        sample = verify.SAMPLES[1]
+        pages = PDFPages([sample['title'], '§2 基金产品概况\n基金主代码 159366\n',
+            '§3 主要财务指标和基金净值表现\n',
+            '4.4 报告期内基金的投资策略和运作分析\n本基金增配科技行业。\n4.5 报告期内基金的业绩表现\n'], 4)
+        document = {'fundCode': sample['codes'][0], 'sourceUrl': sample['sourceUrl'], 'publishedAt': sample['publishedAt'],
+                    'kind': 'quarterly', 'periodEnd': '2026-09-30'}
+        source = verify.FixedPdfProvider(sample)
+        try:
+            with patch('report_extract._pypdf_pages', return_value=pages), patch('manager_cells.enrich_manager_details'):
+                details = source.report_details(document, max_pages=80)
+        finally: source.session.close()
+        with patch.object(verify.subprocess, 'run', side_effect=verify.subprocess.TimeoutExpired('node', 30, stderr='private error')) as run:
+            with self.assertRaisesRegex(ValueError, '^INTEGRATION_ADMISSION_FAILED$'):
+                verify.production_admission(details, document, dt.datetime.now(dt.timezone.utc).isoformat())
+            self.assertEqual(run.call_args.kwargs['timeout'], 30)
+            self.assertIs(run.call_args.kwargs['stderr'], verify.subprocess.DEVNULL)
+            self.assertNotIn(BODY, run.call_args.kwargs['input'])
+        details['strategyClaims']['fullText'] = '完整私有文本'
+        with patch.object(verify.subprocess, 'run') as run:
+            with self.assertRaisesRegex(ValueError, '^INTEGRATION_PUBLIC_FIELDS_INVALID$'):
+                verify.production_admission(details, document, dt.datetime.now(dt.timezone.utc).isoformat())
+            run.assert_not_called()
+
     def test_short_evidence_quote_page_hash_and_reference_guards(self):
         import strategy_claims
         original = strategy_claims.parse_strategy_claims
@@ -305,7 +367,8 @@ class StrategyClaimVerificationTests(unittest.TestCase):
         text = (ROOT / '.github/workflows/verify-strategy-claims.yml').read_text()
         for expected in ('contents: read', 'timeout-minutes: 12', 'persist-credentials: false',
                          '/.github/workflows/verify-strategy-claims.yml', '/config/*.json', 'retention-days: 7',
-                         'path: .cache/strategy-claims-verification/result.json'):
+                         'path: .cache/strategy-claims-verification/result.json', '/lib/*.js',
+                         '/web/strategy-sections.js', '/web/source-dates.js', 'actions/setup-node@v4', "node-version: '22'"):
             self.assertIn(expected, text)
         for forbidden in ('git push', 'contents: write', 'web/data/', 'schedule:', 'secrets.'):
             self.assertNotIn(forbidden, text)

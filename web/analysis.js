@@ -38,6 +38,17 @@
       || data.targetPeriodEnd !== end || data.baselinePeriodEnd !== baseline || !generationValue(data.generation) || !object(data.coverage)
       || !Array.isArray(data.stocks) || data.stocks.length > 30000 || !Array.isArray(data.portfolioFiles)
       || !Array.isArray(data.themes)) throw new Error('INVALID_ANALYSIS');
+    if (data.analysisVersion >= 8) {
+      const coverage = data.coverage;
+      if (!count(coverage.analyzedRecords) || typeof coverage.collectionEvidenceComplete !== 'boolean'
+        || typeof coverage.strategySemanticAnalysisComplete !== 'boolean'
+        || ['strategyRuleScanCompleteRecords', 'strategyRuleScanPendingRecords', 'strategySemanticAnalysisCompleteRecords',
+          'strategySemanticAnalysisPendingRecords'].some(key => !count(coverage[key]))
+        || coverage.strategyRuleScanCompleteRecords + coverage.strategyRuleScanPendingRecords !== coverage.analyzedRecords
+        || coverage.strategySemanticAnalysisCompleteRecords + coverage.strategySemanticAnalysisPendingRecords !== coverage.analyzedRecords
+        || coverage.strategySemanticAnalysisComplete !== (coverage.analyzedRecords > 0 && coverage.strategySemanticAnalysisPendingRecords === 0)
+        || coverage.complete && (!coverage.collectionEvidenceComplete || !coverage.strategySemanticAnalysisComplete)) throw new Error('INVALID_ANALYSIS');
+    }
     if (data.coverage.status === 'awaiting-data' && (data.asOf !== null || data.retrievedAt !== null
       || data.priceUpdatedAt != null || data.coverage.complete !== false
       || !['inputRecords', 'analyzedRecords', 'stockCount', 'contributionCount'].every(key => data.coverage[key] === 0)
@@ -236,6 +247,7 @@
         const themes = $('analysis-themes'); themes.replaceChildren(element('h3', '基金报告中的策略主题'));
         if (generationValue(data.priceUpdatedAt)) themes.append(element('p', `行情单独更新 ${data.priceUpdatedAt}；报告原有观测日期保留。`, 'narrative-meta'));
         themes.append(element('p', `策略章节完整提取 ${data.coverage.strategySectionCompleteRecords || 0} 条组合记录，待完整核验 ${data.coverage.strategySectionIncompleteRecords ?? data.coverage.analyzedRecords ?? 0} 条；已有摘录 ${data.coverage.strategyRecords || 0} 条。摘录可用与整节完整分开计数。`, 'narrative-meta'));
+        themes.append(element('p', `整节有限规则扫描 ${data.coverage.strategyRuleScanCompleteRecords || 0} 条，待扫描 ${data.coverage.strategyRuleScanPendingRecords ?? data.coverage.analyzedRecords ?? 0} 条；全文语义解读已验收 ${data.coverage.strategySemanticAnalysisCompleteRecords || 0} 条，待验收 ${data.coverage.strategySemanticAnalysisPendingRecords ?? data.coverage.analyzedRecords ?? 0} 条。章节提取、规则扫描和语义解读分别计数。`, 'narrative-meta'));
         themes.append(element('p', '报告期历史产品名单尚未完整核验；本页汇总当前已取得的记录，不能据此视为全行业完整结果。', 'narrative-meta'));
         themes.append(element('p', '主题按本季度报告原文规则归类；计数为有对应表述的组合，不能解释为全行业结论或单只股票交易动机。', 'filter-tip'));
         const list = element('div', undefined, 'analysis-theme-list');
