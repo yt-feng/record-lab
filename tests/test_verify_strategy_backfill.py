@@ -67,6 +67,8 @@ class Reader:
     def read(self, path, maximum=verifier.MAX_PART_BYTES):
         self.reads.append(path)
         if path not in self.data: raise verifier.VerificationError('DATA_READ_FAILED')
+        encoded = json.dumps(self.data[path], ensure_ascii=False).encode()
+        self.last_blob = hashlib.sha1(b'blob ' + str(len(encoded)).encode() + b'\0' + encoded).hexdigest()
         return copy.deepcopy(self.data[path])
     def unchanged(self): return True
 
@@ -78,6 +80,9 @@ def setup_reader(body=BODY, scanned=False):
         prefix = 'web/data/periods/' + quarter + '/'
         records[prefix + 'latest.json'] = value['manifest']
         records[prefix + 'companies/co1.json'] = value['envelope']
+        records[prefix + 'catalog.json'] = {'schemaVersion': 1, 'targetPeriodEnd': verifier.PERIODS[quarter][0],
+            'companies': [{'code': 'co1', 'name': '合成公司'}],
+            'funds': [{'code': '000001', 'companyCode': 'co1', 'companyName': '合成公司'}]}
         templates[report['sourceUrl']] = template
     return Reader(records), templates
 
@@ -108,7 +113,7 @@ class StrategyBackfillVerificationTests(unittest.TestCase):
             return verifier.bridge({'mode': 'normalize-only', 'fund': fund, 'envelope': sample['envelope'],
                 'config': sample['phase'], 'now': dt.datetime.now(dt.timezone.utc).isoformat()})
         value = control(sample['fund'])
-        expected = {'quarter': '2026Q2', 'dataPath': sample['dataPath'], 'dataBlobSha': reader.last_blob,
+        expected = {'quarter': '2026Q2', 'dataPath': sample['dataPath'], 'dataBlobSha': sample['dataBlobSha'],
                     'beforeHash': value['protectedBeforeHash'], 'observedAfterHash': value['normalizedHash']}
         return reader, sample, expected, control
 
@@ -164,7 +169,8 @@ class StrategyBackfillVerificationTests(unittest.TestCase):
 
     def test_empty_patch_diagnosis_exposes_sample_catalog_missing_proven_alias(self):
         from test_strategy_evidence_pool import REPORT, extracted
-        report = {**copy.deepcopy(REPORT), **extracted(), 'navYuan': 1000, 'coverage': 'top10', 'holdings': [
+        template = extracted()
+        report = {**copy.deepcopy(REPORT), **copy.deepcopy(template), 'navYuan': 1000, 'coverage': 'top10', 'holdings': [
             {'market': 'CN', 'stockCode': '600001', 'stockName': '合成证券', 'currency': 'CNY',
              'shares': 10, 'marketValueYuan': 100, 'weightPct': 10}]}
         for key in ('strategyClaims', 'strategyClaimsIdentityEvidence', 'strategyEvidencePool', 'strategyEvidenceBudget'):
@@ -180,11 +186,11 @@ const x=JSON.parse(fs.readFileSync(0,'utf8')), snapshot=buildSnapshot(x.raw,{con
 const catalog={companies:[{code:'co1',name:'合成公司',fundCount:2}],funds:[
 {code:'000001',companyCode:'co1',companyName:'合成公司'},{code:'000002',companyCode:'co1',companyName:'合成公司'}]};
 const result=mergeSnapshots({snapshots:[snapshot],catalog,config:x.phase,now:x.now,reusePrices:false});
-process.stdout.write(JSON.stringify(result.companySnapshots.co1));"""
+process.stdout.write(JSON.stringify({envelope:result.companySnapshots.co1,manifest:result.manifest}));"""
         now = dt.datetime.now(dt.timezone.utc).isoformat()
         response = subprocess.run(['node', '-e', node], input=json.dumps({'raw': raw, 'phase': phase, 'now': now}),
             text=True, capture_output=True, timeout=30, cwd=ROOT, check=True)
-        envelope = json.loads(response.stdout); fund = envelope['funds'][0]
+        original = json.loads(response.stdout); envelope = original['envelope']; fund = envelope['funds'][0]
         self.assertEqual(fund['companyId'], 'co1')
         control = verifier.bridge({'mode': 'normalize-only', 'fund': fund, 'envelope': envelope, 'config': phase, 'now': now})
         self.assertFalse(control['nonStrategyFieldsUnchanged'])
@@ -193,6 +199,47 @@ process.stdout.write(JSON.stringify(result.companySnapshots.co1));"""
                          {'fund.company', 'fund.companyId', 'fund.companyMapping'})
         self.assertTrue(all(row['beforeType'] == row['afterType'] == 'string' for row in control['differences']))
         self.assertEqual(control['unmappedDifferenceCount'], 0)
+        catalog_path = 'web/data/periods/2026Q2/catalog.json'
+        original_catalog = {'schemaVersion': 1, 'targetPeriodEnd': '2026-06-30',
+            'companies': [{'code': 'co1', 'name': '合成公司'}], 'funds': [
+                {'code': '000001', 'companyCode': 'co1', 'companyName': '合成公司'},
+                {'code': '000002', 'companyCode': 'co1', 'companyName': '合成公司'}]}
+        reader = Reader({catalog_path: original_catalog})
+        catalog, evidence = verifier.catalog_context(reader, '2026Q2', fund)
+        fixed = verifier.bridge({'mode': 'normalize-only', 'fund': fund, 'envelope': envelope,
+                                 'catalog': catalog, 'config': phase, 'now': now})
+        self.assertTrue(fixed['nonStrategyFieldsUnchanged']); self.assertEqual(fixed['differences'], [])
+        self.assertEqual(evidence['requiredCodeCount'], 2); self.assertEqual(evidence['blobSha'], reader.last_blob)
+        calls = []
+        sample = {'quarter': '2026Q2', 'phase': phase, 'manifest': original['manifest'], 'envelope': envelope,
+                  'fund': fund, 'task': verifier.binding_for(fund, phase, now), 'partsRead': 1,
+                  'dataPath': 'web/data/periods/2026Q2/companies/co1.json', 'dataBlobSha': 'b' * 40,
+                  'catalog': catalog, 'catalogContext': evidence}
+        result = verifier.run_sample(sample, provider_factory=source_factory({REPORT['sourceUrl']: template}, calls))
+        self.assertEqual(result['status'], 'verified', result); self.assertEqual(len(calls), 1)
+        self.assertEqual(result['protectedBeforeHash'], result['protectedAfterHash'])
+        self.assertTrue(all(result['catalogContext']['checks'].values()))
+        # A real contradictory directory row must never be repaired by copying
+        # the representative's owner to its alias, nor cause a PDF request.
+        reader.data[catalog_path]['funds'][1]['companyCode'] = 'other'
+        with patch.object(verifier, 'PublicProvider', side_effect=AssertionError('no provider')):
+            with self.assertRaisesRegex(verifier.VerificationError, 'CATALOG_CONTEXT_INVALID'):
+                verifier.catalog_context(reader, '2026Q2', fund)
+
+    def test_catalog_context_missing_duplicate_wrong_quarter_and_conflicting_fields_fail_before_get(self):
+        for problem in ('missing', 'duplicate', 'quarter', 'field-conflict', 'company-field-conflict', 'oversize-name'):
+            reader, templates = setup_reader(); calls = []
+            catalog = reader.data['web/data/periods/2026Q2/catalog.json']
+            if problem == 'missing': catalog['funds'] = []
+            if problem == 'duplicate': catalog['funds'] *= 2
+            if problem == 'quarter': catalog['targetPeriodEnd'] = '2026-09-30'
+            if problem == 'field-conflict': catalog['funds'][0]['companyId'] = 'other'
+            if problem == 'company-field-conflict': catalog['companies'][0]['id'] = 'other'
+            if problem == 'oversize-name': catalog['companies'][0]['name'] = 'x' * 201
+            with self.subTest(problem=problem):
+                with self.assertRaisesRegex(verifier.VerificationError, 'CATALOG_CONTEXT_INVALID'):
+                    verifier.select_sample(reader, '2026Q2', dt.datetime.now(dt.timezone.utc).isoformat())
+                self.assertEqual(calls, [])
 
     def test_real_two_quarter_collect_build_merge_preserves_original_values_and_clocks(self):
         reader, templates = setup_reader(); before = copy.deepcopy(reader.data); calls = []

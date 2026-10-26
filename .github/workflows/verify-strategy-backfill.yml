@@ -57,7 +57,9 @@ jobs:
           sparse-checkout-cone-mode: false
           sparse-checkout: |
             /web/data/periods/2026Q2/latest.json
+            /web/data/periods/2026Q2/catalog.json
             /web/data/periods/2026Q3/latest.json
+            /web/data/periods/2026Q3/catalog.json
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'

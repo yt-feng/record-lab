@@ -27,11 +27,12 @@ PERIODS = {'2026Q2': ('2026-06-30', '2026-03-31'), '2026Q3': ('2026-09-30', '202
 MAX_PARTS = 12
 MAX_READ_BYTES = 96_000_000
 MAX_PART_BYTES = 8_000_000
+MAX_CATALOG_BYTES = 25_000_000
 MAX_OUTPUT_BYTES = 32_000
 MAX_BRIDGE_BYTES = 9_000_000
 ERRORS = PATCH_ERRORS | {'ACTIONS_REQUIRED', 'INVALID_DATA_COMMIT', 'DATA_READ_FAILED', 'DATA_READ_BOUND',
     'INVALID_DATA_MANIFEST', 'SAMPLE_NOT_FOUND_WITHIN_BOUND', 'BRIDGE_FAILED', 'VERIFICATION_FAILED',
-    'PUBLICATION_REJECTED', 'UNSUPPORTED_OUTPUT', 'DATA_CHANGED', 'DIAGNOSTIC_BINDING_INVALID'}
+    'PUBLICATION_REJECTED', 'UNSUPPORTED_OUTPUT', 'DATA_CHANGED', 'DIAGNOSTIC_BINDING_INVALID', 'CATALOG_CONTEXT_INVALID'}
 DIAGNOSTIC_COMMIT = '63ab7e38ce388f246d80588146081991a88ff623'
 DIAGNOSTIC_SAMPLES = {
     '000189': {'quarter': '2026Q3', 'dataPath': 'web/data/periods/2026Q3/companies/80000229-r721f3cf9b7ff16cc13d3.json',
@@ -108,8 +109,12 @@ try {
    return out;
   }
   const before=clone(x.fund),company=before.companyId;
-  const catalog={fundCount:1,companyCount:1,companies:[{code:company,name:before.company,fundCount:1}],
-    funds:[{code:before.code,companyCode:company,companyName:before.company}]};
+  // The legacy sample-only context remains solely for zero-request fault
+  // reproduction. Verification always supplies the immutable directory rows.
+  const catalog=x.catalog||(x.mode==='normalize-only'?{fundCount:1,companyCount:1,
+    companies:[{code:company,name:before.company,fundCount:1}],
+    funds:[{code:before.code,companyCode:company,companyName:before.company}]}:null);
+  if(!catalog)throw new Error('catalog unavailable');
   if(x.mode==='normalize-only') {
    // No patch, new source observation, or file publication. Omitting the
    // previous manifest only exposes the engine's normalized in-memory output.
@@ -194,7 +199,7 @@ class GitDataReader:
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             raise VerificationError('DATA_READ_FAILED') from None
     def read(self, path, maximum=MAX_PART_BYTES):
-        if not re.fullmatch(r'web/data/periods/2026Q[23]/(?:latest|companies/[A-Za-z0-9_-]{1,64})\.json', path):
+        if not re.fullmatch(r'web/data/periods/2026Q[23]/(?:latest|catalog|companies/[A-Za-z0-9_-]{1,64})\.json', path):
             raise VerificationError('DATA_READ_FAILED')
         line = self.command('ls-tree', self.commit, '--', path).decode().strip()
         match = re.fullmatch(r'100644 blob ([a-f0-9]{40})\t' + re.escape(path), line)
@@ -210,6 +215,61 @@ class GitDataReader:
     def unchanged(self):
         return (self.command('rev-parse', 'HEAD').decode().strip() == self.commit
                 and not self.command('status', '--porcelain', '--untracked-files=no'))
+
+
+def catalog_context(reader, quarter, fund):
+    """Look up aliases in the original directory; never infer their owners."""
+    end = PERIODS[quarter][0]
+    codes = fund.get('shareClassCodes', [])
+    if not isinstance(codes, list) or len(codes) > 64:
+        raise VerificationError('CATALOG_CONTEXT_INVALID')
+    codes = [fund.get('code'), *codes]
+    if any(not isinstance(code, str) or not re.fullmatch(r'[0-9]{6}', code) for code in codes):
+        raise VerificationError('CATALOG_CONTEXT_INVALID')
+    wanted = set(codes)
+    path = f'web/data/periods/{quarter}/catalog.json'
+    source = reader.read(path, maximum=MAX_CATALOG_BYTES); blob = reader.last_blob
+    if (not isinstance(source, dict) or type(source.get('schemaVersion')) is not int or source['schemaVersion'] != 1 or source.get('targetPeriodEnd') != end
+            or source.get('quarter', quarter) != quarter or not isinstance(source.get('funds'), list)
+            or len(source['funds']) > 150000 or not isinstance(source.get('companies'), list)
+            or len(source['companies']) > 5000 or not isinstance(blob, str) or not re.fullmatch(r'[a-f0-9]{40}', blob)):
+        raise VerificationError('CATALOG_CONTEXT_INVALID')
+    rows = [row for row in source['funds'] if isinstance(row, dict) and isinstance(row.get('code'), str) and row['code'] in wanted]
+    if len(rows) != len(wanted) or {row['code'] for row in rows} != wanted:
+        raise VerificationError('CATALOG_CONTEXT_INVALID')
+    owners = set()
+    for row in rows:
+        values = [row.get(key) for key in ('companyId', 'companyCode') if row.get(key)]
+        if (not values or any(not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', value)
+                              or value == 'unknown' for value in values) or len(set(values)) != 1):
+            raise VerificationError('CATALOG_CONTEXT_INVALID')
+        owners.add(values[0])
+    if len(owners) != 1 or next(iter(owners)) != fund.get('companyId'):
+        raise VerificationError('CATALOG_CONTEXT_INVALID')
+    owner = next(iter(owners))
+    companies = []
+    for row in source['companies']:
+        if not isinstance(row, dict): continue
+        identifiers = [row[key] for key in ('id', 'companyId', 'companyCode', 'code') if row.get(key)]
+        if owner in identifiers:
+            if any(value != owner for value in identifiers): raise VerificationError('CATALOG_CONTEXT_INVALID')
+            companies.append({key: row[key] for key in ('id', 'companyId', 'companyCode', 'code', 'name', 'companyName', 'company') if key in row})
+    if len(companies) != 1: raise VerificationError('CATALOG_CONTEXT_INVALID')
+    for row in [*rows, *companies]:
+        for key in ('company', 'companyName', 'name'):
+            if key in row and row[key] is not None and (not isinstance(row[key], str) or len(row[key]) > 200
+                                                       or re.search(r'[\x00-\x1f\x7f]', row[key])):
+                raise VerificationError('CATALOG_CONTEXT_INVALID')
+    # This is a read-only subset of original directory facts. Counts describe
+    # the verification context, not the industry universe or original company.
+    catalog = {'schemaVersion': 1, 'targetPeriodEnd': end, 'fundCount': len(rows), 'companyCount': 1,
+               'companies': companies, 'funds': [{key: row[key] for key in ('code', 'companyId', 'companyCode', 'company', 'companyName')
+                                                 if key in row} for row in rows]}
+    evidence = {'dataCommit': reader.commit, 'path': path, 'blobSha': blob, 'targetPeriodEnd': end,
+                'requiredCodeCount': len(wanted), 'matchedCodeCount': len(rows), 'companyCount': 1,
+                'checks': {'sameImmutableCommit': True, 'targetQuarterMatches': True, 'allRequiredCodesUnique': True,
+                           'allCompanyMappingsAgree': True, 'retainedCompanyMatches': True}}
+    return catalog, evidence
 
 
 def select_sample(reader, quarter, now):
@@ -237,6 +297,8 @@ def select_sample(reader, quarter, now):
         fund = envelope['funds'][index]
         task = binding_for(fund, phase, now)
         if not task: raise VerificationError('BRIDGE_FAILED')
+        data_blob = reader.last_blob
+        catalog, catalog_evidence = catalog_context(reader, quarter, fund)
         # Preserve the actual observation envelope, but carry only this one
         # sample portfolio through the independent in-memory merge.
         small = {key: value for key, value in envelope.items() if key not in ('funds', 'errors', 'coverage')}
@@ -244,7 +306,8 @@ def select_sample(reader, quarter, now):
         # memory, avoiding a second serialized copy of a large portfolio.
         small['funds'] = []
         return {'quarter': quarter, 'phase': phase, 'manifest': manifest, 'envelope': small,
-                'fund': fund, 'task': task, 'dataPath': path, 'dataBlobSha': reader.last_blob,
+                'fund': fund, 'task': task, 'dataPath': path, 'dataBlobSha': data_blob,
+                'catalog': catalog, 'catalogContext': catalog_evidence,
                 'partsRead': len(seen)}
     raise VerificationError('SAMPLE_NOT_FOUND_WITHIN_BOUND')
 
@@ -294,6 +357,7 @@ def run_sample(sample, checkpoint=None, provider_factory=PublicProvider):
               'analysisDigest': task['analysisDigest'], 'taskDigest': task['taskDigest'],
               'retainedStrategyObservedAt': task['retainedStrategyObservedAt'],
               'dataPath': sample['dataPath'], 'dataBlobSha': sample['dataBlobSha'],
+              'catalogContext': sample['catalogContext'],
               'partsRead': sample['partsRead'], 'receipt': None, 'checks': {}, 'elapsedSeconds': 0}
     def record(raw):
         result['receipt'] = compact_receipt(raw)
@@ -305,7 +369,8 @@ def run_sample(sample, checkpoint=None, provider_factory=PublicProvider):
         with patch('report_extract.mineru_tokens_from_env', return_value=[]):
             raw = collect(config, china_today(), record, provider_factory)
         checked = bridge({'mode': 'merge', 'fund': sample['fund'], 'envelope': sample['envelope'],
-                          'manifest': sample['manifest'], 'config': config, 'raw': raw, 'now': raw['retrievedAt']})
+                          'manifest': sample['manifest'], 'catalog': sample['catalog'],
+                          'config': config, 'raw': raw, 'now': raw['retrievedAt']})
         if (not isinstance(checked, dict) or set(checked) != {'checks', 'claimCount', 'evidenceCount', 'quoteChars',
                     'scannedClauseCount', 'classifiedClauseCount', 'unknownClauseCount', 'newStrategyObservedAt',
                     'protectedBeforeHash', 'protectedAfterHash'} | DIFF_FIELDS or not valid_differences(checked)
