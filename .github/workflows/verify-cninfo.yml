@@ -45,7 +45,7 @@ jobs:
           python-version: '3.12'
       - name: Test discovery boundaries without network
         run: python -m unittest discover -s tests -p 'test_cninfo_discovery.py'
-      - name: Verify bounded pagination or enumerate public windows without PDFs
+      - name: Verify pagination or enumerate public windows with at most 32 pages per slice
         env:
           DISCOVERY_MODE: ${{ inputs.mode }}
           DISCOVERY_AS_OF: ${{ inputs.as_of }}

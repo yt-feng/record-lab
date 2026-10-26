@@ -29,7 +29,7 @@ UTC = dt.timezone.utc
 # Official history-notice.js initializes page.size to 30. This alone is not
 # proof that the server honours pagination; Actions verifies two pages first.
 PAGE_SIZE = 30
-MAX_PAGES_PER_SLICE = 20  # Deliberately below the site's UI limit of 100 pages.
+MAX_PAGES_PER_SLICE = 32  # 960 rows: observed 780-row publication day needs 26 pages.
 MAX_REQUESTS = 200
 MAX_ROWS = 40_000
 MAX_RESPONSE_BYTES = 2_000_000

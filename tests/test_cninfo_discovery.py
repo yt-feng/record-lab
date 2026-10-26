@@ -86,6 +86,68 @@ class CninfoDiscoveryTests(unittest.TestCase):
         self.assertIn('DAILY_PAGE_LIMIT', result['slices'][0]['errors'])
         self.assertIn('UNIQUE_ROW_COUNT_MISMATCH', result['slices'][0]['errors'])
 
+    def test_observed_780_row_publication_day_fits_26_pages_with_supported_size(self):
+        source = FakeSource([announcement(str(10000 + i), f'{300000+i:06d}', '2026-07-21',
+                                         '合成基金2026年第2季度报告') for i in range(780)])
+        result = run(source, period='2026Q2', window_end='2026-07-21', page_size=30)
+        self.assertTrue(result['windowEnumerationComplete'])
+        self.assertEqual(result['counts']['candidateCodes'], 780)
+        self.assertEqual(result['counts']['duplicateRows'], 0)
+        self.assertEqual(result['counts']['requestCount'], 28)  # Two earlier empty windows.
+        self.assertEqual(max(int(call['pageNum']) for call in source.calls), 26)
+        self.assertTrue(all(call['pageSize'] == '30' for call in source.calls))
+        self.assertFalse(result['historicalUniverseVerified'])
+        self.assertFalse(result['allQuarterReportsVerified'])
+
+    def test_above_960_rows_still_stops_at_32_pages_and_keeps_partial_evidence(self):
+        source = FakeSource([announcement(str(10000 + i), f'{300000+i:06d}') for i in range(961)])
+        result = run(source, window_end='2026-10-01', page_size=30)
+        self.assertFalse(result['windowEnumerationComplete'])
+        self.assertEqual(result['counts']['candidateCodes'], 960)
+        self.assertEqual(result['counts']['requestCount'], 32)
+        self.assertEqual(result['slices'][0]['expectedRows'], 961)
+        self.assertEqual(result['slices'][0]['uniqueRows'], 960)
+        self.assertIn('DAILY_PAGE_LIMIT', result['slices'][0]['errors'])
+        self.assertIn('UNIQUE_ROW_COUNT_MISMATCH', result['slices'][0]['errors'])
+
+    def test_observed_1021_row_week_conserves_split_counts_including_780_row_day(self):
+        days = ['2026-07-15'] * 3 + ['2026-07-20'] * 238 + ['2026-07-21'] * 780
+        rows = [announcement(str(10000 + i), f'{300000+i:06d}', day,
+                             '合成基金2026年第2季度报告') for i, day in enumerate(days)]
+        result = run(FakeSource(rows), period='2026Q2', window_end='2026-07-21', page_size=30)
+        self.assertTrue(result['windowEnumerationComplete'])
+        self.assertEqual(result['counts']['candidateCodes'], 1021)
+        self.assertEqual(result['counts']['enumeratedUniqueAnnouncementIds'], 1021)
+        self.assertEqual(result['counts']['unconfirmedProbeAnnouncementIds'], 0)
+        self.assertEqual(result['counts']['duplicateRows'], 0)
+        parents = [item for item in result['slices'] if item['status'] == 'split']
+        self.assertEqual([item['expectedRows'] for item in parents], [1021, 1018])
+        self.assertTrue(all(item['expectedRows'] == item['childDeclaredRows'] for item in parents))
+        day = next(item for item in result['slices'] if item['sliceId'] == '2026-07-21~2026-07-21')
+        self.assertEqual((day['status'], day['uniqueRows']), ('complete', 780))
+
+    def test_780_row_day_does_not_bypass_request_or_time_budget(self):
+        rows = [announcement(str(10000 + i), f'{300000+i:06d}') for i in range(780)]
+        limited = run(FakeSource(rows), window_end='2026-10-01', page_size=30, max_requests=10)
+        self.assertEqual(limited['limitReached'], 'REQUEST_LIMIT')
+        self.assertEqual(limited['counts']['requestCount'], 10)
+        self.assertEqual(limited['counts']['candidateCodes'], 300)
+        self.assertFalse(limited['windowEnumerationComplete'])
+        source = FakeSource(rows)
+        def timed_out(params):
+            if len(source.calls) == 10: raise discovery.DiscoveryError('TIME_LIMIT')
+            return source(params)
+        limited = run(timed_out, window_end='2026-10-01', page_size=30)
+        self.assertEqual(limited['limitReached'], 'TIME_LIMIT')
+        self.assertEqual(limited['counts']['candidateCodes'], 300)
+        self.assertFalse(limited['windowEnumerationComplete'])
+        self.assertEqual((discovery.MAX_REQUESTS, discovery.MAX_SECONDS), (200, 600))
+        with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}):
+            for budget in ({'max_requests': 201}, {'max_seconds': 601}):
+                with self.assertRaises(discovery.DiscoveryError) as error:
+                    discovery.ActionsTransport(**budget)
+                self.assertEqual(error.exception.code, 'INVALID_LIMIT')
+
     def test_duplicate_page_cannot_mask_unseen_rows_and_conflicting_id_is_quarantined(self):
         first = announcement('1001', '018774')
         def fetch(params):
