@@ -7,7 +7,9 @@ const crypto = require('node:crypto');
 const { buildSnapshot, catalogDetails, deduplicatePortfolios, publicUrl } = require('./build-data');
 const { validDate } = require('../lib/fund-analysis');
 const { verifiedReportManagers, normalizeManagers, evidenceFor, managerKey, managerCoverageFor, completeManagerCoverage } = require('../lib/report-managers');
+const { strategySectionCoverageFor, strategyAnalysisFor } = require('../lib/strategy-sections');
 const { VERSION: PRICE_COVERAGE_VERSION, calendar, validCompletePrice, validCompleteQuarterPrice, retainedCoverage } = require('../lib/price-coverage');
+const { bindingFor, validPatch, canReplacePrice, key: priceKey } = require('../lib/price-patches');
 
 const CODE = /^\d{6}$/;
 const COMPANY = /^[A-Za-z0-9_-]{1,40}$/;
@@ -88,9 +90,13 @@ function sanitizeFund(item, { now, config, envelope }) {
   if (!clean || clean.selectedReport?.periodEnd !== item.selectedReport?.periodEnd || clean.status !== item.status) return null;
   const suppliedRows = new Map(item.rows.filter(row => row && typeof row.stockCode === 'string')
     .map(row => [`${row.market}:${row.stockCode}`, row]));
+  const priceAt = timestamp(item.priceUpdatedAt) && Date.parse(item.priceUpdatedAt) <= now.getTime() + 300000
+    && Date.parse(item.priceUpdatedAt) <= Date.parse(envelope.priceUpdatedAt || envelope.retrievedAt)
+    ? item.priceUpdatedAt : clean.retrievedAt;
   for (const row of clean.rows) {
-    recoverPrice(row, suppliedRows.get(`${row.market}:${row.stockCode}`)?.priceRange, clean.retrievedAt);
+    recoverPrice(row, suppliedRows.get(`${row.market}:${row.stockCode}`)?.priceRange, priceAt);
   }
+  if (priceAt !== clean.retrievedAt) clean.priceUpdatedAt = priceAt;
   clean.summary.observedPriceCount = clean.rows.filter(row => row.priceRange.status === 'observed').length;
   clean.dataStatus = item.dataStatus;
   clean.cacheReason = item.dataStatus === 'cached' ? 'PREVIOUS_OBSERVATION' : null;
@@ -138,7 +144,11 @@ function retainPrices(candidate, old) {
     const prior = rows.get(`${row.market}:${row.stockCode}`)?.priceRange;
     const complete = value => validCompletePrice(value, row.market, row.stockCode, row.priceRange.rangeStart, row.priceRange.rangeEnd);
     if (row.priceRange.status !== 'observed' || !complete(row.priceRange) && complete(prior)) {
-      if (prior && recoverPrice(row, prior, candidate.retrievedAt)) row.priceRange.dataStatus = 'cached';
+      const bound = Date.parse(old?.priceUpdatedAt) > Date.parse(candidate.retrievedAt) ? old.priceUpdatedAt : candidate.retrievedAt;
+      if (prior && recoverPrice(row, prior, bound)) {
+        row.priceRange.dataStatus = 'cached';
+        if (Date.parse(bound) > Date.parse(candidate.retrievedAt)) candidate.priceUpdatedAt = bound;
+      }
     }
   }
   candidate.summary.observedPriceCount = candidate.rows.filter(row => row.priceRange.status === 'observed').length;
@@ -180,6 +190,17 @@ function retainReportEvidence(target, source) {
     to.holdingsIncompleteReason = from.holdingsIncompleteReason;
     changed = true;
   }
+  const oldStrategy = strategySectionCoverageFor(to.strategySectionCoverage, to.periodEnd);
+  const newStrategy = strategySectionCoverageFor(from.strategySectionCoverage, to.periodEnd);
+  const completeStrategy = proof => proof?.complete === true && proof.kind === 'quarterly' && proof.periodStart === quarterStart;
+  if (newStrategy && (completeStrategy(newStrategy) && !completeStrategy(oldStrategy)
+      || !oldStrategy && newStrategy.periodStart === quarterStart)) {
+    to.strategySectionCoverage = clone(newStrategy);
+    to.strategyAnalysis = strategyAnalysisFor(from.strategyAnalysis, newStrategy);
+    to.strategyEvidenceRetrievedAt = from.strategyEvidenceRetrievedAt || source.retrievedAt;
+    for (const key of ['strategyExcerpts', 'strategyThemes', 'narrative']) if (from[key] !== undefined) to[key] = clone(from[key]);
+    target.narrative = clone(to.narrative); changed = true;
+  }
   if (!to.narrative?.text && from.narrative?.text) {
     to.narrative = clone(from.narrative); target.narrative = clone(from.narrative); changed = true;
     for (const key of ['parseMethod', 'parseErrorCode', 'sourceTextHash', 'pageStats', 'strategyExcerpts', 'strategyThemes',
@@ -220,13 +241,14 @@ function coverageFor(funds, directory, config, expectedCount = directory.fundCou
     terminatedBeforePeriodFundCount: funds.filter(fund => fund.notApplicableEvidence?.reason === 'TERMINATED_BEFORE_PERIOD').length,
     reportOnlyFundCount: funds.filter(fund => fund.selectedReport?.reportOnly).length,
     catalogStatus: directory.known ? 'available' : 'unavailable',
-    limitations: ['目录总数不代表已完成采集。', '只有报告明确确认未持有股票才记为无股票持仓。',
+    limitations: ['目录总数不代表已完成采集。', '股票为零仅依据报告未持股说明或经核验的期末股票账面金额，保留各证据的适用范围。',
       '区间最高最低价不是实际持仓成本。', '同组合仅凭公开主代码和份额证据去重，份额金额不叠加。'],
   };
 }
 
 function observationDates(funds) {
   return { asOf: funds.length ? funds.map(fund => fund.asOf).sort().at(-1) : null,
+    priceUpdatedAt: funds.map(fund => fund.priceUpdatedAt).filter(timestamp).sort().at(-1) || null,
     retrievedAt: funds.length ? [...funds].sort((a, b) => Date.parse(b.retrievedAt) - Date.parse(a.retrievedAt))[0].retrievedAt : null };
 }
 
@@ -310,7 +332,9 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
   const addError = code => errors.push(fixedErrors.has(code) ? code : 'INVALID_FUND');
   const requestedCodes = new Set(receiptCodes.filter(code => typeof code === 'string' && CODE.test(code)));
   const attempts = new Map();
+  const priceResults = [];
   for (const snapshot of snapshots) {
+    for (const patch of snapshot?.pricePatches || []) if (CODE.test(patch?.code || '')) requestedCodes.add(patch.code);
     for (const item of [...(snapshot?.batchResults || []), ...(snapshot?.funds || [])]) if (CODE.test(item?.code || '')) requestedCodes.add(item.code);
     if (!validEnvelope(snapshot, currentTime, config)) continue;
     const freshCodes = new Set(snapshot.funds.filter(item => item?.dataStatus === 'fresh').map(item => item.code));
@@ -361,7 +385,8 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
       const old = byCode.get(fund.code);
       if (!shouldReplace(old, fund)) {
         if (old && retainReportEvidence(old, fund)) {
-          const rebuilt = sanitizeFund(old, { now: currentTime, config, envelope: { asOf: old.asOf, retrievedAt: old.retrievedAt } });
+          const rebuilt = sanitizeFund(old, { now: currentTime, config,
+            envelope: { asOf: old.asOf, retrievedAt: old.retrievedAt, priceUpdatedAt: old.priceUpdatedAt } });
           if (rebuilt) { byCode.set(old.code, rebuilt); acceptedFreshFundCount += 1; }
         }
         continue;
@@ -375,12 +400,42 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
       acceptedFreshFundCount += 1;
     }
   }
+  let acceptedPricePatchCount = 0;
+  for (const envelope of snapshots) {
+    if (!validEnvelope(envelope, currentTime, config)) continue;
+    for (const patch of Array.isArray(envelope.pricePatches) ? envelope.pricePatches : []) {
+      if (!CODE.test(patch?.code || '') || !directoryMap.has(patch.code)) continue;
+      const fund = byCode.get(patch.code);
+      const matches = validPatch(patch, config, currentTime) && fund
+        && JSON.stringify(bindingFor(fund, config)) === JSON.stringify(patch.binding);
+      if (!matches) {
+        priceResults.push({ code: patch.code, binding: patch.binding, accepted: false,
+          errorCode: patch.errorCode === 'PRICE_BUDGET_REACHED' ? 'PRICE_BUDGET_REACHED' : 'PRICE_BINDING_INVALID' });
+        continue;
+      }
+      const rows = new Map(fund.rows.map(row => [priceKey(row), row]));
+      let adopted = 0;
+      for (const update of patch.prices) {
+        const row = rows.get(priceKey(update));
+        if (!row || !canReplacePrice(row.priceRange, update.priceRange, row, config)) continue;
+        const before = JSON.stringify(row.priceRange);
+        if (recoverPrice(row, update.priceRange, envelope.retrievedAt) && JSON.stringify(row.priceRange) !== before) {
+          fund.priceUpdatedAt = [fund.priceUpdatedAt, row.priceRange.fetchedAt].filter(Boolean).sort().at(-1);
+          adopted++;
+        }
+      }
+      fund.summary.observedPriceCount = fund.rows.filter(row => row.priceRange.status === 'observed').length;
+      if (adopted) acceptedPricePatchCount++;
+      priceResults.push({ code: patch.code, binding: patch.binding, accepted: true, errorCode: null });
+    }
+  }
   const funds = deduplicatePortfolios([...byCode.values()], addError);
   const receipt = mergeReceipt(funds, requestedCodes, config, currentTime, attempts);
+  receipt.pricePatches = priceResults;
   // No new observation means no fabricated new timestamp or overwritten old files.
   const needsRepartition = Object.values(previousCompanies).some(item => item.funds?.length > (pageLimits?.maxFunds || MAX_COMPANY_FUNDS)
     || Buffer.byteLength(JSON.stringify(item)) + 1 > (pageLimits?.maxBytes || MAX_COMPANY_BYTES));
-  if (!acceptedFreshFundCount && !migratedBootstrapFundCount && !needsRepartition && previousManifest) {
+  if (!acceptedFreshFundCount && !acceptedPricePatchCount && !migratedBootstrapFundCount && !needsRepartition && previousManifest) {
     return { changed: false, manifest: previousManifest, companySnapshots: {},
       receipt, counts: { acceptedFreshFundCount: 0, errorCount: errors.length }, errors: [...new Set(errors)] };
   }
@@ -438,7 +493,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
     targetPeriodEnd: config.targetPeriodEnd || null, baselinePeriodEnd: config.baselinePeriodEnd || null,
     coverage, companyCoverage, companyFiles, funds: [], errors: [] };
   return { changed: true, manifest, companySnapshots, receipt,
-    counts: { acceptedFreshFundCount, migratedBootstrapFundCount, companyCount: buckets.size,
+    counts: { acceptedFreshFundCount, acceptedPricePatchCount, migratedBootstrapFundCount, companyCount: buckets.size,
       fundCount: funds.length, errorCount: errors.length },
     errors: [...new Set(errors)] };
 }

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import time
+import threading
 
 from providers import DataError, PublicProvider, HOLDINGS_TOPLINE
 from lifecycle import normalize_lifecycle_evidence, should_check_lifecycle
@@ -152,7 +153,7 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         if (needed and needed.issubset(snapshots)) or (not needed and len([p for p in snapshots if p <= as_of]) >= 2):
             break
     extraction_keys = ("parseMethod", "parseErrorCode", "sourceTextHash", "pageStats",
-                       "strategyExcerpts", "strategyThemes", "reportPdfSourceUrl",
+                       "strategyExcerpts", "strategyThemes", "strategySectionCoverage", "strategyAnalysis", "reportPdfSourceUrl",
                        "reportPdfPeriodEnd", "reportPdfKind")
 
     def identity_matches(details):
@@ -171,6 +172,8 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         for key in extraction_keys:
             if key in details:
                 report[key] = details[key]
+        if details.get("strategySectionCoverage"):
+            report["strategyEvidenceRetrievedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
         if details.get("parseMethod"):
             report.update({"reportPdfSourceUrl": document["sourceUrl"],
                            "reportPdfPeriodEnd": document["periodEnd"], "reportPdfKind": document["kind"],
@@ -277,6 +280,8 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
                 for key in extraction_keys:
                     if key in quarter_details:
                         report[key] = quarter_details[key]
+                if quarter_details.get("strategySectionCoverage"):
+                    report["strategyEvidenceRetrievedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
                 if quarter_details.get("parseMethod"):
                     report.update({"reportPdfSourceUrl": quarterly["sourceUrl"],
                                    "reportPdfPeriodEnd": period, "reportPdfKind": "quarterly",
@@ -300,11 +305,19 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
 
 def collect(config, as_of, checkpoint=None):
     items = config["funds"]
-    workers = min(2, max(1, int(config.get("maxWorkers", 2))))
+    price_items = [item for item in items if 'priceOnly' in item]
+    if price_items and len(price_items) == len(items):
+        from collect_prices import collect as collect_prices
+        return collect_prices(config, as_of, checkpoint, provider_factory=PublicProvider)
+    from collect_prices import plans_for, bounded
+    price_patches = plans_for(price_items, config) if price_items else []
+    source_items = [item for item in items if 'priceOnly' not in item]
+    patch_lock = threading.RLock()
+    workers = int(bounded(config.get("maxWorkers", 2), 2, 2, 1))
     funds, errors = [], []
     bars, requested_prices = {}, {}
     price_attempted = 0
-    deadline = time.monotonic() + min(1800, max(1, float(config.get("maxBatchSeconds", 1500))))
+    deadline = time.monotonic() + bounded(config.get("maxBatchSeconds", 1500), 1500, 1800)
     def snapshot(stage):
         comparable = sum(len(f["reports"]) >= 2 for f in funds)
         no_equities = sum(bool(f.get("noEquitiesEvidence", {}).get("confirmed")) for f in funds)
@@ -312,6 +325,7 @@ def collect(config, as_of, checkpoint=None):
         complete = stage == "finished" and comparable + no_equities == len(items) and not errors and prices_complete == len(requested_prices)
         payload = {"asOf": as_of, "targetPeriodEnd": config.get("targetPeriodEnd"), "baselinePeriodEnd": config.get("baselinePeriodEnd"),
                    "retrievedAt": dt.datetime.now(dt.timezone.utc).isoformat(), "funds": funds, "barsByStock": bars, "errors": errors,
+                   "pricePatches": price_patches,
                    "coverage": {"requested": len(items), "completedFundRequests": len(funds),
                                 "attemptedFundRequests": sum(f.get("collectionAttempt", {}).get("attempted") is not False for f in funds),
                                 "deferredFundRequests": sum(f.get("collectionAttempt", {}).get("attempted") is False for f in funds),
@@ -327,7 +341,7 @@ def collect(config, as_of, checkpoint=None):
     snapshot("funds")
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(collect_fund, x, as_of, config.get("historyYears", 2), config.get("maxReportsPerFund", 4),
-                               target_period=config.get("targetPeriodEnd"), baseline_period=config.get("baselinePeriodEnd"), deadline=deadline) for x in items]
+                               target_period=config.get("targetPeriodEnd"), baseline_period=config.get("baselinePeriodEnd"), deadline=deadline) for x in source_items]
         for future in concurrent.futures.as_completed(futures):
             fund, issues = future.result()
             funds.append(fund)
@@ -337,6 +351,13 @@ def collect(config, as_of, checkpoint=None):
     funds.sort(key=lambda fund: order[fund["code"]])
     item_by_code = {item["code"]: item for item in items}
     fund_price_keys = []
+    for patch in price_patches:
+        if patch['binding'] is None: continue
+        start = (dt.date.fromisoformat(config['baselinePeriodEnd']) + dt.timedelta(days=1)).isoformat()
+        fund_price_keys.append(patch['targetStockKeys'])
+        for key in patch['targetStockKeys']:
+            market, code = key.split(':', 1)
+            requested_prices[key] = (code, market, start, config['targetPeriodEnd'])
     for fund in funds:
         reports = sorted(fund["reports"], key=lambda r: r["periodEnd"], reverse=True)
         target_period = config.get("targetPeriodEnd")
@@ -380,15 +401,29 @@ def collect(config, as_of, checkpoint=None):
             if rank < len(keys) and keys[rank] not in seen:
                 seen.add(keys[rank])
                 price_order.append(keys[rank])
-    selected_prices = [(key, requested_prices[key]) for key in price_order[:min(2000, max(0, int(config.get("maxPriceSymbols", 150))))]]
-    price_deadline = min(deadline, time.monotonic() + min(900, max(1, float(config.get("maxPriceSeconds", 600)))))
+    selected_prices = [(key, requested_prices[key]) for key in price_order[:int(bounded(config.get("maxPriceSymbols", 150), 150, 2000))]]
+    price_deadline = min(deadline, time.monotonic() + bounded(config.get("maxPriceSeconds", 600), 600, 900))
     snapshot("prices")
     def price(item):
         key, args = item
         if time.monotonic() >= price_deadline:
             return key, None, {"code": args[0], "stage": "prices", "errorCode": "PRICE_BUDGET_REACHED"}, False
         try:
-            return key, PublicProvider().price_bars(*args), None, True
+            provider = PublicProvider()
+            def begin():
+                if not price_patches: return
+                with patch_lock:
+                    changed = False
+                    for patch in price_patches:
+                        if key in patch['targetStockKeys'] and key not in patch['attemptedStockKeys']:
+                            patch['attemptedStockKeys'].append(key); patch['attemptedStockKeys'].sort()
+                            patch['attemptedAt'] = patch['attemptedAt'] or dt.datetime.now(dt.timezone.utc).isoformat()
+                            changed = True
+                    if changed: snapshot('prices')
+            provider.on_request = begin
+            value = provider.price_bars(*args)
+            value['retrievedAt'] = dt.datetime.now(dt.timezone.utc).isoformat()
+            return key, value, None, True
         except Exception as error:
             return key, None, safe_error(args[0], "prices", error), True
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -396,14 +431,15 @@ def collect(config, as_of, checkpoint=None):
         for count, future in enumerate(concurrent.futures.as_completed(futures), 1):
             key, value, error, attempted = future.result()
             price_attempted += int(attempted)
-            if value:
-                bars[key] = value
-            if error:
-                errors.append(error)
+            with patch_lock:
+                if value:
+                    bars[key] = value
+                if error:
+                    errors.append(error)
             # Save every successful stock immediately; also checkpoint batches of
             # failures so a runner timeout never erases completed collection.
-            if value or count % 5 == 0 or count == len(selected_prices):
-                snapshot("prices")
+                if value or count % 5 == 0 or count == len(selected_prices):
+                    snapshot("prices")
     return snapshot("finished")
 
 

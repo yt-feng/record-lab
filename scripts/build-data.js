@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { analyzeFund, normalizeReport, normalizeLifecycleEvidence, validDate, validHoldingIdentity } = require('../lib/fund-analysis');
 const { validCompletePrice, validCompleteQuarterPrice } = require('../lib/price-coverage');
+const { normalizePatch } = require('../lib/price-patches');
 
 const BUILD_CODES = new Set([
   'INVALID_INPUT', 'INVALID_AS_OF', 'FUTURE_AS_OF', 'INVALID_RETRIEVED_AT', 'INVALID_CONFIG',
@@ -82,7 +83,9 @@ function isValidNoEq(evidence, { asOf, code } = {}) {
     || !validDate(evidence.periodEnd) || !validDate(evidence.publishedAt)
     || evidence.periodEnd > evidence.publishedAt || evidence.publishedAt > asOf
     || !Number.isInteger(evidence.page) || evidence.page <= 0
-    || typeof evidence.text !== 'string' || (evidence.fundCode !== undefined && evidence.fundCode !== code)) return false;
+    || (evidence.fundCode !== undefined && evidence.fundCode !== code)) return false;
+  if (evidence.evidenceType === 'exhaustive-nonstock-assets') return require('../web/nonstock-assets').validNonstockAssets(evidence);
+  if (typeof evidence.text !== 'string') return false;
   if (evidence.evidenceType === 'zero-stock-balance-sheet') return require('../web/zero-stock').validZeroStock(evidence);
   if (evidence.evidenceType === 'explicit-no-stock-detail') return require('../web/zero-stock').validExplicitNoStock(evidence);
   const excerpt = evidence.text.slice(0, 600).replace(/\s+/g, '');
@@ -102,7 +105,8 @@ function isValidNoEq(evidence, { asOf, code } = {}) {
 
 function noEquitiesReport(evidence, code) {
   const kind = ['quarterly', 'semiannual', 'annual'].includes(evidence.kind) ? evidence.kind : 'unknown';
-  const normalizedEvidence = { confirmed: true, sourceUrl: evidence.sourceUrl,
+  const normalizedEvidence = evidence.evidenceType === 'exhaustive-nonstock-assets'
+    ? require('../web/nonstock-assets').normalizeNonstockAssets(evidence) : { confirmed: true, sourceUrl: evidence.sourceUrl,
     periodEnd: evidence.periodEnd, publishedAt: evidence.publishedAt, page: evidence.page,
     text: evidence.text.slice(0, 600), kind,
     ...(['zero-stock-balance-sheet', 'explicit-no-stock-detail'].includes(evidence.evidenceType) ? { evidenceType: evidence.evidenceType } : {}),
@@ -152,6 +156,7 @@ function cleanReport(raw, code, asOf, addError) {
     } else if (!report.noEquitiesConfirmed || !isValidNoEq(raw.noEquitiesEvidence, { asOf, code })
       || raw.noEquitiesEvidence.periodEnd !== report.periodEnd
       || raw.noEquitiesEvidence.publishedAt !== report.publishedAt
+      || (raw.noEquitiesEvidence.evidenceType === 'exhaustive-nonstock-assets' && raw.noEquitiesEvidence.kind !== report.kind)
       || raw.noEquitiesEvidence.sourceUrl !== report.sourceUrl) {
       addError(report.noEquitiesConfirmed ? 'INVALID_NO_EQUITIES_EVIDENCE' : 'EMPTY_HOLDINGS', code); return null;
     }
@@ -192,6 +197,7 @@ function cleanBars(rawBars, addError) {
       requestedStart: validDate(value.requestedStart) ? value.requestedStart : null,
       requestedEnd: validDate(value.requestedEnd) ? value.requestedEnd : null,
       sourceUrls: Array.isArray(value.sourceUrls) ? [...new Set(value.sourceUrls)].slice(0, 8) : [value.sourceUrl],
+      retrievedAt: timestamp(value.retrievedAt) ? value.retrievedAt : null,
       sourceValidation: value.sourceValidation && typeof value.sourceValidation === 'object'
         ? Object.fromEntries(['rejectedRowCount', 'conflictingDateCount'].map(field => [field,
           Number.isInteger(value.sourceValidation[field]) && value.sourceValidation[field] >= 0 ? value.sourceValidation[field] : 1]))
@@ -411,6 +417,11 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
     }
   }
   const barsByStock = cleanBars(raw.barsByStock, addError);
+  const priceItems = configured.filter(item => Object.hasOwn(item, 'priceOnly'));
+  const priceCodes = new Set(priceItems.map(item => item.code));
+  const pricePatches = priceItems.map(item => normalizePatch(
+    (Array.isArray(raw.pricePatches) ? raw.pricePatches : []).find(patch => patch?.code === item.code),
+    item, barsByStock, config, raw.retrievedAt, config.traversal?.plannedAt));
   const analysisOptions = { asOf: raw.asOf, barsByStock,
     periodEnd: config.targetPeriodEnd, baselinePeriodEnd: config.baselinePeriodEnd };
   const groups = new Map();
@@ -427,6 +438,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
   let failedFundCount = 0;
   let deferredFundCount = 0;
   for (const code of requested) {
+    if (priceCodes.has(code)) continue;
     const items = groups.get(code) || [];
     const old = cached.get(code);
     const rawReports = items.flatMap(item => Array.isArray(item.reports) ? item.reports : []);
@@ -560,7 +572,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
       attempted: true, errorCode: finalFund.selectedReport.reportOnly ? 'HOLDINGS_UNRESOLVED' : null });
   }
   // A receipt-only part is necessary to preserve explicitly unstarted products.
-  if (!freshFundCount && !deferredFundCount) throw new SafeBuildError('NO_VALID_FRESH_FUNDS');
+  if (!freshFundCount && !deferredFundCount && !pricePatches.length) throw new SafeBuildError('NO_VALID_FRESH_FUNDS');
   let retainedFundCount = 0;
   if (preserveOthers) {
     for (const [code, old] of cached) {
@@ -588,7 +600,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
   if (failedFundCount) limitations.push('部分基金沿用上次有效数据或暂缺，原始观测日期保留。');
   const uniqueErrors = [...new Map(errors.map(issue => [JSON.stringify(issue), issue])).values()];
   return {
-    schemaVersion: 1, asOf: raw.asOf, retrievedAt: raw.retrievedAt, sourceMode: 'actions',
+    schemaVersion: 1, asOf: raw.asOf, retrievedAt: raw.retrievedAt, sourceMode: 'actions', pricePatches,
     targetPeriodEnd: config.targetPeriodEnd || null, baselinePeriodEnd: config.baselinePeriodEnd || null,
     coverage: {
       targetPeriodEnd: config.targetPeriodEnd || null, baselinePeriodEnd: config.baselinePeriodEnd || null,

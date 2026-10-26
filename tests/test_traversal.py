@@ -87,19 +87,22 @@ class TraversalTests(unittest.TestCase):
 
     def retained_fund(self):
         from report_managers import parse_report_managers
+        from strategy_sections import parse_strategy_sections
+        strategy = parse_strategy_sections(["合成基金2026年第2季度报告\n4.4 报告期内基金的投资策略和运作分析\n本基金在报告期内增加债券配置。\n4.5 报告期内基金的业绩表现"],
+            {"sourceUrl": "https://example.org/report.pdf", "periodEnd": "2026-06-30", "kind": "quarterly", "publishedAt": "2026-07-20"})
         manager_rows = parse_report_managers(["", "", "4.1.2 基金经理及基金经理助理简介\n姓名 职务 任本基金的基金经理期限 证券从业年限 说明 任职日期 离任日期\n张甲 基金经理 2020年1月1日 - 20年\n4.2 运作说明"],
             {"sourceUrl": "https://example.org/manager-report.pdf", "periodEnd": "2026-06-30", "kind": "quarterly", "publishedAt": "2026-07-20"})
         return {"code": "000001", "companyId": "co1", "status": "ok", "dataStatus": "fresh",
                 "retrievedAt": "2026-09-29T10:00:00Z", "shareClassCodes": ["000001"],
                 "managerAttribution": "report", "managerSourceUrl": "https://example.org/manager-report.pdf",
                 "reportManagers": manager_rows, "managerTableCoverage": manager_rows.coverage,
-                "selectedReport": {**evidence(), "fundCode": "000001", "navYuan": 1000,
+                "selectedReport": {**evidence(), **strategy, "fundCode": "000001", "navYuan": 1000,
                     "parseMethod": "pypdf", "sourceTextHash": "a" * 64,
                     "pageStats": {"pageCount": 10, "totalPages": 10, "processedPages": 10,
                                   "nonEmptyPages": 10, "charCount": 12000, "textStatus": "usable", "truncated": False},
                     "holdings": [{"stockCode": "600001", "market": "CN"}]},
                 "previousReport": {"periodEnd": "2026-03-31", "publishedAt": "2026-04-20",
-                                   "sourceUrl": "https://example.org/baseline.pdf", "holdings": [{"stockCode": "600001"}]},
+                                   "sourceUrl": "https://example.org/baseline.pdf", "holdings": [{"stockCode": "600001", "market": "CN"}]},
                 "narrative": {"text": "合成季度原文摘录", "sourceUrl": "https://example.org/report.pdf",
                               "periodStart": "2026-04-01", "periodEnd": "2026-06-30", "page": None},
                 "rows": [{"stockCode": "600001", "market": "CN", "priceRange": complete_price()}]}
@@ -110,6 +113,7 @@ class TraversalTests(unittest.TestCase):
         self.assertTrue(all(value == "complete" for value in fields.values()))
         fund["selectedReport"]["pageStats"]["truncated"] = True
         fund["narrative"]["periodStart"] = "2026-01-01"
+        del fund["selectedReport"]["strategySectionCoverage"]
         fund["selectedReport"]["navYuan"] = None
         fund["previousReport"]["periodEnd"] = "2025-12-31"
         fund["rows"][0]["priceRange"]["priceBasis"] = "adjusted"
@@ -145,6 +149,7 @@ class TraversalTests(unittest.TestCase):
         self.assertEqual(complete_plan["meta"]["qualityCount"], 0)
         self.assertNotIn("000001", [item["code"] for item in complete_plan["batches"]["batch-0.json"]["funds"]])
         del complete_fund["narrative"]
+        del complete_fund["selectedReport"]["strategySectionCoverage"]
         missing_plan = traversal.plan_batches(catalog(), progress, config, shards=1, batch_size=3, now=NOW, retained=[complete_fund])
         self.assertEqual(missing_plan["batches"]["batch-0.json"]["traversal"]["qualityCodes"], ["000001"])
         self.assertNotIn("000001", missing_plan["batches"]["batch-0.json"]["traversal"]["enrichmentCodes"])
@@ -160,6 +165,7 @@ class TraversalTests(unittest.TestCase):
             retry["funds"][0]["qualityAttempt"] = True
             retry["funds"][0]["managerAttempt"] = False
             retry["funds"][0]["managerTableCoverageVersion"] = 1
+            retry["funds"][0]["strategySectionCoverageVersion"] = 1
             progress = traversal.merge_progress(catalog(), progress, config, [retry], now=NOW)
             replay = traversal.merge_progress(catalog(), progress, config, [retry], now=NOW)
             self.assertEqual(progress["funds"][0]["quality"]["attempts"], replay["funds"][0]["quality"]["attempts"])
@@ -203,6 +209,7 @@ class TraversalTests(unittest.TestCase):
         self.assertEqual(quality["fields"]["baseline"], "missing")
         self.assertEqual(quality["fields"]["prices"], "not-applicable")
         fund["narrative"] = None
+        fund["selectedReport"].pop("strategySectionCoverage", None)
         self.assertEqual(traversal.report_quality(fund, PHASE, traversal.utc_now(NOW))["fields"]["strategy"], "missing")
 
     def test_manifest_loader_uses_only_referenced_quarter_files(self):
@@ -269,14 +276,15 @@ class TraversalTests(unittest.TestCase):
         forged = {"fields": {key: "not-applicable" for key in traversal.QUALITY_FIELDS}}
         self.assertEqual(traversal.normalize_quality(forged, "complete", traversal.utc_now(NOW))["missingFields"], list(traversal.QUALITY_FIELDS))
 
-    def test_enrichment_prioritizes_missing_prices_without_replacing_report_state(self):
+    def test_enrichment_without_retained_source_identity_returns_to_report_lane(self):
         first = event()
         first["funds"][0]["priceCoverage"] = self.coverage(1)
         progress = traversal.merge_progress(catalog(), None, CONFIG, [first], now=NOW)
         plan = traversal.plan_batches(catalog(), progress, CONFIG, shards=1, batch_size=1, now=NOW)
         batch = plan["batches"]["batch-0.json"]
-        self.assertEqual(batch["traversal"]["enrichmentCodes"], ["000001"])
-        self.assertEqual(batch["funds"][0]["priceTargets"], [{"stockCode": "600002", "market": "CN"}])
+        self.assertEqual(batch["traversal"]["enrichmentCodes"], [])
+        self.assertEqual(batch["traversal"]["qualityCodes"], ["000001"])
+        self.assertNotIn("priceTargets", batch["funds"][0])
         self.assertEqual(progress["funds"][0]["status"], "complete")
         self.assertEqual(progress["enrichment"]["pendingFunds"], 1)
 
@@ -288,7 +296,8 @@ class TraversalTests(unittest.TestCase):
         self.assertEqual(stored["missingStockKeys"], ["CN:600002"])
         self.assertNotIn("missingStocks", stored)
         plan = traversal.plan_batches(catalog(), progress, CONFIG, shards=1, batch_size=1, now=NOW)
-        self.assertEqual(plan["batches"]["batch-0.json"]["funds"][0]["priceTargets"], [{"stockCode": "600002", "market": "CN"}])
+        self.assertNotIn("priceTargets", plan["batches"]["batch-0.json"]["funds"][0])
+        self.assertEqual(traversal.missing_stock_objects(stored), [{"stockCode": "600002", "market": "CN"}])
         legacy = json.loads(json.dumps(progress))
         legacy["funds"][0]["enrichment"].pop("missingStockKeys")
         legacy["funds"][0]["enrichment"]["missingStocks"] = [{"stockCode": "600002", "market": "CN"}]
@@ -649,7 +658,7 @@ class TraversalTests(unittest.TestCase):
     def test_missing_pdf_quality_reopens_but_truncated_parser_does_not(self):
         directory, previous, config = self.retry_fixture()
         fund = previous["funds"][0]
-        fund.update({"status": "complete", "quality": {"attempts": 3, "lastAttemptAt": fund["lastAttemptAt"], "managerTableCoverageVersion": 1, "priceCoverageVersion": 2,
+        fund.update({"status": "complete", "quality": {"attempts": 3, "lastAttemptAt": fund["lastAttemptAt"], "managerTableCoverageVersion": 1, "priceCoverageVersion": 2, "strategySectionCoverageVersion": 1,
                      "fields": {key: "missing" if key == "pdf" else "complete" for key in traversal.QUALITY_FIELDS}},
                      "enrichment": self.coverage(2)})
         opened = traversal.merge_progress(directory, previous, config, now="2026-10-27T07:00:00Z")
@@ -737,7 +746,7 @@ class TraversalTests(unittest.TestCase):
         self.assertFalse(blocked["complete"])
         fund = previous["funds"][0]
         fund.update({"status": "complete", "errorCode": None,
-                     "quality": {"attempts": 3, "lastAttemptAt": fund["lastAttemptAt"], "managerTableCoverageVersion": 1, "priceCoverageVersion": 2,
+                     "quality": {"attempts": 3, "lastAttemptAt": fund["lastAttemptAt"], "managerTableCoverageVersion": 1, "priceCoverageVersion": 2, "strategySectionCoverageVersion": 1, "strategyAttempts": 3,
                          "fields": {key: "missing" if key in {"nav", "strategy"} else "complete" for key in traversal.QUALITY_FIELDS}},
                      "enrichment": self.coverage(2)})
         incomplete = traversal.merge_progress(directory, previous, config, now="2026-10-26T07:00:00Z")["completionAudit"]

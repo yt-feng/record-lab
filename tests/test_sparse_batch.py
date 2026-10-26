@@ -21,7 +21,7 @@ class SparseBatchTests(unittest.TestCase):
                 shutil.copytree(source / directory, root / directory, ignore=shutil.ignore_patterns('__pycache__'))
             (root / 'web/data').mkdir(parents=True)
             (root / 'web/data/large.json').write_text('{}')
-            for name in ('lifecycle.js', 'zero-stock.js'):
+            for name in ('lifecycle.js', 'zero-stock.js', 'nonstock-assets.js', 'strategy-sections.js'):
                 shutil.copy2(source / 'web' / name, root / 'web' / name)
             (root / 'requirements.txt').write_text('')
             def git(*args, **kwargs):
@@ -33,6 +33,8 @@ class SparseBatchTests(unittest.TestCase):
             self.assertFalse((root / 'web/data/large.json').exists())
             self.assertTrue((root / 'requirements.txt').exists())
             subprocess.run(['node', '-e', "require('./scripts/build-data'); require('./scripts/analyze-data');"],
+                           cwd=root, check=True, capture_output=True)
+            subprocess.run(['python3', '-c', "import sys;sys.path.insert(0,'scripts');import collect_prices,price_patches"],
                            cwd=root, check=True, capture_output=True)
 
 

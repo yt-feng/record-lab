@@ -12,7 +12,7 @@ def retained():
 def previous(quality, at='2026-09-29T10:00:00Z'):
     return {'schemaVersion': 1, 'phase': PHASE, 'collectorVersion': 4, 'funds': [
         {'code': '000001', 'companyCode': 'co1', 'status': 'complete', 'attempts': 1,
-         'lastAttemptAt': at, 'quality': {'priceCoverageVersion': 2, **quality}}]}
+         'lastAttemptAt': at, 'quality': {'priceCoverageVersion': 2, 'strategySectionCoverageVersion': 1, **quality}}]}
 
 
 class ManagerQualityTests(unittest.TestCase):
@@ -56,7 +56,7 @@ class ManagerQualityTests(unittest.TestCase):
     def test_legacy_six_field_complete_and_exhausted_states_get_independent_manager_budget(self):
         for attempts in (0, 3):
             prior = {'fields': {key: 'complete' for key in traversal.SIX_QUALITY_FIELDS}, 'attempts': attempts,
-                     'totalAttempts': attempts, 'status': 'complete', 'priceCoverageVersion': 2}
+                     'totalAttempts': attempts, 'status': 'complete', 'priceCoverageVersion': 2, 'strategySectionCoverageVersion': 1}
             normalized = traversal.normalize_quality(prior, 'complete', traversal.utc_now(NOW))
             self.assertEqual(normalized['missingFields'], ['managers'])
             self.assertEqual(normalized['status'], 'pending')
@@ -92,9 +92,9 @@ class ManagerQualityTests(unittest.TestCase):
         self.assertEqual(state['quality']['status'], 'exhausted')
         self.assertNotIn('000001', traversal.quality_eligible({row['code']: row for row in progress['funds']}))
 
-    def test_repaired_manager_field_does_not_clear_unrelated_exhausted_pdf_gap(self):
+    def test_repaired_manager_field_does_not_clear_unrelated_exhausted_nav_gap(self):
         config = {**CONFIG, 'collectorVersion': 4, 'requireReportQuality': True}
-        fields = {key: 'complete' for key in traversal.SIX_QUALITY_FIELDS}; fields['strategy'] = 'missing'
+        fields = {key: 'complete' for key in traversal.SIX_QUALITY_FIELDS}; fields['nav'] = 'missing'
         progress = previous({'fields': fields, 'attempts': 3, 'totalAttempts': 3})
         attempt = event(at='2026-09-29T11:00:00Z')
         attempt['funds'][0].update(qualityAttempt=True, managerAttempt=True,
@@ -102,7 +102,7 @@ class ManagerQualityTests(unittest.TestCase):
                                   reportQuality={'fields': {**fields, 'managers': 'complete'}, 'managerTableCoverageVersion': 1, 'priceCoverageVersion': 2})
         progress = traversal.merge_progress(catalog(), progress, config, [attempt], NOW)
         quality = progress['funds'][0]['quality']
-        self.assertEqual(quality['missingFields'], ['strategy'])
+        self.assertEqual(quality['missingFields'], ['nav'])
         self.assertEqual(quality['status'], 'exhausted')
         self.assertEqual(quality['attempts'], 3)
         self.assertEqual(quality['managerAttempts'], 1)

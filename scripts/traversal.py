@@ -11,7 +11,9 @@ import re
 from urllib.parse import urlparse, parse_qsl
 from lifecycle import normalize_lifecycle_evidence
 from report_managers import normalize_manager_table_coverage, manager_key
+from strategy_sections import normalize_strategy_section_coverage
 from price_coverage import CALENDAR, VERSION as PRICE_COVERAGE_VERSION, valid_complete_price
+from price_patches import valid_binding as valid_price_binding, valid_target as valid_price_target, status_for as price_patch_status
 
 FUND_CODE = re.compile(r"\d{6}\Z")
 COMPANY_CODE = re.compile(r"[A-Za-z0-9_-]{1,40}\Z")
@@ -24,12 +26,15 @@ QUALITY_ACCEPTED = {"complete", "not-applicable"}
 QUALITY_MAX_ATTEMPTS = 3
 MANAGER_MAX_ATTEMPTS = 3
 MANAGER_TABLE_COVERAGE_VERSION = 1
+STRATEGY_SECTION_COVERAGE_VERSION = 1
+STRATEGY_MAX_ATTEMPTS = 3
 ERROR_CODES = {
     "BATCH_FAILED", "FUND_FAILED", "NO_VALID_REPORTS", "TARGET_REPORT_MISSING", "FUND_NOT_COLLECTED",
     "NO_VALID_FRESH_FUNDS", "NO_REPORTS", "NO_DATED_HOLDINGS", "EMPTY_HOLDINGS", "OLDER_REPORT",
     "HOLDING_COVERAGE_REGRESSION", "REPORT_COVERAGE_REGRESSION", "CONTRADICTORY_NO_EQUITIES",
     "INVALID_REPORT", "INVALID_REPORT_SOURCE", "REPORT_IDENTITY_MISMATCH", "INVALID_NO_EQUITIES_EVIDENCE",
     "BATCH_DEADLINE_REACHED", "PRICE_BUDGET_REACHED",
+    "PRICE_BINDING_INVALID", "ENRICHMENT_FAILED",
     "TIMEOUT", "NETWORK_ERROR", "HTTP_ERROR", "TLS_FAILED", "TARGET_REPORT_UNAVAILABLE",
     "PDF_PARSE_FAILED", "PDF_TEXT_EMPTY", "INVALID_PDF", "UNSUPPORTED_MARKET", "HOLDINGS_UNRESOLVED", "INVALID_FORMAT", "PARSE_FAILED",
 }
@@ -247,6 +252,7 @@ def base_states(catalog, previous, phase, now, config=None):
                         "representativeCode": prior.get("representativeCode") if is_code(prior.get("representativeCode"))
                         and prior.get("representativeCode") in records and records[prior["representativeCode"]]["companyCode"] == record["companyCode"] else code,
                         "attribution": "portfolio-evidence" if prior.get("attribution") == "portfolio-evidence" else "direct"}
+        states[code]['priceBindingNeedsReport'] = prior.get('priceBindingNeedsReport') is True
         prior_enrichment = prior.get("enrichment")
         prior_quality = prior.get("quality")
         if isinstance(prior_quality, dict) and isinstance(prior_quality.get("baselineExemption"), dict):
@@ -438,6 +444,8 @@ def normalize_quality(previous, status, now):
         return {"fields": {key: "not-applicable" for key in QUALITY_FIELDS}, "missingFields": [],
                 "attempts": 0, "totalAttempts": counter(previous.get("totalAttempts")),
                 "managerAttempts": 0, "managerTotalAttempts": counter(previous.get("managerTotalAttempts")), "managerLastAttemptAt": None,
+                "strategyAttempts": 0, "strategyTotalAttempts": counter(previous.get("strategyTotalAttempts")), "strategyLastAttemptAt": None,
+                "strategySectionCoverageVersion": STRATEGY_SECTION_COVERAGE_VERSION,
                 "managerTableCoverageVersion": MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2,
                 "retry": retry_state(previous.get("retry"), previous.get("lastAttemptAt"), now),
                 "lastAttemptAt": None, "status": "not-applicable"}
@@ -446,6 +454,9 @@ def normalize_quality(previous, status, now):
     manager_version_changed = previous.get("managerTableCoverageVersion") != MANAGER_TABLE_COVERAGE_VERSION
     if manager_version_changed and fields["managers"] == "complete":
         fields["managers"] = "partial"
+    strategy_version_changed = previous.get("strategySectionCoverageVersion") != STRATEGY_SECTION_COVERAGE_VERSION
+    if strategy_version_changed and fields["strategy"] == "complete":
+        fields["strategy"] = "partial"
     if previous.get("priceCoverageVersion") != 2 and status in SUCCESS:
         fields["prices"] = "missing"
     if status == "no-equities":
@@ -463,6 +474,10 @@ def normalize_quality(previous, status, now):
     # The new report-manager field has its own bounded repair budget. Historical
     # six-field attempts cannot exhaust a parser that did not yet exist.
     manager_attempts = 0 if manager_version_changed else min(MANAGER_MAX_ATTEMPTS, counter(previous.get("managerAttempts")))
+    strategy_attempts = 0 if strategy_version_changed else min(STRATEGY_MAX_ATTEMPTS, counter(previous.get("strategyAttempts")))
+    strategy_last = previous.get("strategyLastAttemptAt")
+    if not instant(strategy_last) or instant(strategy_last) > now + dt.timedelta(minutes=5):
+        strategy_last = None
     manager_last = previous.get("managerLastAttemptAt")
     if not instant(manager_last) or instant(manager_last) > now + dt.timedelta(minutes=5):
         manager_last = None
@@ -473,13 +488,16 @@ def normalize_quality(previous, status, now):
     result = {"fields": fields, "missingFields": missing, "attempts": attempts, "lastAttemptAt": last,
               "managerAttempts": manager_attempts, "managerTotalAttempts": counter(previous.get("managerTotalAttempts"), counter(previous.get("managerAttempts"))),
               "managerLastAttemptAt": manager_last,
+              "strategyAttempts": strategy_attempts, "strategyTotalAttempts": counter(previous.get("strategyTotalAttempts"), counter(previous.get("strategyAttempts"))),
+              "strategyLastAttemptAt": strategy_last, "strategySectionCoverageVersion": STRATEGY_SECTION_COVERAGE_VERSION,
               "managerTableCoverageVersion": MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2,
               "priceUniverseEmpty": previous.get("priceUniverseEmpty") is True,
               "totalAttempts": counter(previous.get("totalAttempts"), attempts), "retry": retry_state(previous.get("retry"), last, now),
               "pdfRetryable": previous.get("pdfRetryable") is not False,
               "status": "complete" if not missing else "pending" if (
-                  any(key != "managers" for key in missing) and attempts < QUALITY_MAX_ATTEMPTS
-                  or "managers" in missing and manager_attempts < MANAGER_MAX_ATTEMPTS) else "exhausted"}
+                  any(key not in {"managers", "strategy"} for key in missing) and attempts < QUALITY_MAX_ATTEMPTS
+                  or "managers" in missing and manager_attempts < MANAGER_MAX_ATTEMPTS
+                  or "strategy" in missing and strategy_attempts < STRATEGY_MAX_ATTEMPTS) else "exhausted"}
     if baseline_exempt and fields["baseline"] == "not-applicable":
         result["baselineExemption"] = {key: baseline_exemption[key] for key in ("reason", "date", "sourceUrl", "fundCode", "baselinePeriodEnd", "periodEnd")}
     return result
@@ -590,7 +608,9 @@ def report_quality(fund, phase, now):
         fields["managers"] = "complete"
     elif valid_manager_rows(fund, report, phase):
         fields["managers"] = "partial"
-    if fund.get("status") == "no-equities":
+    if (fund.get("status") == "no-equities" and not report.get("holdings")
+            and not any(row.get("current") is not None for row in fund.get("rows", []) if isinstance(row, dict))
+            and no_equities_report_matches(report, fund.get("noEquitiesEvidence") or report.get("noEquitiesEvidence"))):
         fields["holdings"] = "complete"
     elif fund.get("status") == "ok" and isinstance(report.get("holdings"), list) and report["holdings"]:
         fields["holdings"] = ("truncated" if report.get("holdingsPossiblyTruncated") is True else
@@ -609,15 +629,27 @@ def report_quality(fund, phase, now):
             fields["pdf"] = "partial"
     narrative = fund.get("narrative") or report.get("narrative") or {}
     if isinstance(narrative, dict) and isinstance(narrative.get("text"), str) and narrative["text"].strip() and public_url(narrative.get("sourceUrl")):
-        fields["strategy"] = "complete" if (narrative.get("periodStart") == quarter_start(phase["targetPeriodEnd"])
+        fields["strategy"] = "partial" if (narrative.get("periodStart") == quarter_start(phase["targetPeriodEnd"])
                                                 and narrative.get("periodEnd") == phase["targetPeriodEnd"]) else "wrong-period"
-    if fields["strategy"] != "complete":
+    if fields["strategy"] != "partial":
         excerpts = report.get("strategyExcerpts")
         if isinstance(excerpts, list) and any(isinstance(item, dict) and isinstance(item.get("text"), str)
                 and item["text"].strip() and public_url(item.get("sourceUrl"))
                 and item.get("periodStart") == quarter_start(phase["targetPeriodEnd"])
                 and item.get("periodEnd") == phase["targetPeriodEnd"] for item in excerpts):
+            fields["strategy"] = "partial"
+    strategy_proof = normalize_strategy_section_coverage(report.get("strategySectionCoverage"), phase["targetPeriodEnd"])
+    if strategy_proof:
+        strategy_observed = instant(report.get("strategyEvidenceRetrievedAt")) if report.get("strategyEvidenceRetrievedAt") is not None else observed
+        period_conflict = any(item.get("periodEnd") != phase["targetPeriodEnd"] or item.get("kind") != "quarterly"
+                              for item in strategy_proof["documentPeriodEvidence"])
+        if period_conflict or strategy_proof["kind"] != "quarterly" or strategy_proof["periodStart"] != quarter_start(phase["targetPeriodEnd"]):
+            fields["strategy"] = "wrong-period"
+        elif (strategy_proof["complete"] and strategy_observed and strategy_observed <= now + dt.timedelta(minutes=5)
+              and date(strategy_proof["publishedAt"]) <= strategy_observed.date()):
             fields["strategy"] = "complete"
+        elif strategy_proof["sections"] and fields["strategy"] == "missing":
+            fields["strategy"] = "partial"
     nav = report.get("navYuan")
     if isinstance(nav, (float, int)) and not isinstance(nav, bool) and 0 < nav < float("inf"):
         fields["nav"] = "complete"
@@ -629,7 +661,8 @@ def report_quality(fund, phase, now):
             and public_url(baseline.get("sourceUrl")) and date(baseline.get("publishedAt"))
             and date(baseline["publishedAt"]) >= date(baseline["periodEnd"])
             and date(baseline["publishedAt"]) <= observed.date()
-            and (baseline.get("holdings") or baseline.get("noEquitiesConfirmed") is True)):
+            and (baseline.get("holdings") or baseline.get("noEquitiesConfirmed") is True
+                 and no_equities_report_matches(baseline, baseline.get("noEquitiesEvidence")))):
         fields["baseline"] = "complete"
     elif valid_baseline_exemption(baseline_exemption, now):
         fields["baseline"] = "not-applicable"
@@ -640,6 +673,7 @@ def report_quality(fund, phase, now):
         elif coverage['holdingCount'] > 0:
             fields["prices"] = "complete" if coverage["priceComplete"] == coverage["holdingCount"] else "partial" if coverage["priceAvailable"] else "missing"
     result = {"fields": fields, "managerTableCoverageVersion": MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2,
+              "strategySectionCoverageVersion": STRATEGY_SECTION_COVERAGE_VERSION,
               "priceUniverseEmpty": bool(coverage and coverage['holdingCount'] == 0),
               "pdfRetryable": not report.get("parseMethod") and report.get("parseErrorCode") in (None, *RECOVERABLE_ERRORS)}
     if fields["baseline"] == "not-applicable" and valid_baseline_exemption(baseline_exemption, now):
@@ -652,13 +686,19 @@ def quality_eligible(states):
             and not state.get("deferredUntil")
             and state["attribution"] != "portfolio-evidence" and state.get("representativeCode", code) == code
             and state["quality"]["status"] == "pending" and (
-                any(field != "managers" for field in state["quality"]["missingFields"]) and state["quality"]["attempts"] < QUALITY_MAX_ATTEMPTS
-                or "managers" in state["quality"]["missingFields"] and state["quality"]["managerAttempts"] < MANAGER_MAX_ATTEMPTS)]
+                any(field not in {"managers", "strategy"} for field in state["quality"]["missingFields"]) and state["quality"]["attempts"] < QUALITY_MAX_ATTEMPTS
+                or "managers" in state["quality"]["missingFields"] and state["quality"]["managerAttempts"] < MANAGER_MAX_ATTEMPTS
+                or "strategy" in state["quality"]["missingFields"] and state["quality"]["strategyAttempts"] < STRATEGY_MAX_ATTEMPTS)]
 
 
 def manager_only_repair(quality):
     return ("managers" in quality["missingFields"] and quality["managerAttempts"] < MANAGER_MAX_ATTEMPTS
             and (quality["missingFields"] == ["managers"] or quality["attempts"] >= QUALITY_MAX_ATTEMPTS))
+
+
+def strategy_only_repair(quality):
+    return ("strategy" in quality["missingFields"] and quality["strategyAttempts"] < STRATEGY_MAX_ATTEMPTS
+            and (quality["missingFields"] == ["strategy"] or quality["attempts"] >= QUALITY_MAX_ATTEMPTS))
 
 
 def valid_quality(value, phase=None):
@@ -677,6 +717,7 @@ def merge_quality_observation(previous, observation):
     """Old collector flags cannot manufacture newer coverage proofs."""
     incoming = dict(observation.get("fields", {}))
     for field, version, expected in (("managers", "managerTableCoverageVersion", MANAGER_TABLE_COVERAGE_VERSION),
+                                      ("strategy", "strategySectionCoverageVersion", STRATEGY_SECTION_COVERAGE_VERSION),
                                       ("prices", "priceCoverageVersion", 2)):
         if observation.get(version) != expected:
             if previous["fields"].get(field) == "complete" or field not in incoming:
@@ -684,6 +725,7 @@ def merge_quality_observation(previous, observation):
             elif incoming[field] == "complete":
                 incoming[field] = "partial"
     return {**previous, **observation, "fields": incoming,
+            "strategySectionCoverageVersion": STRATEGY_SECTION_COVERAGE_VERSION,
             "managerTableCoverageVersion": MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2}
 
 
@@ -757,11 +799,23 @@ def no_equities_text(text):
         re.search(r"(?:未持有|未投资于?)股票(?:资产|投资|组合)?(?:[。；，,.;：:]|$)", excerpt))
 
 
+def no_equities_report_matches(report, evidence):
+    return (isinstance(report, dict) and isinstance(evidence, dict) and evidence.get("confirmed") is True
+            and evidence.get("sourceUrl") == report.get("sourceUrl")
+            and evidence.get("periodEnd") == report.get("periodEnd")
+            and evidence.get("publishedAt") == report.get("publishedAt")
+            and (evidence.get("evidenceType") != "exhaustive-nonstock-assets" or evidence.get("kind") == report.get("kind"))
+            and evidence_page(evidence.get("page")) and no_equities_content(evidence))
+
+
 def no_equities_content(evidence):
     """Require the quoted stock section and both same-page zero asset rows."""
     if not isinstance(evidence, dict):
         return False
     kind = evidence.get("evidenceType")
+    if kind == "exhaustive-nonstock-assets":
+        from nonstock_assets import valid_nonstock_assets
+        return valid_nonstock_assets(evidence)
     if kind == "zero-stock-balance-sheet":
         from zero_stock import valid_zero_stock
         return valid_zero_stock(evidence)
@@ -872,6 +926,11 @@ def eligible_work(states, config):
     """Use the same nonoverlapping task lanes for planning and coverage audits."""
     enrich_codes = set(enrichment_eligible(states))
     quality_codes = set(quality_eligible(states)) if quality_enabled(config) else set()
+    for code in list(enrich_codes):
+        if states[code].get('priceBindingNeedsReport'):
+            enrich_codes.discard(code)
+            if states[code]['quality']['attempts'] < QUALITY_MAX_ATTEMPTS:
+                quality_codes.add(code)
     # A report with only missing quotes belongs to the price repair lane. Keep
     # its known missing securities as explicit targets rather than recollecting
     # every security under the broader report repair budget.
@@ -933,6 +992,7 @@ def completion_audit(states, config, now, directory_pending=False):
                 "sourceRetryTasks": sum(states[code]["status"] != "pending" for code in source),
                 "reportRepairTasks": len(quality), "priceRepairTasks": len(prices),
                 "managerRepairTasks": sum(manager_only_repair(states[code]["quality"]) for code in quality),
+                "strategyRepairTasks": sum(strategy_only_repair(states[code]["quality"]) for code in quality),
                 "scheduledTasks": len(scheduled - ready), "requiresReviewTasks": len(attention),
                 "requiresReviewSourceTasks": sum(item["status"] not in SUCCESS for item in attention),
                 "requiresReviewResearchTasks": sum(item["status"] in SUCCESS for item in attention)},
@@ -940,6 +1000,7 @@ def completion_audit(states, config, now, directory_pending=False):
                 "Field-state counts use applicable share codes; gaps across different fields overlap and must not be added.",
                 "Task queues count representative product codes; source-proven share aliases do not create duplicate repair tasks.",
                 "Manager repair tasks are a subset of report repair tasks and have a separate bounded attempt budget.",
+                "Strategy repair tasks are a subset of report repair tasks; section extraction has an independent versioned budget.",
                 "Requires-review tasks have neither eligible work nor a future retry; they remain incomplete."]}
 
 
@@ -949,14 +1010,33 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
     if not isinstance(shards, int) or not isinstance(batch_size, int) or not 1 <= shards <= 32 or not 1 <= batch_size <= 100:
         raise TraversalError("INVALID_ARGUMENTS")
     companies, records, states = base_states(catalog, previous, phase, current, config)
-    hydrate_quality(states, retained, phase, current)
+    from price_patches import binding_for
+    price_bindings = {}
+    def captured_funds():
+        for fund in retained or ():
+            binding = binding_for(fund, phase)
+            if binding:
+                price_bindings[fund['code']] = binding
+            yield fund
+    hydrate_quality(states, captured_funds(), phase, current)
     apply_retry_policy(states, config, current)
     selected = []
     source_codes, quality_codes, enrich_codes = eligible_work(states, config)
+    # Existing quote repair state is insufficient without the exact retained
+    # source/universe. Recover that source through the report lane instead.
+    price_only = {}
+    for code in set(enrich_codes) - set(quality_codes):
+        binding = price_bindings.get(code)
+        if binding and binding['holdingsIdentity'] == states[code]['enrichment'].get('holdingsIdentity'):
+            price_only[code] = binding
+        else:
+            enrich_codes.discard(code)
+            if states[code]['quality']['attempts'] < QUALITY_MAX_ATTEMPTS:
+                quality_codes.add(code)
     if quality_enabled(config):
         selected = fair_research_selection(states, source_codes, quality_codes, enrich_codes, shards * batch_size)
     else:
-        for pool in (enrich_codes, source_codes):
+        for pool in (quality_codes, enrich_codes, source_codes):
             queue = fair_lane([code for code in pool if code not in selected], states)
             while queue and len(selected) < shards * batch_size:
                 selected.append(queue.popleft())
@@ -965,11 +1045,13 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
         batch = {key: value for key, value in config.items() if key not in {"funds", "traversal"}}
         batch_codes = selected[start:start + batch_size]
         batch["funds"] = [{**records[code], **({"priceTargets": states[code]["enrichment"]["missingStocks"]}
-                          if code in enrich_codes and code not in quality_codes and states[code]["enrichment"]["missingStocks"] else {})} for code in batch_codes]
+                          if code in enrich_codes and code not in quality_codes and states[code]["enrichment"]["missingStocks"] else {}),
+                           **({'priceOnly': price_only[code]} if code in price_only and code not in quality_codes else {})} for code in batch_codes]
         batch["traversal"] = {"phase": phase, "batchId": str(index), "plannedAt": current.isoformat(),
                               "enrichmentCodes": [code for code in batch_codes if code in enrich_codes and code not in quality_codes],
                               "qualityCodes": [code for code in batch_codes if code in quality_codes],
-                              "managerCodes": [code for code in batch_codes if code in quality_codes and manager_only_repair(states[code]["quality"])]}
+                              "managerCodes": [code for code in batch_codes if code in quality_codes and manager_only_repair(states[code]["quality"])],
+                              "strategyCodes": [code for code in batch_codes if code in quality_codes and strategy_only_repair(states[code]["quality"])]}
         filename = f"batch-{index}.json"
         batches[filename] = batch
         matrix.append({"id": str(index), "config": filename})
@@ -982,6 +1064,7 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
                      "retryCount": sum(code in source_codes and states[code]["status"] != "pending" for code in selected),
                      "enrichmentCount": sum(code in enrich_codes and code not in quality_codes for code in selected),
                      "managerCount": sum(code in quality_codes and manager_only_repair(states[code]["quality"]) for code in selected),
+                     "strategyCount": sum(code in quality_codes and strategy_only_repair(states[code]["quality"]) for code in selected),
                      "qualityCount": sum(code in quality_codes for code in selected), "phase": phase}}
 
 
@@ -1004,11 +1087,14 @@ def report_evidence(fund, phase, now, planned_at=None):
     if fund.get("status") == "no-equities":
         evidence = fund.get("noEquitiesEvidence") or report.get("noEquitiesEvidence") or {}
         text = evidence.get("text", "") if isinstance(evidence, dict) else ""
-        if (not isinstance(evidence, dict) or evidence.get("confirmed") is not True or evidence.get("sourceUrl") != report["sourceUrl"]
-                or evidence.get("periodEnd") != report["periodEnd"] or evidence.get("publishedAt") != report["publishedAt"]
-                or not evidence_page(evidence.get("page")) or not no_equities_content(evidence)):
+        if (not no_equities_report_matches(report, evidence) or report.get("holdings")
+                or any(row.get("current") is not None for row in fund.get("rows", []) if isinstance(row, dict))):
             return None
-        result["noEquities"] = {"confirmed": True, "sourceUrl": evidence["sourceUrl"], "page": evidence["page"], "text": text[:600]}
+        if evidence.get("evidenceType") == "exhaustive-nonstock-assets":
+            from nonstock_assets import normalize_nonstock_assets
+            result["noEquities"] = normalize_nonstock_assets(evidence)
+        else:
+            result["noEquities"] = {"confirmed": True, "sourceUrl": evidence["sourceUrl"], "page": evidence["page"], "text": text[:600]}
         if evidence.get("evidenceType") in ("zero-stock-balance-sheet", "explicit-no-stock-detail"):
             result["noEquities"].update({key: evidence[key] for key in ("evidenceType", "kind", "periodEnd", "publishedAt")})
         if evidence.get("evidenceType") == "empty-stock-detail-section":
@@ -1030,6 +1116,7 @@ def build_status(config, snapshot=None, now=None):
     enrich_codes = set(config.get("traversal", {}).get("enrichmentCodes", []))
     quality_codes = set(config.get("traversal", {}).get("qualityCodes", []))
     manager_codes = set(config.get("traversal", {}).get("managerCodes", []))
+    strategy_codes = set(config.get("traversal", {}).get("strategyCodes", []))
     snapshot_ok = isinstance(snapshot, dict) and snapshot.get("schemaVersion") == 1 and snapshot.get("sourceMode") == "actions"
     if snapshot_ok and snapshot.get("targetPeriodEnd") not in (None, phase["targetPeriodEnd"]):
         snapshot_ok = False
@@ -1065,6 +1152,11 @@ def build_status(config, snapshot=None, now=None):
                         qualities.setdefault(code, quality)
     rows = []
     for code, item in wanted.items():
+        if 'priceOnly' in item:
+            patch = next((p for p in (snapshot.get('pricePatches', []) if snapshot_ok else [])
+                          if isinstance(p, dict) and p.get('code') == code), None)
+            rows.append(price_patch_status(item, patch, phase))
+            continue
         declared = results.get(code, {})
         proof = observed.get(code)
         if valid_deferred(declared):
@@ -1098,6 +1190,8 @@ def build_status(config, snapshot=None, now=None):
         row["qualityAttempt"] = code in quality_codes
         row["managerAttempt"] = code in manager_codes
         row["managerTableCoverageVersion"] = MANAGER_TABLE_COVERAGE_VERSION
+        row["strategyAttempt"] = code in strategy_codes
+        row["strategySectionCoverageVersion"] = STRATEGY_SECTION_COVERAGE_VERSION
         if code in qualities:
             row["reportQuality"] = qualities[code]
         rows.append(row)
@@ -1119,7 +1213,7 @@ def valid_event_evidence(evidence, status, phase, attempted_at):
         noeq = evidence.get("noEquities") or {}
         if not isinstance(noeq, dict) or noeq.get("confirmed") is not True or noeq.get("sourceUrl") != evidence["sourceUrl"] or not evidence_page(noeq.get("page")):
             return False
-        if noeq.get("evidenceType") in ("empty-stock-detail-section", "zero-stock-balance-sheet", "explicit-no-stock-detail") and any(noeq.get(key) != evidence[key] for key in ("periodEnd", "publishedAt")):
+        if noeq.get("evidenceType") in ("empty-stock-detail-section", "zero-stock-balance-sheet", "explicit-no-stock-detail", "exhaustive-nonstock-assets") and any(noeq.get(key) != evidence[key] for key in ("periodEnd", "publishedAt")):
             return False
         return no_equities_content(noeq)
     return status == "complete"
@@ -1144,12 +1238,29 @@ def valid_status(document, config, now=None):
     enrich_codes = set(config.get("traversal", {}).get("enrichmentCodes", []))
     quality_codes = set(config.get("traversal", {}).get("qualityCodes", []))
     manager_codes = set(config.get("traversal", {}).get("managerCodes", []))
-    if not manager_codes.issubset(quality_codes):
+    strategy_codes = set(config.get("traversal", {}).get("strategyCodes", []))
+    if not manager_codes.issubset(quality_codes) or not strategy_codes.issubset(quality_codes):
         return False
     for item in rows:
         if not isinstance(item, dict) or item.get("code") not in wanted or item["code"] in seen:
             return False
         seen.add(item["code"])
+        planned_item = next(row for row in config['funds'] if row['code'] == item['code'])
+        if 'priceOnly' in planned_item:
+            if (item.get('priceOnly') is not True or item.get('status') != 'failed'
+                    or item.get('companyCode') != wanted[item['code']]
+                    or item.get('qualityAttempt') is not False or item.get('managerAttempt') is not False
+                    or item.get('strategyAttempt') is not False):
+                return False
+            keys = item.get('attemptedStockKeys')
+            began = instant(item.get('priceAttemptedAt'))
+            if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys) or item.get('attempted') is not bool(keys) or item.get('enrichmentAttempt') is not bool(keys): return False
+            if keys and (not valid_price_target(planned_item, phase) or item.get('priceBinding') != planned_item['priceOnly']
+                         or not began or began > attempted or planned and began < planned
+                         or any(key not in {stock_key(x) for x in planned_item['priceTargets']} for key in keys)
+                         or len(set(keys)) != len(keys)): return False
+            if not keys and item.get('errorCode') not in ('PRICE_BUDGET_REACHED', 'PRICE_BINDING_INVALID'): return False
+            continue
         if item.get("companyCode") != wanted[item["code"]] or item.get("status") not in TERMINAL | {"failed", "deferred-budget"}:
             return False
         if bool(item.get("enrichmentAttempt")) != (item["code"] in enrich_codes):
@@ -1157,6 +1268,8 @@ def valid_status(document, config, now=None):
         if bool(item.get("qualityAttempt")) != (item["code"] in quality_codes):
             return False
         if bool(item.get("managerAttempt")) != (item["code"] in manager_codes):
+            return False
+        if bool(item.get("strategyAttempt")) != (item["code"] in strategy_codes):
             return False
         if item.get("reportQuality") is not None and not valid_quality(item["reportQuality"], phase):
             return False
@@ -1192,6 +1305,7 @@ def valid_status(document, config, now=None):
 def reconcile_observations(statuses, receipt, config, now=None):
     """Use only the merger's retained public observations when advancing coverage."""
     current = utc_now(now)
+    phase = phase_for(config)
     generated = instant(receipt.get("generatedAt")) if isinstance(receipt, dict) else None
     if (not isinstance(receipt, dict) or receipt.get("schemaVersion") != 1 or receipt.get("phase") != phase_for(config)
             or not generated or generated > current + dt.timedelta(minutes=5) or not isinstance(receipt.get("funds"), list)):
@@ -1213,6 +1327,7 @@ def reconcile_observations(statuses, receipt, config, now=None):
             continue
         observations[item["code"]] = item
     reconciled = []
+    patch_receipts = {item.get('code'): item for item in receipt.get('pricePatches', []) if isinstance(item, dict)}
     for document in statuses:
         if not isinstance(document, dict):
             continue
@@ -1223,6 +1338,21 @@ def reconcile_observations(statuses, receipt, config, now=None):
                 continue
             row = dict(original)
             observation = observations.get(row.get("code"))
+            if row.get('priceOnly') is True:
+                proof = patch_receipts.get(row.get('code'))
+                identity_ok = (valid_price_binding(row.get('priceBinding'), phase, row.get('code'))
+                               and proof and proof.get('accepted') is True and proof.get('binding') == row.get('priceBinding')
+                               and observation and observation.get('status') in SUCCESS
+                               and observation.get('priceCoverage', {}).get('holdingsIdentity') == row.get('priceBinding', {}).get('holdingsIdentity'))
+                if identity_ok:
+                    row.update({key: observation[key] for key in ('status', 'reportEvidence', 'priceCoverage', 'representativeCode')})
+                    row['patchAccepted'] = True
+                    row['errorCode'] = None
+                else:
+                    row['patchAccepted'] = False
+                    if proof and proof.get('errorCode') == 'PRICE_BINDING_INVALID': row['errorCode'] = 'PRICE_BINDING_INVALID'
+                result['funds'].append(row)
+                continue
             if row.get("status") == "deferred-budget":
                 owner = observation.get("companyCode") if observation else None
                 if owner == "unknown":
@@ -1285,6 +1415,31 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
             if item.get("companyCode") != state["companyCode"]:
                 continue
             status = item.get("status")
+            if item.get('priceOnly') is True:
+                if state['status'] not in SUCCESS or item.get('qualityAttempt') or item.get('managerAttempt') or item.get('strategyAttempt'):
+                    continue
+                if item.get('errorCode') == 'PRICE_BINDING_INVALID': state['priceBindingNeedsReport'] = True
+                if item.get('attempted') is not True or item.get('enrichmentAttempt') is not True:
+                    continue
+                started = instant(item.get('priceAttemptedAt'))
+                keys = item.get('attemptedStockKeys')
+                binding = item.get('priceBinding')
+                if (not valid_price_binding(binding, phase, item['code']) or not started or started > attempted
+                        or not isinstance(keys, list) or not keys or not all(isinstance(k, str) and k in binding['stockKeys'] for k in keys)
+                        or len(set(keys)) != len(keys)):
+                    continue
+                extra = state['enrichment']
+                if instant(extra.get('lastAttemptAt')) and started <= instant(extra['lastAttemptAt']): continue
+                extra['attempts'] = min(3, extra['attempts'] + 1)
+                extra['totalAttempts'] += 1
+                extra['lastAttemptAt'] = item['priceAttemptedAt']
+                extra['status'] = 'exhausted' if extra['attempts'] >= 3 else 'pending'
+                extra['errorCode'] = 'ENRICHMENT_FAILED'
+                if (item.get('patchAccepted') is True and valid_price_binding(item.get('priceBinding'), phase, item['code'])
+                        and valid_event_evidence(item.get('reportEvidence'), status, phase, attempted)
+                        and item['priceBinding']['holdingsIdentity'] == extra.get('holdingsIdentity')):
+                    apply_coverage(state, item.get('priceCoverage'))
+                continue
             if status == "deferred-budget":
                 prior_deferred = instant(state.get("lastDeferredAt"))
                 prior_attempt = instant(state.get("lastAttemptAt"))
@@ -1325,7 +1480,8 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                 if prior_quality and attempted <= prior_quality:
                     continue
                 manager_only = item.get("managerAttempt") is True and manager_only_repair(quality)
-                if not manager_only:
+                strategy_only = item.get("strategyAttempt") is True and strategy_only_repair(quality)
+                if not manager_only and not strategy_only:
                     quality["attempts"] = min(QUALITY_MAX_ATTEMPTS, quality["attempts"] + 1)
                 manager_observed = isinstance(item.get("reportQuality"), dict) and item["reportQuality"].get("managerTableCoverageVersion") == MANAGER_TABLE_COVERAGE_VERSION
                 manager_attempted = item.get("managerTableCoverageVersion") == MANAGER_TABLE_COVERAGE_VERSION or manager_observed
@@ -1333,6 +1489,12 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                     quality["managerAttempts"] = min(MANAGER_MAX_ATTEMPTS, quality["managerAttempts"] + 1)
                     quality["managerTotalAttempts"] += 1
                     quality["managerLastAttemptAt"] = document["attemptedAt"]
+                strategy_observed = isinstance(item.get("reportQuality"), dict) and item["reportQuality"].get("strategySectionCoverageVersion") == STRATEGY_SECTION_COVERAGE_VERSION
+                strategy_attempted = item.get("strategySectionCoverageVersion") == STRATEGY_SECTION_COVERAGE_VERSION or strategy_observed
+                if strategy_attempted and (quality["fields"]["strategy"] not in QUALITY_ACCEPTED or item.get("strategyAttempt") is True):
+                    quality["strategyAttempts"] = min(STRATEGY_MAX_ATTEMPTS, quality["strategyAttempts"] + 1)
+                    quality["strategyTotalAttempts"] += 1
+                    quality["strategyLastAttemptAt"] = document["attemptedAt"]
                 quality["totalAttempts"] += 1
                 state["totalAttempts"] += 1
                 state["deferredUntil"] = None
@@ -1343,6 +1505,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                     quality.update(merge_quality_observation(quality, item["reportQuality"]))
                 state["quality"] = normalize_quality(quality, state["status"], current)
                 if status in SUCCESS:
+                    state['priceBindingNeedsReport'] = False
                     apply_coverage(state, item.get("priceCoverage"))
                     accepted_success.add(item["code"])
                 # Failed PDF enrichment must never erase a valid holding report.
@@ -1403,6 +1566,8 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
             quality_attempts = max((states[code]["quality"]["attempts"] for code in codes if code in states), default=0)
             manager_attempts = max((states[code]["quality"]["managerAttempts"] for code in codes if code in states), default=0)
             manager_total = max((states[code]["quality"]["managerTotalAttempts"] for code in codes if code in states), default=0)
+            strategy_attempts = max((states[code]["quality"]["strategyAttempts"] for code in codes if code in states), default=0)
+            strategy_total = max((states[code]["quality"]["strategyTotalAttempts"] for code in codes if code in states), default=0)
             representative_quality = states[representative]["quality"]
             for code in codes:
                 if code in states and states[code]["status"] == "not-applicable":
@@ -1411,7 +1576,8 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                     states[code]["representativeCode"] = representative
                     states[code]["enrichment"]["attempts"] = portfolio_attempts
                     states[code]["quality"] = normalize_quality({**representative_quality, "attempts": quality_attempts,
-                                                                 "managerAttempts": manager_attempts, "managerTotalAttempts": manager_total}, status, current)
+                                                                 "managerAttempts": manager_attempts, "managerTotalAttempts": manager_total,
+                                                                 "strategyAttempts": strategy_attempts, "strategyTotalAttempts": strategy_total}, status, current)
                 if code in states and states[code]["status"] not in SUCCESS:
                     states[code].update({"status": status, "lastAttemptAt": document["attemptedAt"], "errorCode": None,
                                          "attribution": "portfolio-evidence"})
@@ -1484,6 +1650,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                          "incompleteFunds": applicable - research_complete, "pendingFunds": research_pending,
                          "exhaustedFunds": research_exhausted, "maxAttempts": QUALITY_MAX_ATTEMPTS,
                          "managerMaxAttempts": MANAGER_MAX_ATTEMPTS,
+                         "strategyMaxAttempts": STRATEGY_MAX_ATTEMPTS,
                          "fieldCoverage": {key: sum(state["status"] != "not-applicable" and state["quality"]["fields"][key] in QUALITY_ACCEPTED for state in all_states)
                                            for key in QUALITY_FIELDS}},
             "enrichment": {"pendingFunds": sum(item["status"] == "pending" for item in enrichment_states),

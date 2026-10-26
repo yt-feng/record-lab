@@ -27,7 +27,7 @@ class CampaignTests(unittest.TestCase):
             for directory in ('scripts', 'lib', 'config'):
                 shutil.copytree(source / directory, root / directory, ignore=shutil.ignore_patterns('__pycache__'))
             (root / 'web').mkdir()
-            for module in ('lifecycle.js', 'zero-stock.js'):
+            for module in ('lifecycle.js', 'zero-stock.js', 'nonstock-assets.js', 'strategy-sections.js'):
                 shutil.copy2(source / 'web' / module, root / 'web' / module)
             atomic_json(root / 'web/data/catalog.json', {'schemaVersion': 1, 'asOf': '2026-10-26',
                 'coverage': {'directoryComplete': True, 'companyCount': 1, 'fundCount': 1200},
@@ -91,7 +91,7 @@ class CampaignTests(unittest.TestCase):
             for directory in ('scripts', 'lib', 'config'):
                 shutil.copytree(source / directory, root / directory, ignore=shutil.ignore_patterns('__pycache__'))
             (root / 'web').mkdir()
-            for module in ('lifecycle.js', 'zero-stock.js'):
+            for module in ('lifecycle.js', 'zero-stock.js', 'nonstock-assets.js', 'strategy-sections.js'):
                 shutil.copy2(source / 'web' / module, root / 'web' / module)
             catalog = {'schemaVersion': 1, 'asOf': '2026-10-26', 'retrievedAt': '2026-10-26T00:00:00Z',
                 'coverage': {'directoryComplete': True, 'companyCount': 1, 'fundCount': 2},
@@ -236,8 +236,10 @@ class CampaignTests(unittest.TestCase):
                 self.assertEqual(run.call_args.args[0][-1], str(period / 'analysis.json'))
                 (period / 'analysis.json').write_text(json.dumps({**latest, 'kind': 'quarter-analysis'}))
                 run.reset_mock(); self.assertEqual(site.ensure_analyses(root), 1); run.assert_called_once()
-                (period / 'analysis.json').write_text(json.dumps({**latest, 'kind': 'quarter-analysis', 'analysisVersion': 3}))
+                (period / 'analysis.json').write_text(json.dumps({**latest, 'kind': 'quarter-analysis', 'analysisVersion': 4, 'priceUpdatedAt': None}))
                 run.reset_mock(); self.assertEqual(site.ensure_analyses(root), 0); run.assert_not_called()
+                (period / 'latest.json').write_text(json.dumps({**latest, 'priceUpdatedAt': '2026-10-26T12:00:00Z'}))
+                run.reset_mock(); self.assertEqual(site.ensure_analyses(root), 1); run.assert_called_once()
 
     def test_staging_rejects_missing_part_and_excessive_bytes(self):
         with tempfile.TemporaryDirectory() as temp:

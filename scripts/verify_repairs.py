@@ -36,10 +36,14 @@ SAMPLES = (
      "check": "no-equities", "evidenceType": "zero-stock-balance-sheet", "page": 14},
     {"code": "000606", "kind": "quarterly", "periodEnd": "2026-06-30", "publishedAt": "2026-07-21",
      "title": "天弘优选债券型证券投资基金2026年第2季度报告", "sourceUrl": "https://pdf.dfcfw.com/pdf/H2_AN202607211827184178_1.pdf",
-     "check": "managers", "managerRows": [("刘洋", "2017-10-28", None, 6)]},
+     "check": "managers", "managerRows": [("刘洋", "2017-10-28", None, 6)], "strategyPages": [7, 8]},
     {"code": "010898", "kind": "quarterly", "periodEnd": "2026-09-30", "publishedAt": "2026-10-24",
      "title": "银河产业动力混合型证券投资基金2026年第3季度报告", "sourceUrl": "https://pdf.dfcfw.com/pdf/H2_AN202610241830863000_1.pdf",
-     "check": "managers", "managerRows": [("高鹏", "2025-10-24", None, 5), ("石磊", "2026-08-01", None, 6)]},
+     "check": "managers", "managerRows": [("高鹏", "2025-10-24", None, 5), ("石磊", "2026-08-01", None, 6)], "strategyPages": [7, 8]},
+    {"code": "253050", "kind": "quarterly", "periodEnd": "2026-06-30", "publishedAt": "2026-07-21",
+     "title": "国联安货币市场证券投资基金2026年第2季度报告", "sourceUrl": "https://pdf.dfcfw.com/pdf/H2_AN202607211827190658_1.pdf",
+     "check": "no-equities", "evidenceType": "exhaustive-nonstock-assets", "page": 8,
+     "pages": [8, 12, 13], "totalAssets": "33077230295.61", "otherAssets": "203521.29"},
 )
 OUTPUT = Path(".cache/repair-verification/result.json")
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,12 +76,15 @@ def normalized_snapshot(sample, details, now):
     document = {key: sample[key] for key in ("title", "kind", "periodEnd", "publishedAt", "sourceUrl")}
     document["fundCode"] = sample["code"]
     fields = ("navYuan", "narrative", "parseMethod", "parseErrorCode", "sourceTextHash", "pageStats",
-              "strategyExcerpts", "strategyThemes", "reportPdfSourceUrl", "reportPdfPeriodEnd", "reportPdfKind")
+              "strategyExcerpts", "strategyThemes", "strategySectionCoverage", "strategyAnalysis",
+              "reportPdfSourceUrl", "reportPdfPeriodEnd", "reportPdfKind")
     report = {**document, **{key: details[key] for key in fields if key in details},
               "holdings": [], "coverage": "unknown", "managers": details.get("reportManagers", []),
               "managerEvidenceRetrievedAt": now.isoformat(), "evidenceRetrievedAt": now.isoformat()}
     if "managerTableCoverage" in details:
         report["managerTableCoverage"] = details["managerTableCoverage"]
+    if "strategySectionCoverage" in details:
+        report["strategyEvidenceRetrievedAt"] = now.isoformat()
     if sample["check"] == "foreign-holdings":
         holdings = details.get("pdfHoldings") or []
         proof = pdf_holdings_evidence(details, document, holdings)
@@ -145,7 +152,18 @@ def evaluate(sample, details, fund, quality):
                       sourcePage=evidence.get("page") == sample["page"], noEquityStatus=fund.get("status") == "no-equities",
                       normalizedQuality=fields.get("holdings") == "complete")
         observed.update(evidenceType=evidence.get("evidenceType") if evidence.get("evidenceType") in
-                        {"explicit-no-stock-detail", "zero-stock-balance-sheet"} else "unknown", page=evidence.get("page"))
+                        {"explicit-no-stock-detail", "zero-stock-balance-sheet", "exhaustive-nonstock-assets"} else "unknown", page=evidence.get("page"))
+        if sample["evidenceType"] == "exhaustive-nonstock-assets":
+            from nonstock_assets import valid_nonstock_assets
+            asset, other = evidence.get("assetTable") or {}, evidence.get("otherAssetsTable") or {}
+            checks.update(closedTableProof=valid_nonstock_assets(evidence), physicalPages=evidence.get("pages") == sample["pages"],
+                          totalAssets=(asset.get("total") or {}).get("amount") == sample["totalAssets"],
+                          otherAssets=(other.get("total") or {}).get("amount") == sample["otherAssets"])
+            # Only fixed numeric facts are retained; the two original table
+            # excerpts remain in memory with all other extracted text.
+            if checks["closedTableProof"]:
+                observed.update(pages=evidence["pages"], stockBookValue=evidence["stockBookValue"],
+                                totalAssets=asset["total"]["amount"], otherAssets=other["total"]["amount"])
     else:
         managers = fund.get("reportManagers") or []
         rows = [(item.get("name"), item.get("startDate"), item.get("endDate"), (item.get("evidence") or {}).get("page")) for item in managers]
@@ -158,6 +176,38 @@ def evaluate(sample, details, fund, quality):
                                  "endDate": end if isinstance(end, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", end) else None,
                                  "page": page if type(page) is int and 1 <= page <= 10000 else None} for name, start, end, page in rows[:10]]
         observed["managerTableComplete"] = (fund.get("managerTableCoverage") or {}).get("complete") is True
+        proof = report.get("strategySectionCoverage") or {}
+        analysis = report.get("strategyAnalysis") or {}
+        sections = proof.get("sections") or []
+        evidence = analysis.get("evidence") or []
+        categories = ("market-review", "portfolio-operations", "outlook")
+        period_start = (dt.date.fromisoformat(phase_for(sample)["baselinePeriodEnd"]) + dt.timedelta(days=1)).isoformat()
+        checks.update(strategySectionComplete=proof.get("complete") is True,
+                      strategyPeriod=(proof.get("periodStart") == period_start and proof.get("periodEnd") == sample["periodEnd"]
+                                      and proof.get("kind") == "quarterly"),
+                      strategySource=(proof.get("sourceUrl") == sample["sourceUrl"] and proof.get("publishedAt") == sample["publishedAt"]),
+                      strategyBounds=(len(sections) == 1 and sections[0].get("section") == "4.4"
+                                      and sections[0].get("endSection") == "4.5" and sections[0].get("pages") == sample["strategyPages"]),
+                      strategyQuality=fields.get("strategy") == "complete",
+                      selectedEvidence=(analysis.get("scope") == "selected-evidence" and analysis.get("analysisCoverage") == "selected-evidence"
+                                        and analysis.get("status") == "available"
+                                        and analysis.get("semanticAnalysisComplete") is False and analysis.get("sourceSectionComplete") is True
+                                        and analysis.get("explainsIndividualStockTrades") is False and analysis.get("securityMentionsProveTrades") is False),
+                      strategyEvidenceProvenance=bool(evidence) and len(evidence) <= 8 and all(isinstance(item, dict)
+                          and isinstance(item.get("text"), str) and 0 < len(item["text"]) <= 160
+                          and item.get("sourceUrl") == sample["sourceUrl"] and item.get("periodStart") == period_start
+                          and item.get("periodEnd") == sample["periodEnd"] and item.get("page") in sample["strategyPages"] for item in evidence),
+                      strategyCategories=all(any(isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip()
+                                                 and category in (item.get("categories") or []) for item in evidence) for category in categories))
+        counts = analysis.get("categorySentenceCounts") or {}
+        observed["strategy"] = {"sectionComplete": proof.get("complete") is True,
+                                "analysisCoverage": "selected-evidence" if analysis.get("analysisCoverage") == "selected-evidence" else "unknown",
+                                "semanticAnalysisComplete": analysis.get("semanticAnalysisComplete") is True,
+                                "sectionCount": len(sections), "selectedEvidenceCount": len(evidence),
+                                "sentenceCounts": {key: counts[key] if type(counts.get(key)) is int and 0 <= counts[key] <= 100000 else None
+                                                   for key in (*categories, "unclassified")}}
+        if checks["strategyBounds"]:
+            observed["strategy"].update(section="4.4", endSection="4.5", pages=sample["strategyPages"])
     return {"code": sample["code"], "periodEnd": sample["periodEnd"], "sourceUrl": sample["sourceUrl"], "check": sample["check"],
             "status": "passed" if all(checks.values()) else "failed", "checks": checks, "observed": observed}
 

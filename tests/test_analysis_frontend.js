@@ -28,12 +28,12 @@ test('analysis CSV distinguishes unresolved identity and keeps null amount cells
   assert.match(result,/身份待核验数/);assert.match(result,/' =SUM\(1,2\)/);assert.match(result,/,"20","",/);
 });
 
-function generated(id) {
+function generated(id, structuredStrategy = false) {
   const target = id === '2026Q2' ? '2026-06-30' : '2026-09-30';
   const baseline = id === '2026Q2' ? '2026-03-31' : '2026-06-30';
   const published = id === '2026Q2' ? '2026-07-20' : '2026-10-20';
   const start = id === '2026Q2' ? '2026-04-01' : '2026-07-01';
-  const current = {stockCode:'600001',stockName:'合成证券',market:'CN',currency:'CNY',shares:100,weightPct:5,marketValueYuan:500};
+  const current = {stockCode:structuredStrategy?'601318':'600001',stockName:'合成证券',market:'CN',currency:'CNY',shares:100,weightPct:5,marketValueYuan:500};
   const report = {fundCode:'000001',kind:'quarterly',coverage:'top10',navYuan:10000,
     sourceUrl:`https://example.org/${id}.pdf`,periodEnd:target,publishedAt:published,holdings:[current],
     strategyExcerpts:[{text:`${id}组合按估值调整行业配置。`,sourceUrl:`https://example.org/${id}.pdf`,page:7,periodStart:start,periodEnd:target}]};
@@ -43,6 +43,7 @@ function generated(id) {
       managers:[{name:'当前经理'}],reports:[report,{...report,periodEnd:baseline,publishedAt:baseline,
         sourceUrl:`https://example.org/${id}-prior.pdf`,holdings:[{...current,shares:50}],strategyExcerpts:[]}]}]},
     {now:'2026-10-26T12:00:00Z',config:{funds:[{code:'000001'}],targetPeriodEnd:target,baselinePeriodEnd:baseline}});
+  if (structuredStrategy) Object.assign(snapshot.funds[0].selectedReport, structuredClone(require('./fixtures/strategy-sections.json').complete));
   snapshot.funds[0].reportManagers=[{name:'报告经理',startDate:'2025-01-01',endDate:null,role:'本基金基金经理',periodStart:start,periodEnd:target,
     evidence:{sourceUrl:'https://example.org/manager-report.pdf',page:5,pages:[5],tablePage:5,section:'4.1',
       text:'报告经理 本基金基金经理 2025年1月1日 -',method:'explicit-report-manager-table',periodEnd:target}}];snapshot.funds[0].managerAttribution='report';
@@ -88,6 +89,21 @@ test('real generated stock index, contribution parts and evidence render report 
   assert.match(result,/持股数增加/);assert.match(result,/本期持股 100.*上期持股 50.*股数差 50/);
   assert.match(result,/2026Q2组合按估值调整行业配置/);assert.match(result,/第 7 页/);
   assert.equal(bundle.index.generation,[...bundle.parts.values()][0].generation);
+});
+
+test('strategy detail separates complete extraction, selected quotes, operations and outlook',async()=>{
+  const bundle=generated('2026Q2',true);
+  const view=runtime(url=>resolveBundle(bundle,'2026Q2',url));
+  await view.api.loadQuarter({id:'2026Q2'});await view.button().click();
+  const result=view.nodes.get('analysis-detail').textContent;
+  assert.equal(bundle.index.coverage.strategySectionCompleteRecords,1);
+  assert.equal(bundle.index.coverage.strategySemanticAnalysisComplete,false);
+  assert.match(result,/策略章节已完整提取/);
+  assert.match(result,/市场回顾 1 句.*组合操作表述 1 句.*后市展望 1 句/);
+  assert.match(result,/不代表全文语义分析已完成/);
+  assert.match(result,/原文明确提及该证券/);
+  assert.match(result,/我们增加中国平安的配置，因为估值较为合理/);
+  assert.match(view.nodes.get('analysis-themes').textContent,/策略章节完整提取 1 条/);
 });
 
 test('same-quarter parts from another generation or baseline are rejected rather than mixed with old totals',async()=>{

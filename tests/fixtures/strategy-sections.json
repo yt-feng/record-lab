@@ -1,0 +1,1878 @@
+{
+  "complete": {
+    "strategySectionCoverage": {
+      "schemaVersion": 1,
+      "method": "bounded-strategy-sections-v1",
+      "sourceUrl": "https://example.org/strategy.pdf",
+      "publishedAt": "2026-07-20",
+      "periodStart": "2026-04-01",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "sourceTextHash": "96b31602b8e696030f72fbf3d99dbca95e39deb2a5aef503ea4f2493e515a8c9",
+      "sections": [
+        {
+          "section": "4.4",
+          "heading": "4.4 报告期内基金的投资策略和运作分析",
+          "startPage": 7,
+          "endPage": 8,
+          "pages": [
+            7,
+            8
+          ],
+          "endSection": "4.5",
+          "endHeading": "4.5 报告期内基金的业绩表现",
+          "sectionBounded": true,
+          "pageNumbersVerified": true,
+          "pageLimitReached": false,
+          "textLimitReached": false,
+          "contentChars": 42,
+          "sentenceCount": 3,
+          "contentHash": "c388bc31208fcf372356a7836f1eef68bf90b3def45969416ed41f86e1882c37"
+        }
+      ],
+      "documentPeriodEvidence": [
+        {
+          "periodEnd": "2026-06-30",
+          "kind": "quarterly",
+          "page": 7,
+          "text": "2026年第2季度报告"
+        }
+      ],
+      "sectionCount": 1,
+      "contentChars": 42,
+      "sentenceCount": 3,
+      "complete": true,
+      "status": "complete",
+      "reasonCodes": []
+    },
+    "strategyAnalysis": {
+      "schemaVersion": 1,
+      "scope": "selected-evidence",
+      "method": "explicit-language-rules-v1",
+      "status": "available",
+      "analysisCoverage": "selected-evidence",
+      "semanticAnalysisComplete": false,
+      "sourceSectionComplete": true,
+      "sentenceCount": 3,
+      "categorySentenceCounts": {
+        "market-review": 1,
+        "portfolio-operations": 1,
+        "outlook": 1,
+        "unclassified": 0
+      },
+      "categoryCountsOverlap": true,
+      "selectedSentenceCount": 3,
+      "omittedSentenceCount": 0,
+      "maxQuotes": 8,
+      "maxQuoteChars": 160,
+      "evidence": [
+        {
+          "id": "s0-0",
+          "text": "本季度市场回暖。",
+          "page": 7,
+          "pages": [
+            7
+          ],
+          "section": "4.4",
+          "sentenceIndex": 0,
+          "categories": [
+            "market-review"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-1",
+          "text": "我们增加中国平安的配置，因为估值较为合理。",
+          "page": 7,
+          "pages": [
+            7,
+            8
+          ],
+          "section": "4.4",
+          "sentenceIndex": 1,
+          "categories": [
+            "portfolio-operations"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [
+            {
+              "stockCode": "601318",
+              "market": "CN",
+              "stockName": "中国平安",
+              "matchType": "exact-name",
+              "provesTrade": false,
+              "provesTradeReason": false
+            }
+          ],
+          "languageSignals": {
+            "operation": true,
+            "causalConnective": true,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-2",
+          "text": "未来本基金将关注科技方向。",
+          "page": 8,
+          "pages": [
+            8
+          ],
+          "section": "4.4",
+          "sentenceIndex": 2,
+          "categories": [
+            "outlook"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": true
+          }
+        }
+      ],
+      "explainsIndividualStockTrades": false,
+      "securityMentionsProveTrades": false
+    }
+  },
+  "child": {
+    "strategySectionCoverage": {
+      "schemaVersion": 1,
+      "method": "bounded-strategy-sections-v1",
+      "sourceUrl": "https://example.org/strategy.pdf",
+      "publishedAt": "2026-07-20",
+      "periodStart": "2026-04-01",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "sourceTextHash": "29cfe7ea13f828220d73c46b943fea0371e1210653bd92ca937d31077a21d586",
+      "sections": [
+        {
+          "section": "4.4.1",
+          "heading": "4.4.1 报告期内基金投资策略和运作分析",
+          "startPage": 1,
+          "endPage": 1,
+          "pages": [
+            1
+          ],
+          "endSection": "4.4.2",
+          "endHeading": "4.4.2 报告期内基金的业绩表现",
+          "sectionBounded": true,
+          "pageNumbersVerified": true,
+          "pageLimitReached": false,
+          "textLimitReached": false,
+          "contentChars": 45,
+          "sentenceCount": 3,
+          "contentHash": "ffd97a7608708f9c36e584d93e4aa7bfb519300c86cc9d1e90384fa026f47418"
+        }
+      ],
+      "documentPeriodEvidence": [
+        {
+          "periodEnd": "2026-06-30",
+          "kind": "quarterly",
+          "page": 1,
+          "text": "2026年第2季度报告"
+        }
+      ],
+      "sectionCount": 1,
+      "contentChars": 45,
+      "sentenceCount": 3,
+      "complete": true,
+      "status": "complete",
+      "reasonCodes": []
+    },
+    "strategyAnalysis": {
+      "schemaVersion": 1,
+      "scope": "selected-evidence",
+      "method": "explicit-language-rules-v1",
+      "status": "available",
+      "analysisCoverage": "selected-evidence",
+      "semanticAnalysisComplete": false,
+      "sourceSectionComplete": true,
+      "sentenceCount": 3,
+      "categorySentenceCounts": {
+        "market-review": 1,
+        "portfolio-operations": 1,
+        "outlook": 1,
+        "unclassified": 0
+      },
+      "categoryCountsOverlap": true,
+      "selectedSentenceCount": 3,
+      "omittedSentenceCount": 0,
+      "maxQuotes": 8,
+      "maxQuoteChars": 160,
+      "evidence": [
+        {
+          "id": "s0-0",
+          "text": "本季度经济和市场回暖。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4.1",
+          "sentenceIndex": 0,
+          "categories": [
+            "market-review"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-1",
+          "text": "我们增加中国平安的配置，因为估值较为合理。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4.1",
+          "sentenceIndex": 1,
+          "categories": [
+            "portfolio-operations"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [
+            {
+              "stockCode": "601318",
+              "market": "CN",
+              "stockName": "中国平安",
+              "matchType": "exact-name",
+              "provesTrade": false,
+              "provesTradeReason": false
+            }
+          ],
+          "languageSignals": {
+            "operation": true,
+            "causalConnective": true,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-2",
+          "text": "未来本基金将关注科技方向。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4.1",
+          "sentenceIndex": 2,
+          "categories": [
+            "outlook"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": true
+          }
+        }
+      ],
+      "explainsIndividualStockTrades": false,
+      "securityMentionsProveTrades": false
+    }
+  },
+  "unknown-page": {
+    "strategySectionCoverage": {
+      "schemaVersion": 1,
+      "method": "bounded-strategy-sections-v1",
+      "sourceUrl": "https://example.org/strategy.pdf",
+      "publishedAt": "2026-07-20",
+      "periodStart": "2026-04-01",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "sourceTextHash": "1b0e338fcf4e4f2248f3eee8b7ca6cde8f0afa63c69fb5be2e209bdb6f44b5a9",
+      "sections": [
+        {
+          "section": "4.4",
+          "heading": "4.4 报告期内基金的投资策略和运作分析",
+          "startPage": 7,
+          "endPage": null,
+          "pages": [
+            7,
+            null
+          ],
+          "endSection": "4.5",
+          "endHeading": "4.5 报告期内基金的业绩表现",
+          "sectionBounded": true,
+          "pageNumbersVerified": false,
+          "pageLimitReached": false,
+          "textLimitReached": false,
+          "contentChars": 90,
+          "sentenceCount": 6,
+          "contentHash": "0a1c186ee5893793a1933c8f55df989062e7c7b3a24548ee3342f0ba03bea258"
+        }
+      ],
+      "documentPeriodEvidence": [
+        {
+          "periodEnd": "2026-06-30",
+          "kind": "quarterly",
+          "page": 7,
+          "text": "2026年第2季度报告"
+        }
+      ],
+      "sectionCount": 1,
+      "contentChars": 90,
+      "sentenceCount": 6,
+      "complete": false,
+      "status": "partial",
+      "reasonCodes": [
+        "UNKNOWN_OR_NONCONTIGUOUS_PAGES"
+      ]
+    },
+    "strategyAnalysis": {
+      "schemaVersion": 1,
+      "scope": "selected-evidence",
+      "method": "explicit-language-rules-v1",
+      "status": "partial-source",
+      "analysisCoverage": "selected-evidence",
+      "semanticAnalysisComplete": false,
+      "sourceSectionComplete": false,
+      "sentenceCount": 6,
+      "categorySentenceCounts": {
+        "market-review": 2,
+        "portfolio-operations": 2,
+        "outlook": 2,
+        "unclassified": 0
+      },
+      "categoryCountsOverlap": true,
+      "selectedSentenceCount": 3,
+      "omittedSentenceCount": 3,
+      "maxQuotes": 8,
+      "maxQuoteChars": 160,
+      "evidence": [
+        {
+          "id": "s0-0",
+          "text": "本季度经济和市场回暖。",
+          "page": 7,
+          "pages": [
+            7
+          ],
+          "section": "4.4",
+          "sentenceIndex": 0,
+          "categories": [
+            "market-review"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-1",
+          "text": "我们增加中国平安的配置，因为估值较为合理。",
+          "page": 7,
+          "pages": [
+            7
+          ],
+          "section": "4.4",
+          "sentenceIndex": 1,
+          "categories": [
+            "portfolio-operations"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [
+            {
+              "stockCode": "601318",
+              "market": "CN",
+              "stockName": "中国平安",
+              "matchType": "exact-name",
+              "provesTrade": false,
+              "provesTradeReason": false
+            }
+          ],
+          "languageSignals": {
+            "operation": true,
+            "causalConnective": true,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-2",
+          "text": "未来本基金将关注科技方向。",
+          "page": 7,
+          "pages": [
+            7
+          ],
+          "section": "4.4",
+          "sentenceIndex": 2,
+          "categories": [
+            "outlook"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": true
+          }
+        }
+      ],
+      "explainsIndividualStockTrades": false,
+      "securityMentionsProveTrades": false
+    }
+  },
+  "noncontiguous": {
+    "strategySectionCoverage": {
+      "schemaVersion": 1,
+      "method": "bounded-strategy-sections-v1",
+      "sourceUrl": "https://example.org/strategy.pdf",
+      "publishedAt": "2026-07-20",
+      "periodStart": "2026-04-01",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "sourceTextHash": "1b0e338fcf4e4f2248f3eee8b7ca6cde8f0afa63c69fb5be2e209bdb6f44b5a9",
+      "sections": [
+        {
+          "section": "4.4",
+          "heading": "4.4 报告期内基金的投资策略和运作分析",
+          "startPage": 7,
+          "endPage": 9,
+          "pages": [
+            7,
+            9
+          ],
+          "endSection": "4.5",
+          "endHeading": "4.5 报告期内基金的业绩表现",
+          "sectionBounded": true,
+          "pageNumbersVerified": false,
+          "pageLimitReached": false,
+          "textLimitReached": false,
+          "contentChars": 90,
+          "sentenceCount": 6,
+          "contentHash": "0a1c186ee5893793a1933c8f55df989062e7c7b3a24548ee3342f0ba03bea258"
+        }
+      ],
+      "documentPeriodEvidence": [
+        {
+          "periodEnd": "2026-06-30",
+          "kind": "quarterly",
+          "page": 7,
+          "text": "2026年第2季度报告"
+        }
+      ],
+      "sectionCount": 1,
+      "contentChars": 90,
+      "sentenceCount": 6,
+      "complete": false,
+      "status": "partial",
+      "reasonCodes": [
+        "UNKNOWN_OR_NONCONTIGUOUS_PAGES"
+      ]
+    },
+    "strategyAnalysis": {
+      "schemaVersion": 1,
+      "scope": "selected-evidence",
+      "method": "explicit-language-rules-v1",
+      "status": "partial-source",
+      "analysisCoverage": "selected-evidence",
+      "semanticAnalysisComplete": false,
+      "sourceSectionComplete": false,
+      "sentenceCount": 6,
+      "categorySentenceCounts": {
+        "market-review": 2,
+        "portfolio-operations": 2,
+        "outlook": 2,
+        "unclassified": 0
+      },
+      "categoryCountsOverlap": true,
+      "selectedSentenceCount": 6,
+      "omittedSentenceCount": 0,
+      "maxQuotes": 8,
+      "maxQuoteChars": 160,
+      "evidence": [
+        {
+          "id": "s0-0",
+          "text": "本季度经济和市场回暖。",
+          "page": 7,
+          "pages": [
+            7
+          ],
+          "section": "4.4",
+          "sentenceIndex": 0,
+          "categories": [
+            "market-review"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-1",
+          "text": "我们增加中国平安的配置，因为估值较为合理。",
+          "page": 7,
+          "pages": [
+            7
+          ],
+          "section": "4.4",
+          "sentenceIndex": 1,
+          "categories": [
+            "portfolio-operations"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [
+            {
+              "stockCode": "601318",
+              "market": "CN",
+              "stockName": "中国平安",
+              "matchType": "exact-name",
+              "provesTrade": false,
+              "provesTradeReason": false
+            }
+          ],
+          "languageSignals": {
+            "operation": true,
+            "causalConnective": true,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-2",
+          "text": "未来本基金将关注科技方向。",
+          "page": 7,
+          "pages": [
+            7
+          ],
+          "section": "4.4",
+          "sentenceIndex": 2,
+          "categories": [
+            "outlook"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": true
+          }
+        },
+        {
+          "id": "s0-3",
+          "text": "本季度经济和市场回暖。",
+          "page": 9,
+          "pages": [
+            9
+          ],
+          "section": "4.4",
+          "sentenceIndex": 3,
+          "categories": [
+            "market-review"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-4",
+          "text": "我们增加中国平安的配置，因为估值较为合理。",
+          "page": 9,
+          "pages": [
+            9
+          ],
+          "section": "4.4",
+          "sentenceIndex": 4,
+          "categories": [
+            "portfolio-operations"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [
+            {
+              "stockCode": "601318",
+              "market": "CN",
+              "stockName": "中国平安",
+              "matchType": "exact-name",
+              "provesTrade": false,
+              "provesTradeReason": false
+            }
+          ],
+          "languageSignals": {
+            "operation": true,
+            "causalConnective": true,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-5",
+          "text": "未来本基金将关注科技方向。",
+          "page": 9,
+          "pages": [
+            9
+          ],
+          "section": "4.4",
+          "sentenceIndex": 5,
+          "categories": [
+            "outlook"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": true
+          }
+        }
+      ],
+      "explainsIndividualStockTrades": false,
+      "securityMentionsProveTrades": false
+    }
+  },
+  "missing-end": {
+    "strategySectionCoverage": {
+      "schemaVersion": 1,
+      "method": "bounded-strategy-sections-v1",
+      "sourceUrl": "https://example.org/strategy.pdf",
+      "publishedAt": "2026-07-20",
+      "periodStart": "2026-04-01",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "sourceTextHash": "a2153bdf3ead8fbd825bbe773f775ed0216dd1cd7580bafcf317a3529aff4ecf",
+      "sections": [
+        {
+          "section": "4.4",
+          "heading": "4.4 报告期内基金的投资策略和运作分析",
+          "startPage": 1,
+          "endPage": 1,
+          "pages": [
+            1
+          ],
+          "endSection": null,
+          "endHeading": null,
+          "sectionBounded": false,
+          "pageNumbersVerified": true,
+          "pageLimitReached": false,
+          "textLimitReached": false,
+          "contentChars": 45,
+          "sentenceCount": 3,
+          "contentHash": "ffd97a7608708f9c36e584d93e4aa7bfb519300c86cc9d1e90384fa026f47418"
+        }
+      ],
+      "documentPeriodEvidence": [
+        {
+          "periodEnd": "2026-06-30",
+          "kind": "quarterly",
+          "page": 1,
+          "text": "2026年第2季度报告"
+        }
+      ],
+      "sectionCount": 1,
+      "contentChars": 45,
+      "sentenceCount": 3,
+      "complete": false,
+      "status": "partial",
+      "reasonCodes": [
+        "MISSING_SECTION_END"
+      ]
+    },
+    "strategyAnalysis": {
+      "schemaVersion": 1,
+      "scope": "selected-evidence",
+      "method": "explicit-language-rules-v1",
+      "status": "partial-source",
+      "analysisCoverage": "selected-evidence",
+      "semanticAnalysisComplete": false,
+      "sourceSectionComplete": false,
+      "sentenceCount": 3,
+      "categorySentenceCounts": {
+        "market-review": 1,
+        "portfolio-operations": 1,
+        "outlook": 1,
+        "unclassified": 0
+      },
+      "categoryCountsOverlap": true,
+      "selectedSentenceCount": 3,
+      "omittedSentenceCount": 0,
+      "maxQuotes": 8,
+      "maxQuoteChars": 160,
+      "evidence": [
+        {
+          "id": "s0-0",
+          "text": "本季度经济和市场回暖。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 0,
+          "categories": [
+            "market-review"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-1",
+          "text": "我们增加中国平安的配置，因为估值较为合理。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 1,
+          "categories": [
+            "portfolio-operations"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [
+            {
+              "stockCode": "601318",
+              "market": "CN",
+              "stockName": "中国平安",
+              "matchType": "exact-name",
+              "provesTrade": false,
+              "provesTradeReason": false
+            }
+          ],
+          "languageSignals": {
+            "operation": true,
+            "causalConnective": true,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-2",
+          "text": "未来本基金将关注科技方向。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 2,
+          "categories": [
+            "outlook"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": true
+          }
+        }
+      ],
+      "explainsIndividualStockTrades": false,
+      "securityMentionsProveTrades": false
+    }
+  },
+  "page-cap": {
+    "strategySectionCoverage": {
+      "schemaVersion": 1,
+      "method": "bounded-strategy-sections-v1",
+      "sourceUrl": "https://example.org/strategy.pdf",
+      "publishedAt": "2026-07-20",
+      "periodStart": "2026-04-01",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "sourceTextHash": "b3160f30aa0daade96368ca8ef7073746d16b39673f29d629e216c007a3845a8",
+      "sections": [
+        {
+          "section": "4.4",
+          "heading": "4.4 报告期内基金的投资策略和运作分析",
+          "startPage": 1,
+          "endPage": 8,
+          "pages": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+          ],
+          "endSection": null,
+          "endHeading": null,
+          "sectionBounded": false,
+          "pageNumbersVerified": true,
+          "pageLimitReached": true,
+          "textLimitReached": false,
+          "contentChars": 360,
+          "sentenceCount": 24,
+          "contentHash": "d802c764ba5b9cb3992ff087be51773b286f4881a100261165bef1acc9a283d4"
+        }
+      ],
+      "documentPeriodEvidence": [
+        {
+          "periodEnd": "2026-06-30",
+          "kind": "quarterly",
+          "page": 1,
+          "text": "2026年第2季度报告"
+        }
+      ],
+      "sectionCount": 1,
+      "contentChars": 360,
+      "sentenceCount": 24,
+      "complete": false,
+      "status": "partial",
+      "reasonCodes": [
+        "MISSING_SECTION_END",
+        "SECTION_PAGE_LIMIT"
+      ]
+    },
+    "strategyAnalysis": {
+      "schemaVersion": 1,
+      "scope": "selected-evidence",
+      "method": "explicit-language-rules-v1",
+      "status": "partial-source",
+      "analysisCoverage": "selected-evidence",
+      "semanticAnalysisComplete": false,
+      "sourceSectionComplete": false,
+      "sentenceCount": 24,
+      "categorySentenceCounts": {
+        "market-review": 8,
+        "portfolio-operations": 8,
+        "outlook": 8,
+        "unclassified": 0
+      },
+      "categoryCountsOverlap": true,
+      "selectedSentenceCount": 6,
+      "omittedSentenceCount": 18,
+      "maxQuotes": 8,
+      "maxQuoteChars": 160,
+      "evidence": [
+        {
+          "id": "s0-0",
+          "text": "本季度经济和市场回暖。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 0,
+          "categories": [
+            "market-review"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-1",
+          "text": "我们增加中国平安的配置，因为估值较为合理。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 1,
+          "categories": [
+            "portfolio-operations"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [
+            {
+              "stockCode": "601318",
+              "market": "CN",
+              "stockName": "中国平安",
+              "matchType": "exact-name",
+              "provesTrade": false,
+              "provesTradeReason": false
+            }
+          ],
+          "languageSignals": {
+            "operation": true,
+            "causalConnective": true,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-2",
+          "text": "未来本基金将关注科技方向。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 2,
+          "categories": [
+            "outlook"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": true
+          }
+        },
+        {
+          "id": "s0-3",
+          "text": "本季度经济和市场回暖。",
+          "page": 2,
+          "pages": [
+            2
+          ],
+          "section": "4.4",
+          "sentenceIndex": 3,
+          "categories": [
+            "market-review"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-4",
+          "text": "我们增加中国平安的配置，因为估值较为合理。",
+          "page": 2,
+          "pages": [
+            2
+          ],
+          "section": "4.4",
+          "sentenceIndex": 4,
+          "categories": [
+            "portfolio-operations"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [
+            {
+              "stockCode": "601318",
+              "market": "CN",
+              "stockName": "中国平安",
+              "matchType": "exact-name",
+              "provesTrade": false,
+              "provesTradeReason": false
+            }
+          ],
+          "languageSignals": {
+            "operation": true,
+            "causalConnective": true,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-5",
+          "text": "未来本基金将关注科技方向。",
+          "page": 2,
+          "pages": [
+            2
+          ],
+          "section": "4.4",
+          "sentenceIndex": 5,
+          "categories": [
+            "outlook"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": true
+          }
+        }
+      ],
+      "explainsIndividualStockTrades": false,
+      "securityMentionsProveTrades": false
+    }
+  },
+  "text-cap": {
+    "strategySectionCoverage": {
+      "schemaVersion": 1,
+      "method": "bounded-strategy-sections-v1",
+      "sourceUrl": "https://example.org/strategy.pdf",
+      "publishedAt": "2026-07-20",
+      "periodStart": "2026-04-01",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "sourceTextHash": "b89ffa18284448fe6ebe89fd4a5e061c8bb2c926b263034e41c0c1be007291f4",
+      "sections": [
+        {
+          "section": "4.4",
+          "heading": "4.4 报告期内基金的投资策略和运作分析",
+          "startPage": 1,
+          "endPage": 1,
+          "pages": [
+            1
+          ],
+          "endSection": "4.5",
+          "endHeading": "4.5 报告期内基金的业绩表现",
+          "sectionBounded": true,
+          "pageNumbersVerified": true,
+          "pageLimitReached": false,
+          "textLimitReached": true,
+          "contentChars": 99,
+          "sentenceCount": 7,
+          "contentHash": "aeb7158709a0c3b87352c4523a661915416e06e6174a75195283e2240f1b3d6a"
+        }
+      ],
+      "documentPeriodEvidence": [
+        {
+          "periodEnd": "2026-06-30",
+          "kind": "quarterly",
+          "page": 1,
+          "text": "2026年第2季度报告"
+        }
+      ],
+      "sectionCount": 1,
+      "contentChars": 99,
+      "sentenceCount": 7,
+      "complete": false,
+      "status": "partial",
+      "reasonCodes": [
+        "SECTION_TEXT_LIMIT"
+      ]
+    },
+    "strategyAnalysis": {
+      "schemaVersion": 1,
+      "scope": "selected-evidence",
+      "method": "explicit-language-rules-v1",
+      "status": "partial-source",
+      "analysisCoverage": "selected-evidence",
+      "semanticAnalysisComplete": false,
+      "sourceSectionComplete": false,
+      "sentenceCount": 7,
+      "categorySentenceCounts": {
+        "market-review": 3,
+        "portfolio-operations": 2,
+        "outlook": 2,
+        "unclassified": 0
+      },
+      "categoryCountsOverlap": true,
+      "selectedSentenceCount": 6,
+      "omittedSentenceCount": 1,
+      "maxQuotes": 8,
+      "maxQuoteChars": 160,
+      "evidence": [
+        {
+          "id": "s0-0",
+          "text": "本季度经济和市场回暖。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 0,
+          "categories": [
+            "market-review"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-1",
+          "text": "我们增加中国平安的配置，因为估值较为合理。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 1,
+          "categories": [
+            "portfolio-operations"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [
+            {
+              "stockCode": "601318",
+              "market": "CN",
+              "stockName": "中国平安",
+              "matchType": "exact-name",
+              "provesTrade": false,
+              "provesTradeReason": false
+            }
+          ],
+          "languageSignals": {
+            "operation": true,
+            "causalConnective": true,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-2",
+          "text": "未来本基金将关注科技方向。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 2,
+          "categories": [
+            "outlook"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": true
+          }
+        },
+        {
+          "id": "s0-3",
+          "text": "本季度经济和市场回暖。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 3,
+          "categories": [
+            "market-review"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-4",
+          "text": "我们增加中国平安的配置，因为估值较为合理。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 4,
+          "categories": [
+            "portfolio-operations"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [
+            {
+              "stockCode": "601318",
+              "market": "CN",
+              "stockName": "中国平安",
+              "matchType": "exact-name",
+              "provesTrade": false,
+              "provesTradeReason": false
+            }
+          ],
+          "languageSignals": {
+            "operation": true,
+            "causalConnective": true,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-5",
+          "text": "未来本基金将关注科技方向。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 5,
+          "categories": [
+            "outlook"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": true
+          }
+        }
+      ],
+      "explainsIndividualStockTrades": false,
+      "securityMentionsProveTrades": false
+    }
+  },
+  "wrong-kind": {
+    "strategySectionCoverage": {
+      "schemaVersion": 1,
+      "method": "bounded-strategy-sections-v1",
+      "sourceUrl": "https://example.org/strategy.pdf",
+      "publishedAt": "2026-07-20",
+      "periodStart": "2026-04-01",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "sourceTextHash": "6b9bbdbb6857c81e92fcf19d15ce3a537f8008a9ea547ed01ecf2c7b32de0f4f",
+      "sections": [
+        {
+          "section": "4.4",
+          "heading": "4.4 报告期内基金的投资策略和运作分析",
+          "startPage": 1,
+          "endPage": 1,
+          "pages": [
+            1
+          ],
+          "endSection": "4.5",
+          "endHeading": "4.5 报告期内基金的业绩表现",
+          "sectionBounded": true,
+          "pageNumbersVerified": true,
+          "pageLimitReached": false,
+          "textLimitReached": false,
+          "contentChars": 45,
+          "sentenceCount": 3,
+          "contentHash": "ffd97a7608708f9c36e584d93e4aa7bfb519300c86cc9d1e90384fa026f47418"
+        }
+      ],
+      "documentPeriodEvidence": [
+        {
+          "periodEnd": "2026-06-30",
+          "kind": "semiannual",
+          "page": 1,
+          "text": "2026年中期报告"
+        }
+      ],
+      "sectionCount": 1,
+      "contentChars": 45,
+      "sentenceCount": 3,
+      "complete": false,
+      "status": "partial",
+      "reasonCodes": [
+        "MISSING_OR_MISMATCHED_DOCUMENT_PERIOD"
+      ]
+    },
+    "strategyAnalysis": {
+      "schemaVersion": 1,
+      "scope": "selected-evidence",
+      "method": "explicit-language-rules-v1",
+      "status": "wrong-period",
+      "analysisCoverage": "selected-evidence",
+      "semanticAnalysisComplete": false,
+      "sourceSectionComplete": false,
+      "sentenceCount": 3,
+      "categorySentenceCounts": {
+        "market-review": 1,
+        "portfolio-operations": 1,
+        "outlook": 1,
+        "unclassified": 0
+      },
+      "categoryCountsOverlap": true,
+      "selectedSentenceCount": 0,
+      "omittedSentenceCount": 3,
+      "maxQuotes": 8,
+      "maxQuoteChars": 160,
+      "evidence": [],
+      "explainsIndividualStockTrades": false,
+      "securityMentionsProveTrades": false
+    }
+  },
+  "missing-title": {
+    "strategySectionCoverage": {
+      "schemaVersion": 1,
+      "method": "bounded-strategy-sections-v1",
+      "sourceUrl": "https://example.org/strategy.pdf",
+      "publishedAt": "2026-07-20",
+      "periodStart": "2026-04-01",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "sourceTextHash": "d7d5f947b3d4deff7fca30a3b9212d985994bb8b989e54a46c9e2cb7c2402f75",
+      "sections": [
+        {
+          "section": "4.4",
+          "heading": "4.4 报告期内基金的投资策略和运作分析",
+          "startPage": 1,
+          "endPage": 1,
+          "pages": [
+            1
+          ],
+          "endSection": "4.5",
+          "endHeading": "4.5 报告期内基金的业绩表现",
+          "sectionBounded": true,
+          "pageNumbersVerified": true,
+          "pageLimitReached": false,
+          "textLimitReached": false,
+          "contentChars": 45,
+          "sentenceCount": 3,
+          "contentHash": "ffd97a7608708f9c36e584d93e4aa7bfb519300c86cc9d1e90384fa026f47418"
+        }
+      ],
+      "documentPeriodEvidence": [],
+      "sectionCount": 1,
+      "contentChars": 45,
+      "sentenceCount": 3,
+      "complete": false,
+      "status": "partial",
+      "reasonCodes": [
+        "MISSING_OR_MISMATCHED_DOCUMENT_PERIOD"
+      ]
+    },
+    "strategyAnalysis": {
+      "schemaVersion": 1,
+      "scope": "selected-evidence",
+      "method": "explicit-language-rules-v1",
+      "status": "partial-source",
+      "analysisCoverage": "selected-evidence",
+      "semanticAnalysisComplete": false,
+      "sourceSectionComplete": false,
+      "sentenceCount": 3,
+      "categorySentenceCounts": {
+        "market-review": 1,
+        "portfolio-operations": 1,
+        "outlook": 1,
+        "unclassified": 0
+      },
+      "categoryCountsOverlap": true,
+      "selectedSentenceCount": 3,
+      "omittedSentenceCount": 0,
+      "maxQuotes": 8,
+      "maxQuoteChars": 160,
+      "evidence": [
+        {
+          "id": "s0-0",
+          "text": "本季度经济和市场回暖。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 0,
+          "categories": [
+            "market-review"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-1",
+          "text": "我们增加中国平安的配置，因为估值较为合理。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 1,
+          "categories": [
+            "portfolio-operations"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [
+            {
+              "stockCode": "601318",
+              "market": "CN",
+              "stockName": "中国平安",
+              "matchType": "exact-name",
+              "provesTrade": false,
+              "provesTradeReason": false
+            }
+          ],
+          "languageSignals": {
+            "operation": true,
+            "causalConnective": true,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-2",
+          "text": "未来本基金将关注科技方向。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 2,
+          "categories": [
+            "outlook"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": true
+          }
+        }
+      ],
+      "explainsIndividualStockTrades": false,
+      "securityMentionsProveTrades": false
+    }
+  },
+  "selected-evidence": {
+    "strategySectionCoverage": {
+      "schemaVersion": 1,
+      "method": "bounded-strategy-sections-v1",
+      "sourceUrl": "https://example.org/strategy.pdf",
+      "publishedAt": "2026-07-20",
+      "periodStart": "2026-04-01",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "sourceTextHash": "7f861a6b6d16b76b5aa927d69e71ca9d90d72e77438f92ccff3ebe22a2438f4a",
+      "sections": [
+        {
+          "section": "4.4",
+          "heading": "4.4 报告期内基金的投资策略和运作分析",
+          "startPage": 1,
+          "endPage": 1,
+          "pages": [
+            1
+          ],
+          "endSection": "4.5",
+          "endHeading": "4.5 报告期内基金的业绩表现",
+          "sectionBounded": true,
+          "pageNumbersVerified": true,
+          "pageLimitReached": false,
+          "textLimitReached": false,
+          "contentChars": 375,
+          "sentenceCount": 23,
+          "contentHash": "de2f85ab23ad303cb7880a624068bf52272446fdbcf701cacc4e1aeedbd4fec0"
+        }
+      ],
+      "documentPeriodEvidence": [
+        {
+          "periodEnd": "2026-06-30",
+          "kind": "quarterly",
+          "page": 1,
+          "text": "2026年第2季度报告"
+        }
+      ],
+      "sectionCount": 1,
+      "contentChars": 375,
+      "sentenceCount": 23,
+      "complete": true,
+      "status": "complete",
+      "reasonCodes": []
+    },
+    "strategyAnalysis": {
+      "schemaVersion": 1,
+      "scope": "selected-evidence",
+      "method": "explicit-language-rules-v1",
+      "status": "available",
+      "analysisCoverage": "selected-evidence",
+      "semanticAnalysisComplete": false,
+      "sourceSectionComplete": true,
+      "sentenceCount": 23,
+      "categorySentenceCounts": {
+        "market-review": 21,
+        "portfolio-operations": 1,
+        "outlook": 1,
+        "unclassified": 0
+      },
+      "categoryCountsOverlap": true,
+      "selectedSentenceCount": 4,
+      "omittedSentenceCount": 19,
+      "maxQuotes": 8,
+      "maxQuoteChars": 160,
+      "evidence": [
+        {
+          "id": "s0-0",
+          "text": "本季度市场第0阶段经济有所回升。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 0,
+          "categories": [
+            "market-review"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-1",
+          "text": "本季度市场第1阶段经济有所回升。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 1,
+          "categories": [
+            "market-review"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-21",
+          "text": "我们增加中国平安的配置，因为估值较为合理。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 21,
+          "categories": [
+            "portfolio-operations"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [
+            {
+              "stockCode": "601318",
+              "market": "CN",
+              "stockName": "中国平安",
+              "matchType": "exact-name",
+              "provesTrade": false,
+              "provesTradeReason": false
+            }
+          ],
+          "languageSignals": {
+            "operation": true,
+            "causalConnective": true,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-22",
+          "text": "未来本基金将关注科技方向。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 22,
+          "categories": [
+            "outlook"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": true
+          }
+        }
+      ],
+      "explainsIndividualStockTrades": false,
+      "securityMentionsProveTrades": false
+    }
+  },
+  "next-major-section": {
+    "strategySectionCoverage": {
+      "schemaVersion": 1,
+      "method": "bounded-strategy-sections-v1",
+      "sourceUrl": "https://example.org/strategy.pdf",
+      "publishedAt": "2026-07-20",
+      "periodStart": "2026-04-01",
+      "periodEnd": "2026-06-30",
+      "kind": "quarterly",
+      "sourceTextHash": "b0404f621ce6e905e4f035b2a24387c92f81b71bdf8da94191f17d702bc88a59",
+      "sections": [
+        {
+          "section": "4.4",
+          "heading": "4.4 报告期内基金的投资策略和运作分析",
+          "startPage": 1,
+          "endPage": 1,
+          "pages": [
+            1
+          ],
+          "endSection": "5",
+          "endHeading": "§5 投资组合报告",
+          "sectionBounded": true,
+          "pageNumbersVerified": true,
+          "pageLimitReached": false,
+          "textLimitReached": false,
+          "contentChars": 45,
+          "sentenceCount": 3,
+          "contentHash": "ffd97a7608708f9c36e584d93e4aa7bfb519300c86cc9d1e90384fa026f47418"
+        }
+      ],
+      "documentPeriodEvidence": [
+        {
+          "periodEnd": "2026-06-30",
+          "kind": "quarterly",
+          "page": 1,
+          "text": "2026年第2季度报告"
+        }
+      ],
+      "sectionCount": 1,
+      "contentChars": 45,
+      "sentenceCount": 3,
+      "complete": true,
+      "status": "complete",
+      "reasonCodes": []
+    },
+    "strategyAnalysis": {
+      "schemaVersion": 1,
+      "scope": "selected-evidence",
+      "method": "explicit-language-rules-v1",
+      "status": "available",
+      "analysisCoverage": "selected-evidence",
+      "semanticAnalysisComplete": false,
+      "sourceSectionComplete": true,
+      "sentenceCount": 3,
+      "categorySentenceCounts": {
+        "market-review": 1,
+        "portfolio-operations": 1,
+        "outlook": 1,
+        "unclassified": 0
+      },
+      "categoryCountsOverlap": true,
+      "selectedSentenceCount": 3,
+      "omittedSentenceCount": 0,
+      "maxQuotes": 8,
+      "maxQuoteChars": 160,
+      "evidence": [
+        {
+          "id": "s0-0",
+          "text": "本季度经济和市场回暖。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 0,
+          "categories": [
+            "market-review"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-1",
+          "text": "我们增加中国平安的配置，因为估值较为合理。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 1,
+          "categories": [
+            "portfolio-operations"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [
+            {
+              "stockCode": "601318",
+              "market": "CN",
+              "stockName": "中国平安",
+              "matchType": "exact-name",
+              "provesTrade": false,
+              "provesTradeReason": false
+            }
+          ],
+          "languageSignals": {
+            "operation": true,
+            "causalConnective": true,
+            "outlook": false
+          }
+        },
+        {
+          "id": "s0-2",
+          "text": "未来本基金将关注科技方向。",
+          "page": 1,
+          "pages": [
+            1
+          ],
+          "section": "4.4",
+          "sentenceIndex": 2,
+          "categories": [
+            "outlook"
+          ],
+          "sourceUrl": "https://example.org/strategy.pdf",
+          "periodStart": "2026-04-01",
+          "periodEnd": "2026-06-30",
+          "quoteTruncated": false,
+          "isInference": false,
+          "securityMentions": [],
+          "languageSignals": {
+            "operation": false,
+            "causalConnective": false,
+            "outlook": true
+          }
+        }
+      ],
+      "explainsIndividualStockTrades": false,
+      "securityMentionsProveTrades": false
+    }
+  }
+}

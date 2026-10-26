@@ -25,15 +25,40 @@ def normalized(sample, _details=None, _now=None):
     elif sample["check"] == "no-equities":
         fund["status"] = "no-equities"
         report["noEquitiesEvidence"] = {"evidenceType": sample["evidenceType"], "page": sample["page"]}
+        if sample["evidenceType"] == "exhaustive-nonstock-assets":
+            report["noEquitiesEvidence"] = nonstock_proof(sample)
     else:
         fund.update(managerAttribution="report", managerTableCoverage={"complete": True}, reportManagers=[{"name": name, "startDate": start, "endDate": end,
                     "evidence": {"page": page, "periodEnd": sample["periodEnd"], "sourceUrl": sample["sourceUrl"]}}
                     for name, start, end, page in sample["managerRows"]])
+        report.update(strategy_details(sample))
     return fund
 
 
 def quality(*_):
-    return {"fields": {"holdings": "complete", "managers": "complete"}}
+    return {"fields": {"holdings": "complete", "managers": "complete", "strategy": "complete"}}
+
+
+def strategy_details(sample):
+    from strategy_sections import parse_strategy_sections
+    quarter = (int(sample["periodEnd"][5:7]) - 1) // 3 + 1
+    pages = [f"合成基金2026年第{quarter}季度报告\n4.4 报告期内基金的投资策略和运作分析\n本季度经济和市场回暖。我们增加债券配置，因为估值较为合理。",
+             "未来本基金将关注科技方向。\n4.5 报告期内基金的业绩表现\n合成结束"]
+    return parse_strategy_sections(pages, sample, page_numbers=sample["strategyPages"])
+
+
+def nonstock_proof(sample):
+    from nonstock_assets import parse_nonstock_assets
+    fixture = json.loads((Path(__file__).parent / "fixtures/nonstock-assets.json").read_text())
+    # Substitute only public numeric facts in the synthetic table layout.
+    substitutions = {"4,000.00": "14,527,769,865.85", "40.00": "43.92", "3,000.00": "8,413,532,288.59",
+                     "30.00": "25.44", "2,999.90": "10,135,724,619.88", "10,000.00": "33,077,230,295.61"}
+    asset = fixture["pages"][0]
+    for old, new in substitutions.items(): asset = asset.replace(old, new)
+    asset = asset.replace("10,135,724,619.88 25.44", "10,135,724,619.88 30.64").replace("0.10", "203,521.29")
+    fixture["pages"][0] = asset
+    fixture["pages"][1] = fixture["pages"][1].replace("0.04", "44,971.77").replace("0.06", "158,549.52").replace("0.10", "203,521.29")
+    return parse_nonstock_assets(fixture["pages"], sample, page_numbers=fixture["pageNumbers"])
 
 
 class FakeProvider:
@@ -61,12 +86,13 @@ class VerifyRepairTests(unittest.TestCase):
         provider.assert_not_called()
         self.assertEqual(json.loads(output.getvalue())["errorCode"], "ACTIONS_REQUIRED")
 
-    def test_exactly_five_fixed_sources_and_small_allowlisted_summary(self):
+    def test_exactly_six_fixed_sources_and_small_allowlisted_summary(self):
         provider = FakeProvider()
         result = verify.run_verification(provider, normalize=normalized, quality_fn=quality, now=NOW)
-        self.assertEqual(len(provider.calls), 5)
-        self.assertEqual(len(set(provider.calls)), 5)
-        self.assertEqual(result["passedCount"], 5)
+        self.assertEqual(len(provider.calls), 6)
+        self.assertEqual(len(set(provider.calls)), 6)
+        self.assertEqual(result["sampleCount"], 6)
+        self.assertEqual(result["passedCount"], 6)
         self.assertFalse(result["provesFullCollection"])
         self.assertFalse(result["productionDataUpdated"])
         self.assertTrue(all(type(item["elapsedSeconds"]) in (int, float) and item["elapsedSeconds"] >= 0 for item in result["results"]))
@@ -95,14 +121,14 @@ class VerifyRepairTests(unittest.TestCase):
         self.assertFalse(verify.evaluate(sample, {}, fund, quality())["checks"]["sourcePage"])
 
     def test_correct_manager_names_alone_do_not_pass_without_pdf_quality(self):
-        sample = verify.SAMPLES[-1]
+        sample = verify.SAMPLES[4]
         fund = normalized(sample)
         fund["managerAttribution"] = "tenure-overlap"
         result = verify.evaluate(sample, {}, fund, {"fields": {"managers": "missing"}})
         self.assertFalse(result["checks"]["reportAttribution"])
         self.assertFalse(result["checks"]["normalizedQuality"])
 
-    def test_download_failure_is_fixed_code_and_other_four_samples_continue(self):
+    def test_download_failure_is_fixed_code_and_other_five_samples_continue(self):
         class Failed(FakeProvider):
             def report_details(self, document, max_pages):
                 self.calls.append(document["sourceUrl"])
@@ -111,24 +137,55 @@ class VerifyRepairTests(unittest.TestCase):
                 return {}
         provider = Failed()
         result = verify.run_verification(provider, normalize=normalized, quality_fn=quality, now=NOW)
-        self.assertEqual(len(provider.calls), 5)
-        self.assertEqual(result["passedCount"], 4)
+        self.assertEqual(len(provider.calls), 6)
+        self.assertEqual(result["passedCount"], 5)
         self.assertEqual(result["results"][0]["errorCode"], "REPAIR_VERIFICATION_FAILED")
         self.assertNotIn("private transient", json.dumps(result))
         self.assertGreaterEqual(result["results"][0]["elapsedSeconds"], 0)
 
     def test_actual_node_builder_preserves_synthetic_manager_proof(self):
-        from report_managers import parse_report_managers
-        sample = verify.SAMPLES[3]
-        table = "4.1 基金经理（或基金经理小组）简介\n姓名 职务 任本基金的基金经理期限 证券从业年限 说明 任职日期 离任日期\n刘洋 本基金基金经理 2017年10月28日 - 13年\n4.2 运作说明"
-        managers = parse_report_managers([""] * 5 + [table], sample)
-        details = {"parseMethod": "pypdf", "sourceTextHash": managers.coverage["sourceTextHash"], "navYuan": 10000,
-                   "pageStats": {"pageCount": 6, "totalPages": 6, "processedPages": 6, "charCount": 200,
-                                 "nonEmptyPages": 1, "truncated": False, "textStatus": "usable"},
-                   "reportManagers": managers, "managerTableCoverage": managers.coverage}
-        fund = verify.normalized_snapshot(sample, details, NOW)
-        measured = verify.report_quality(fund, verify.phase_for(sample), NOW)
-        self.assertEqual(verify.evaluate(sample, details, fund, measured)["status"], "passed")
+        from report_extract import _details_for_pages
+        for sample in verify.SAMPLES[3:5]:
+            pages = [""] * 8
+            pages[0] = sample["title"]
+            for index, (name, start, end, page) in enumerate(sample["managerRows"]):
+                header = "4.1 基金经理（或基金经理小组）简介\n姓名 职务 任本基金的基金经理期限 证券从业年限 说明 任职日期 离任日期\n" if index == 0 else ""
+                pages[page - 1] = header + f"{name} 本基金基金经理 {start} {end or '-'} 13年\n"
+            pages[sample["managerRows"][-1][3] - 1] += "4.2 运作说明"
+            pages[6] = "4.4 报告期内基金的投资策略和运作分析\n本季度经济和市场回暖。我们增加债券配置，因为估值较为合理。"
+            pages[7] = "未来本基金将关注科技方向。\n4.5 报告期内基金的业绩表现\n合成结束"
+            details = _details_for_pages(pages, sample["sourceUrl"], sample["periodEnd"], sample["kind"],
+                                         lambda *_: {"navYuan": 10000}, total_pages=8, published_at=sample["publishedAt"])
+            details["parseMethod"] = "pypdf"
+            fund = verify.normalized_snapshot(sample, details, NOW)
+            measured = verify.report_quality(fund, verify.phase_for(sample), NOW)
+            result = verify.evaluate(sample, details, fund, measured)
+            self.assertEqual(result["status"], "passed", result["checks"])
+            self.assertEqual(fund["selectedReport"]["strategyEvidenceRetrievedAt"], NOW.isoformat())
+            self.assertNotIn("sections", details["strategyAnalysis"])
+
+    def test_both_manager_samples_require_complete_quarter_strategy_and_selected_evidence(self):
+        for sample in verify.SAMPLES[3:5]:
+            fund = normalized(sample)
+            result = verify.evaluate(sample, {}, fund, quality())
+            self.assertEqual(result["status"], "passed")
+            self.assertEqual(result["observed"]["strategy"]["pages"], [7, 8])
+            self.assertFalse(result["observed"]["strategy"]["semanticAnalysisComplete"])
+            self.assertNotIn("市场回暖", json.dumps(result, ensure_ascii=False))
+            for field, value in [("complete", False), ("periodStart", "2026-01-01"),
+                                 ("sourceUrl", "https://example.org/other.pdf"), ("publishedAt", "2026-10-25")]:
+                broken = normalized(sample)
+                broken["selectedReport"]["strategySectionCoverage"][field] = value
+                self.assertEqual(verify.evaluate(sample, {}, broken, quality())["status"], "failed")
+            for category in ("market-review", "portfolio-operations", "outlook"):
+                broken = normalized(sample)
+                broken["selectedReport"]["strategyAnalysis"]["evidence"] = [item for item in broken["selectedReport"]["strategyAnalysis"]["evidence"] if category not in item["categories"]]
+                self.assertFalse(verify.evaluate(sample, {}, broken, quality())["checks"]["strategyCategories"])
+            broken = normalized(sample)
+            broken["selectedReport"]["strategyAnalysis"]["semanticAnalysisComplete"] = True
+            self.assertFalse(verify.evaluate(sample, {}, broken, quality())["checks"]["selectedEvidence"])
+            measured = quality(); measured["fields"]["strategy"] = "partial"
+            self.assertFalse(verify.evaluate(sample, {}, normalized(sample), measured)["checks"]["strategyQuality"])
 
     def test_foreign_cells_cross_actual_proof_builder_and_normalization_bridge(self):
         from foreign_holdings import parse_foreign_equity_grids
@@ -158,6 +215,18 @@ class VerifyRepairTests(unittest.TestCase):
             fund = verify.normalized_snapshot(sample, details, NOW)
             measured = verify.report_quality(fund, verify.phase_for(sample), NOW)
             self.assertEqual(verify.evaluate(sample, details, fund, measured)["status"], "passed")
+
+    def test_sixth_nonstock_proof_crosses_real_builder_quality_and_strict_evaluation(self):
+        sample = verify.SAMPLES[5]
+        details = {"navYuan": 10000, "noEquitiesEvidence": nonstock_proof(sample)}
+        fund = verify.normalized_snapshot(sample, details, NOW)
+        measured = verify.report_quality(fund, verify.phase_for(sample), NOW)
+        result = verify.evaluate(sample, details, fund, measured)
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["observed"]["pages"], [8, 12, 13])
+        self.assertNotIn("text", json.dumps(result))
+        fund["selectedReport"]["noEquitiesEvidence"]["otherAssetsTable"]["total"]["amount"] = "0.00"
+        self.assertFalse(verify.evaluate(sample, details, fund, measured)["checks"]["closedTableProof"])
 
 
 if __name__ == "__main__":

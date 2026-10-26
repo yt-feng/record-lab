@@ -1,10 +1,12 @@
 (function (root, factory) {
   'use strict';
   const api = factory(typeof module === 'object' && module.exports ? require('./lifecycle') : root.RecordLabLifecycle,
-    typeof module === 'object' && module.exports ? require('./zero-stock') : root.RecordLabZeroStock);
+    typeof module === 'object' && module.exports ? require('./zero-stock') : root.RecordLabZeroStock,
+    typeof module === 'object' && module.exports ? require('./nonstock-assets') : root.RecordLabNonstockAssets,
+    typeof module === 'object' && module.exports ? require('./strategy-sections') : root.RecordLabStrategySections);
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root && root.document) api.mount(root.document, root);
-})(typeof globalThis !== 'undefined' ? globalThis : this, function (lifecycle, zeroStock) {
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (lifecycle, zeroStock, nonstockAssets, strategySections) {
   'use strict';
 
   const CHANGE_GROUPS = {
@@ -19,6 +21,21 @@
   const validTimestamp = value => typeof value === 'string' && dateOnly(value.slice(0, 10)) && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value) && !Number.isNaN(Date.parse(value));
   const nullableText = value => value === null || typeof value === 'string';
   const countValue = value => Number.isInteger(value) && value >= 0;
+  const STRATEGY_CATEGORIES = { 'market-review': '市场回顾', 'portfolio-operations': '组合操作表述', outlook: '后市展望', unclassified: '其他说明' };
+  function strategyEvidence(report, asOf = null, retrievedAt = null) {
+    const proof = strategySections?.strategySectionCoverageFor(report?.strategySectionCoverage, report?.periodEnd);
+    const month = Number(report?.periodEnd?.slice(5, 7));
+    const start = `${report?.periodEnd?.slice(0, 4)}-${String(month - 2).padStart(2, '0')}-01`;
+    const current = proof?.kind === 'quarterly' && proof.periodStart === start;
+    const observedAt = report?.strategyEvidenceRetrievedAt || retrievedAt;
+    const ceiling = validTimestamp(retrievedAt) ? Date.parse(retrievedAt) : dateOnly(asOf) ? Date.parse(asOf + 'T23:59:59Z') : NaN;
+    const observed = observedAt ? validTimestamp(observedAt) && Date.parse(observedAt) <= ceiling + 300000
+      && proof?.publishedAt <= observedAt.slice(0, 10) : dateOnly(asOf) && proof?.publishedAt <= asOf;
+    return { proof, analysis: proof && current && observed ? strategySections.strategyAnalysisFor(report?.strategyAnalysis, proof) : null,
+      complete: Boolean(current && observed && proof.complete), label: !proof ? '策略章节尚未完整核验' : !current ? '说明覆盖期并非本季度，未计入本季完整度'
+        : !observed ? '策略公告日期与当前观测时点尚未核对'
+        : proof.complete ? '本季度投资策略和运作分析章节已完整提取' : '本季度策略章节仍有缺页、边界或文本待核验' };
+  }
   const MAX_DATA_BYTES = 80 * 1024 * 1024;
   function safeCompanyPath(path) { return typeof path === 'string' && /^\.\/data\/companies\/[A-Za-z0-9_-]+\.json(?:\.gz)?$/.test(path) ? path : null; }
   function companyPages(manifest, code) { return (manifest?.companyFiles || []).filter(file => file.companyCode === code).slice().sort((a, b) => (a.partIndex || 1) - (b.partIndex || 1)); }
@@ -162,12 +179,13 @@
     } catch (_) { return null; }
   }
   function validEmptyStockEvidence(evidence, report, asOf) {
-    if (!isRecord(evidence) || !['empty-stock-detail-section', 'zero-stock-balance-sheet', 'explicit-no-stock-detail'].includes(evidence.evidenceType) || !isRecord(report) ||
+    if (!isRecord(evidence) || !['empty-stock-detail-section', 'zero-stock-balance-sheet', 'explicit-no-stock-detail', 'exhaustive-nonstock-assets'].includes(evidence.evidenceType) || !isRecord(report) ||
       evidence.confirmed !== true || !['quarterly', 'semiannual', 'annual'].includes(evidence.kind) || evidence.kind !== report.kind ||
-      typeof evidence.text !== 'string' || evidence.text.length > 600 ||
       !Number.isInteger(evidence.page) || evidence.page < 1 || !safeHttpUrl(evidence.sourceUrl) ||
       evidence.sourceUrl !== report.sourceUrl || evidence.periodEnd !== report.periodEnd || evidence.publishedAt !== report.publishedAt ||
       !dateOnly(evidence.periodEnd) || !dateOnly(evidence.publishedAt) || !dateOnly(asOf) || evidence.periodEnd > evidence.publishedAt || evidence.publishedAt > asOf) return false;
+    if (evidence.evidenceType === 'exhaustive-nonstock-assets') return nonstockAssets?.validNonstockAssets(evidence) === true;
+    if (typeof evidence.text !== 'string' || evidence.text.length > 600) return false;
     if (evidence.evidenceType === 'zero-stock-balance-sheet') return zeroStock?.validZeroStock(evidence) === true;
     if (evidence.evidenceType === 'explicit-no-stock-detail') return zeroStock?.validExplicitNoStock(evidence) === true;
     if (typeof evidence.assetAllocationText !== 'string' || evidence.assetAllocationText.length > 600) return false;
@@ -216,7 +234,7 @@
         const evidence = fund.noEquitiesEvidence || fund.selectedReport?.noEquitiesEvidence;
         if (!isRecord(evidence) || evidence.confirmed !== true || !safeHttpUrl(evidence.sourceUrl) || evidence.periodEnd !== fund.selectedReport.periodEnd
           || fund.rows.some(row => row.current != null || !row.previous) || (fund.rows.length && !isRecord(fund.previousReport))) fail();
-        if (['empty-stock-detail-section', 'zero-stock-balance-sheet', 'explicit-no-stock-detail'].includes(evidence.evidenceType)) {
+        if (['empty-stock-detail-section', 'zero-stock-balance-sheet', 'explicit-no-stock-detail', 'exhaustive-nonstock-assets'].includes(evidence.evidenceType)) {
           if (!validEmptyStockEvidence(evidence, fund.selectedReport, data.asOf)) fail();
         } else {
           const text = typeof evidence.text === 'string' ? evidence.text.replace(/\s+/g, '') : '';
@@ -772,7 +790,7 @@
         ? (fund.notApplicableEvidence.reason === 'TERMINATED_BEFORE_PERIOD' ? '不适用：季末前已终止' : '不适用：季末后成立')
         : fund.selectedReport ? '持仓解析待补' : '报告暂缺'));
       if (fund.status === 'no-equities') title.append(el('span', 'badge success',
-        (fund.noEquitiesEvidence || fund.selectedReport?.noEquitiesEvidence)?.evidenceType === 'zero-stock-balance-sheet'
+        ['zero-stock-balance-sheet', 'exhaustive-nonstock-assets'].includes((fund.noEquitiesEvidence || fund.selectedReport?.noEquitiesEvidence)?.evidenceType)
           ? '期末股票账面金额为零' : '报告确认期末未持股'));
       if (fund.dataStatus === 'cached') title.append(el('span', 'badge warning', '保留的有效记录'));
       heading.append(title);
@@ -792,6 +810,8 @@
       if (directoryCompany?.directoryStatus === 'stale') addMetadata(metadata, '机构归属', companyDirectoryLabel(directoryCompany));
       if (fund.asOf) addMetadata(metadata, '该基金观察截至', fund.asOf);
       if (fund.retrievedAt) addMetadata(metadata, '该基金采集', fund.retrievedAt);
+      if (validTimestamp(fund.priceUpdatedAt)) addMetadata(metadata, '行情单独更新', fund.priceUpdatedAt);
+      if (validTimestamp(fund.selectedReport?.strategyEvidenceRetrievedAt)) addMetadata(metadata, '策略原文采集', fund.selectedReport.strategyEvidenceRetrievedAt);
       addMetadata(metadata, '期末净资产', formatMoney(fund.selectedReport?.navYuan));
       addMetadata(metadata, '公告日', fund.selectedReport?.publishedAt);
       addMetadata(metadata, '报告范围', { top10: '前十大重仓股', full: '完整持仓', unknown: '未提供' }[fund.selectedReport?.coverage]);
@@ -843,8 +863,18 @@
         body.append(note);
       } else if (fund.status === 'no-equities') {
         const evidence = fund.noEquitiesEvidence || fund.selectedReport?.noEquitiesEvidence;
-        const note = emptyState(evidence?.evidenceType === 'zero-stock-balance-sheet' ? '报告期末股票投资账面金额为零' : '报告确认本期期末未持有股票', evidence?.text || '按报告证据记录本期期末无股票持仓，不按基金类型推断。', true);
-        if (evidence?.evidenceType === 'empty-stock-detail-section') {
+        const bookZero = ['zero-stock-balance-sheet', 'exhaustive-nonstock-assets'].includes(evidence?.evidenceType);
+        const note = emptyState(bookZero ? '报告期末股票投资账面金额为零' : '报告确认本期期末未持有股票',
+          evidence?.evidenceType === 'exhaustive-nonstock-assets'
+            ? '期末资产组合和其他资产明细逐项按分核对至合计，非股票项目解释全部资产；结论仅对应本期期末股票投资账面金额。'
+            : evidence?.text || '按报告证据记录本期期末无股票持仓，不按基金类型推断。', true);
+        if (evidence?.evidenceType === 'exhaustive-nonstock-assets') {
+          for (const table of [evidence.assetTable, evidence.otherAssetsTable]) {
+            note.append(el('p', 'narrative-meta', `原 PDF 第 ${table.pageNumbers.join('、')} 页 · ${table.heading}`),
+              el('p', 'narrative-text', table.text));
+            addLink(note, '查看原表 ↗', `${evidence.sourceUrl}#page=${table.startPage}`);
+          }
+        } else if (evidence?.evidenceType === 'empty-stock-detail-section') {
           note.append(el('p', 'narrative-meta', `同一物理页第 ${evidence.page} 页 · 股票明细原文与资产组合表共同核验`),
             el('p', 'narrative-text', evidence.assetAllocationText));
         } else if (evidence?.page) note.append(el('p', 'narrative-meta', `原报告第 ${evidence.page} 页`));
@@ -872,13 +902,23 @@
       } else narrative.append(el('p', 'narrative-meta', '尚未提取到可核验的经理运作说明，请查看原报告；不自动推断换仓逻辑。'));
       body.append(narrative);
       const evidence = fund.selectedReport || {};
-      const excerpts = Array.isArray(evidence.strategyExcerpts) ? evidence.strategyExcerpts : [];
+      const structuredStrategy = strategyEvidence(evidence, state.data?.asOf, state.data?.retrievedAt);
+      const excerpts = structuredStrategy.analysis?.evidence.length ? structuredStrategy.analysis.evidence
+        : Array.isArray(evidence.strategyExcerpts) ? evidence.strategyExcerpts : [];
       const themes = Array.isArray(evidence.strategyThemes) ? evidence.strategyThemes : [];
-      if (evidence.parseMethod || excerpts.length || themes.length) {
+      if (evidence.parseMethod || excerpts.length || themes.length || structuredStrategy.proof) {
         const strategy = el('section', 'narrative strategy-evidence');
         const strategyTitle = el('div', 'narrative-title');
         strategyTitle.append(el('h4', '', '报告解析出的策略要点'));
         strategy.append(strategyTitle);
+        strategy.append(el('p', 'narrative-meta', structuredStrategy.label));
+        if (structuredStrategy.proof) addLink(strategy, '策略章节原文 ↗', structuredStrategy.proof.sourceUrl);
+        if (structuredStrategy.analysis) {
+          const analysis = structuredStrategy.analysis;
+          strategy.append(el('p', 'narrative-meta', `原章节 ${analysis.sentenceCount} 句 · 展示 ${analysis.selectedSentenceCount} 条短引文 · 其余 ${analysis.omittedSentenceCount} 句请读原报告。分类可重叠，按原文措辞归类，不代表全文语义分析已完成。`));
+          const counts = Object.entries(analysis.categorySentenceCounts).map(([key, value]) => `${STRATEGY_CATEGORIES[key]} ${value} 句`);
+          strategy.append(el('p', 'narrative-meta', counts.join(' · ')));
+        }
         if (evidence.parseMethod) {
           const methodLabels = { mineru: 'MinerU', pypdf: 'pypdf', 'pypdf-fallback': 'pypdf 回退' };
           const method = methodLabels[evidence.parseMethod] || evidence.parseMethod;
@@ -891,14 +931,16 @@
             strategy.append(el('p', 'narrative-meta', `已处理页数 ${processed} / 原文件页数 ${total}${pages.truncated === true ? ' · 文本被截断，需继续解析' : ''}${pages.textStatus === 'sparse' ? ' · 文本不足，需补解析' : ''}`));
           }
         }
-        if (themes.length) strategy.append(el('p', 'narrative-meta', `主题：${themes.join(' · ')}`));
+        if (!structuredStrategy.analysis && themes.length) strategy.append(el('p', 'narrative-meta', `主题：${themes.join(' · ')}`));
         excerpts.forEach(item => {
           const row = el('p', 'narrative-text');
+          if (item.categories) strategy.append(el('p', 'narrative-meta', item.categories.map(key => STRATEGY_CATEGORIES[key]).filter(Boolean).join(' · ')));
           row.append(doc.createTextNode(item.text));
           row.append(doc.createTextNode(item.page ? `（第 ${item.page} 页）` : '（页码未核验）'));
           const source = el('span', 'cell-sub');
           if (addLink(source, '原文来源 ↗', item.sourceUrl)) row.append(doc.createTextNode(' '), source);
           strategy.append(row);
+          if (item.quoteTruncated) strategy.append(el('p', 'narrative-meta', '该句仅展示短引文，完整表述见原报告。'));
         });
         strategy.append(el('p', 'narrative-note', '以上为报告原文摘录与规则主题归类；不把报告层面的观点自动解释为单只证券的交易动机。'));
         body.append(strategy);
@@ -1097,5 +1139,5 @@
   }
 
   return { validateDataset, validateCatalog, validateProgress, validatePeriods, selectQuarter, periodDataPath, validatePeriodDataset, responseText, researchOverview, notApplicableBreakdown, retryState, formatRetryAt, fundQuality, catalogComplete, catalogFreshness, companyDirectoryLabel, safeCompanyPath, companyPages, companyRecordSummaries, catalogIndex, companyCoverage, coverageOverview, safeHttpUrl, validEmptyStockEvidence, managerNames, managerAttributionLabel, managerTermLabel, reportPeriod, changeGroup, latestFunds, filterFunds,
-    formatNumber, formatMoney, signed, holdingValue, priceDescription, csvCell, exportCsv, observationState, mount };
+    strategyEvidence, formatNumber, formatMoney, signed, holdingValue, priceDescription, csvCell, exportCsv, observationState, mount };
 });

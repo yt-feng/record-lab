@@ -441,7 +441,7 @@ def parse_pdf_pages(pages, source_url, period_end, kind):
             "shareClassCodes": class_codes}
 
 
-def parse_no_equities(pages, report):
+def parse_no_equities(pages, report, *, include_nonstock=True, page_numbers=None):
     pattern = re.compile(r"(?:本基金)?(?:本报告期末|报告期末|截至(?:本)?报告期末)[，,:：]?(?:本基金)?(?:未持有|未投资于|未投资)股票(?:资产|投资|组合)?(?=[。；，]|$)")
     zero = r"(?:-|0(?:\.0+)?)"
     zero_rows = re.compile(r"(?m)^[ \t]*(?:[1-9]\d*[ \t]+)?权益投资[ \t]+" + zero + r"[ \t]+" + zero
@@ -473,7 +473,11 @@ def parse_no_equities(pages, report):
                     "publishedAt": report["publishedAt"], "kind": report["kind"], "title": report["title"],
                     "page": page_num, "text": detail.group(1).strip(), "assetAllocationText": rows[0].strip()}
     from zero_stock import parse_zero_stock, parse_explicit_no_stock
-    return parse_explicit_no_stock(pages, report) or parse_zero_stock(pages, report)
+    result = parse_explicit_no_stock(pages, report) or parse_zero_stock(pages, report)
+    if result or not include_nonstock:
+        return result
+    from nonstock_assets import parse_nonstock_assets
+    return parse_nonstock_assets(pages, report, page_numbers=page_numbers)
 
 
 def parse_pdf_holdings(pages):
@@ -568,6 +572,8 @@ class PublicProvider:
         for attempt in range(attempts):
             try:
                 started = time.monotonic()
+                if callable(getattr(self, 'on_request', None)):
+                    self.on_request()
                 response = self.session.get(url, params=params, headers=headers, timeout=(connect_timeout, request_timeout), stream=True)
                 if response.status_code in (403, 404):
                     raise DataError("HTTP_REJECTED")
@@ -655,7 +661,9 @@ class PublicProvider:
             raise DataError("INVALID_PDF")
         def enrich(pages):
             holdings = parse_pdf_holdings(pages)
-            return {"noEquitiesEvidence": parse_no_equities(pages, report), "pdfHoldings": holdings,
+            # The common extractor owns verified physical page mappings for
+            # the multi-page proof, including MinerU's unknown page markers.
+            return {"noEquitiesEvidence": parse_no_equities(pages, report, include_nonstock=False), "pdfHoldings": holdings,
                     "pdfHoldingsMetadata": holdings.metadata}
         try:
             result = extract_report(data, report["sourceUrl"], report["periodEnd"], report["kind"],

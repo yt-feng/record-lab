@@ -341,11 +341,20 @@ def _details_for_pages(pages: list[str], source_url: str, period_end: str, kind:
             if isinstance(value, dict):
                 ordinal = value.get("page")
                 value["page"] = page_numbers[ordinal - 1] if isinstance(ordinal, int) and 1 <= ordinal <= len(page_numbers) else None
+    if not parsed.get("noEquitiesEvidence"):
+        from nonstock_assets import parse_nonstock_assets
+        parsed["noEquitiesEvidence"] = parse_nonstock_assets(pages,
+            {"sourceUrl": source_url, "periodEnd": period_end, "kind": kind, "publishedAt": published_at},
+            page_numbers=page_numbers)
     normalized = "\n\n".join(page.strip() for page in pages if page and page.strip())
     if not normalized:
         raise ExtractionError("PDF_TEXT_EMPTY")
     excerpts = strategy_excerpts(pages, source_url, period_end, kind,
                                  fallback_narrative=parsed.get("narrative"), page_numbers=page_numbers)
+    from strategy_sections import parse_strategy_sections
+    parsed.update(parse_strategy_sections(pages,
+        {"sourceUrl": source_url, "periodEnd": period_end, "kind": kind, "publishedAt": published_at},
+        page_numbers=page_numbers, securities=parsed.get("pdfHoldings")))
     parsed.update({"sourceTextHash": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
                    "pageStats": {"pageCount": len(pages), "processedPages": len(pages), "totalPages": total_pages,
                                   "nonEmptyPages": sum(bool(page.strip()) for page in pages),

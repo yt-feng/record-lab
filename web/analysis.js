@@ -1,13 +1,24 @@
 (function (root, factory) {
   'use strict';
-  const api = factory();
+  const api = factory(typeof module === 'object' && module.exports ? require('./strategy-sections') : root.RecordLabStrategySections);
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root && root.document) root.RecordAnalysis = api.mount(root.document, root);
-})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (strategySections) {
   'use strict';
   const object = x => x !== null && typeof x === 'object' && !Array.isArray(x);
   const finite = x => typeof x === 'number' && Number.isFinite(x);
   const count = x => Number.isInteger(x) && x >= 0;
+  const STRATEGY_CATEGORIES = { 'market-review': '市场回顾', 'portfolio-operations': '组合操作表述', outlook: '后市展望', unclassified: '其他说明' };
+  function strategyEvidence(strategy, target, asOf = null) {
+    const proof = strategySections?.strategySectionCoverageFor(strategy?.sectionCoverage, target);
+    const start = `${target?.slice(0, 4)}-${String(Number(target?.slice(5, 7)) - 2).padStart(2, '0')}-01`;
+    const current = proof?.kind === 'quarterly' && proof.periodStart === start;
+    const observedAt = strategy?.evidenceRetrievedAt;
+    const observed = typeof asOf === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(asOf)
+      && generationValue(observedAt) && observedAt.slice(0, 10) <= asOf && proof?.publishedAt <= observedAt.slice(0, 10);
+    return { proof, analysis: current && observed ? strategySections.strategyAnalysisFor(strategy?.analysis, proof) : null,
+      complete: Boolean(current && observed && proof.complete) };
+  }
   const generationValue = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(Date.parse(value));
   const money = x => finite(x) ? new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(x / 1e8) + ' 亿元' : '未取得';
   const url = value => { try { const u = new URL(value); return u.protocol === 'https:' && !u.username && !u.password ? u.href : null; } catch { return null; } };
@@ -51,6 +62,12 @@
         || !url(portfolio.report.sourceUrl) || !object(portfolio.strategy) || !Array.isArray(portfolio.strategy.excerpts)
         || portfolio.strategy.excerpts.some(item => !object(item) || typeof item.text !== 'string'
           || item.periodEnd !== snapshot.targetPeriodEnd || !url(item.sourceUrl)))) throw new Error('INVALID_ANALYSIS_PART');
+      for (const portfolio of part.portfolios) {
+        if (!portfolio.strategy.sectionCoverage) continue;
+        const value = strategyEvidence(portfolio.strategy, snapshot.targetPeriodEnd, snapshot.asOf);
+        if (!value.proof || value.proof.publishedAt > snapshot.asOf
+          || portfolio.strategy.analysis && !value.analysis) throw new Error('INVALID_ANALYSIS_PART');
+      }
     } else throw new Error('INVALID_ANALYSIS_PART');
     return part;
   }
@@ -169,9 +186,20 @@
             detail.append(link(`经理表原文 · 第 ${manager.evidence.page} 页 ↗`, manager.evidence.sourceUrl));
           }
           detail.append(link('持仓报告 ↗', report.sourceUrl));
-          const excerpts = portfolio.strategy?.excerpts || [];
+          const strategy = strategyEvidence(portfolio.strategy, snapshot.targetPeriodEnd, snapshot.asOf);
+          detail.append(element('p', strategy.complete ? '本季度策略章节已完整提取；以下为选摘。' : '本季度策略章节仍待完整核验；已有引文继续保留。', 'narrative-meta'));
+          if (strategy.analysis) {
+            const analysis = strategy.analysis;
+            const counts = Object.entries(analysis.categorySentenceCounts).map(([key, value]) => `${STRATEGY_CATEGORIES[key]} ${value} 句`).join(' · ');
+            detail.append(element('p', `${counts}。原章节 ${analysis.sentenceCount} 句，选摘 ${analysis.selectedSentenceCount} 条；分类可重叠，不代表全文语义分析已完成。`, 'narrative-meta'));
+          }
+          const excerpts = strategy.analysis?.evidence.length ? strategy.analysis.evidence
+            : (portfolio.strategy?.excerpts || []).map(item => ({ text: item.text, sourceUrl: item.sourceUrl, page: item.page }));
           for (const quote of excerpts) {
+            if (quote.categories) detail.append(element('p', quote.categories.map(key => STRATEGY_CATEGORIES[key]).filter(Boolean).join(' · '), 'narrative-meta'));
             detail.append(element('p', quote.text, 'narrative-text'));
+            if (quote.securityMentions?.some(item => item.market === stock.market && item.stockCode === stock.stockCode)) detail.append(element('p', '原文明确提及该证券；未据此认定具体交易或原因。', 'narrative-meta'));
+            if (quote.quoteTruncated) detail.append(element('p', '该句仅展示短引文，完整表述见原报告。', 'narrative-meta'));
             detail.append(link(`报告原文${quote.page ? ' · 第 ' + quote.page + ' 页' : ''} ↗`, quote.sourceUrl));
           }
           if (!excerpts.length) detail.append(element('p', '本季度经理观点尚未提取齐全。', 'narrative-meta'));
@@ -192,6 +220,8 @@
         data = value;
         $('analysis-status').textContent = `${selected} · ${data.stocks.length.toLocaleString()} 只证券已建立分析索引 · 观察截至 ${data.asOf || data.retrievedAt || '见来源'}。经理表完整 ${data.coverage.reportManagerRecords || 0} 条组合记录，部分 ${data.coverage.reportManagerPartialRecords || 0} 条，待补总计 ${data.coverage.managerEvidenceMissingRecords || 0} 条。当前为已采集样本，完整度以本季度覆盖清单为准。金额以人民币计，价格保留原币种。`;
         const themes = $('analysis-themes'); themes.replaceChildren(element('h3', '基金报告中的策略主题'));
+        if (generationValue(data.priceUpdatedAt)) themes.append(element('p', `行情单独更新 ${data.priceUpdatedAt}；报告原有观测日期保留。`, 'narrative-meta'));
+        themes.append(element('p', `策略章节完整提取 ${data.coverage.strategySectionCompleteRecords || 0} 条组合记录，待完整核验 ${data.coverage.strategySectionIncompleteRecords ?? data.coverage.analyzedRecords ?? 0} 条；已有摘录 ${data.coverage.strategyRecords || 0} 条。摘录可用与整节完整分开计数。`, 'narrative-meta'));
         themes.append(element('p', '主题按本季度报告原文规则归类；计数为有对应表述的组合，不能解释为全行业结论或单只股票交易动机。', 'filter-tip'));
         const list = element('div', undefined, 'analysis-theme-list');
         for (const theme of data.themes) if (typeof theme.name === 'string' && count(theme.portfolioCount)) list.append(element('span', `${theme.name} · ${theme.portfolioCount} 个组合`, 'badge'));
@@ -209,5 +239,5 @@
     });
     return { loadQuarter, reset };
   }
-  return { validate, validatePart, safePath, selectStocks, csv, mount };
+  return { validate, validatePart, safePath, selectStocks, strategyEvidence, csv, mount };
 });
