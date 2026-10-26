@@ -1,0 +1,60 @@
+name: Verify supplemental fund announcement discovery
+on:
+  workflow_dispatch:
+    inputs:
+      as_of:
+        description: Last publication date to inspect (clamped to actual current date)
+        required: true
+        default: '2026-10-26'
+        type: string
+      include_q2_late:
+        description: Extend Q2 beyond July through as_of for late or corrected reports
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: verify-cninfo-discovery
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/cninfo_discovery.py
+            /scripts/publication_guard.py
+            /scripts/publication_cache.py
+            /tests/test_cninfo_discovery.py
+            /.github/workflows/verify-cninfo.yml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test discovery boundaries without network
+        run: python -m unittest discover -s tests -p 'test_cninfo_discovery.py'
+      - name: Enumerate bounded public announcement windows without PDFs
+        env:
+          DISCOVERY_AS_OF: ${{ inputs.as_of }}
+          DISCOVERY_Q2_LATE: ${{ inputs.include_q2_late }}
+        run: |
+          args=(--as-of "$DISCOVERY_AS_OF")
+          if [ "$DISCOVERY_Q2_LATE" = "true" ]; then args+=(--include-q2-late); fi
+          python scripts/cninfo_discovery.py "${args[@]}"
+      - name: Retain guarded metadata candidates and explicit coverage limits
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supplemental-cninfo-discovery
+          path: |
+            .cache/cninfo-discovery/summary.json
+            .cache/cninfo-discovery/candidates.json
+            .cache/cninfo-discovery/announcements-2026Q?-*.json
+            .cache/cninfo-discovery/codes-2026Q?-*.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
