@@ -318,6 +318,25 @@ test('a whole batch of officially confirmed no-equity funds is a valid publicati
   assert.equal(result.funds[1].selectedReport.kind, 'unknown');
 });
 
+test('empty stock detail requires the matching zero equity and stock allocation rows', () => {
+  const evidence = noEquitiesEvidence({ evidenceType: 'empty-stock-detail-section',
+    text: '7.3 期末按公允价值占基金资产净值比例大小排序的所有股票投资明细\n无。',
+    assetAllocationText: '1 权益投资 - -\n其中：股票 - -' });
+  assert.equal(isValidNoEq(evidence, { asOf: '2026-09-29' }), true);
+  assert.equal(isValidNoEq({ ...evidence, assetAllocationText: '1 权益投资 0.00 0.00\n其中：股票 0 0' }, { asOf: '2026-09-29' }), true);
+  for (const change of [{ text: '7.4 债券投资明细\n无。' }, { text: '无。' },
+    { assetAllocationText: '1 权益投资 - -' }, { assetAllocationText: '1 权益投资 - -\n其中：股票 0.01 0.00' },
+    { assetAllocationText: '1 权益投资 1.00 0.00\n其中：股票 - -' }, { assetAllocationText: undefined },
+    { page: null }, { evidenceType: 'unverified' }]) {
+    assert.equal(isValidNoEq({ ...evidence, ...change }, { asOf: '2026-09-29' }), false);
+  }
+  const result = build(raw([fund('000001', { reports: [], noEquitiesEvidence: evidence })]));
+  assert.equal(result.funds[0].status, 'no-equities');
+  assert.equal(result.funds[0].noEquitiesEvidence.evidenceType, evidence.evidenceType);
+  assert.equal(result.funds[0].noEquitiesEvidence.assetAllocationText, evidence.assetAllocationText);
+  assert.equal(result.funds[0].selectedReport.kind, 'quarterly');
+});
+
 test('a newer official no-equity report replaces former holdings while a same-date contradiction preserves them', () => {
   const older = report({ periodEnd: '2026-03-31', publishedAt: '2026-04-20' });
   const previous = build(raw([fund('000001', { reports: [older] })]));

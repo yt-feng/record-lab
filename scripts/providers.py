@@ -303,6 +303,7 @@ def parse_announcements(data, as_of, expected_code=None):
 
 def parse_pdf_pages(pages, source_url, period_end, kind):
     """Conservative extraction of one NAV cell and one bounded strategy excerpt."""
+    from report_extract import strategy_section_end
     nav = None
     narrative = None
     joined_intro = "\n".join(pages[:5])
@@ -354,11 +355,11 @@ def parse_pdf_pages(pages, source_url, period_end, kind):
             section_pages = []
             for index in range(page_num - 1, min(len(pages), page_num + 2)):
                 page_text = tail if index == page_num - 1 else pages[index]
-                chunks = re.split(r"\n\s*(?:\d+\.){1,2}\d*\s*(?:报告期内基金|管理人对|基金的业绩|宏观经济)", page_text, maxsplit=1)
-                clean = re.sub(r"第\s*\d+\s*页\s*共\s*\d+\s*页", "", chunks[0])
+                boundary = strategy_section_end(page_text)
+                clean = re.sub(r"第\s*\d+\s*页\s*共\s*\d+\s*页", "", page_text if boundary is None else page_text[:boundary])
                 clean = re.sub(r"\s+", "", clean).strip()
                 section_pages.append((index + 1, clean))
-                if len(chunks) > 1:
+                if boundary is not None:
                     break
             candidates = []
             for number_, page_text in section_pages:
@@ -392,6 +393,12 @@ def parse_pdf_pages(pages, source_url, period_end, kind):
 
 def parse_no_equities(pages, report):
     pattern = re.compile(r"(?:本基金)?(?:本报告期末|报告期末|截至(?:本)?报告期末)[，,:：]?(?:本基金)?(?:未持有|未投资于|未投资)股票(?:资产|投资|组合)?(?=[。；，]|$)")
+    zero = r"(?:-|0(?:\.0+)?)"
+    zero_rows = re.compile(r"(?m)^[ \t]*(?:[1-9]\d*[ \t]+)?权益投资[ \t]+" + zero + r"[ \t]+" + zero
+                           + r"[ \t]*\r?\n[ \t]*其中[：:][ \t]*股票[ \t]+" + zero + r"[ \t]+" + zero + r"[ \t]*(?=\r?$)")
+    heading = r"\s*".join("期末按公允价值占基金资产净值比例大小排序的所有股票投资明细")
+    empty_detail = re.compile(r"(?m)^[ \t]*(\d+(?:\.\d+){1,2}[ \t]*" + heading
+                              + r"\s*(?:注\s*[:：]\s*)?无[。.]?)(?=[ \t]*(?:\r?\n|$))")
     for page_num, page in enumerate(pages, 1):
         compact = re.sub(r"\s+", "", page)
         match = pattern.search(compact)
@@ -399,6 +406,22 @@ def parse_no_equities(pages, report):
             return {"confirmed": True, "sourceUrl": report["sourceUrl"], "periodEnd": report["periodEnd"],
                     "publishedAt": report["publishedAt"], "kind": report["kind"], "title": report["title"],
                     "page": page_num, "text": match[0][:200]}
+        # Explicit empty full-stock detail plus a corroborating all-zero equity
+        # allocation row on this same physical page. A fund name or a missing
+        # stock table is never evidence of no holdings.
+        detail = empty_detail.search(page)
+        allocation = re.search(r"\d+(?:\.\d+){1,2}\s*(?:报告)?期末基金资产组合情况", page)
+        if not detail or not allocation or allocation.end() >= detail.start():
+            continue
+        section = re.split(r"\n\s*\d+(?:\.\d+){1,2}\s*[\u4e00-\u9fff]",
+                           page[allocation.end():detail.start()], maxsplit=1)[0]
+        header = re.sub(r"\s+", "", section[:400])
+        rows = zero_rows.search(section)
+        if rows and "金额" in header and "占基金总资产的比例" in header:
+            return {"confirmed": True, "evidenceType": "empty-stock-detail-section",
+                    "sourceUrl": report["sourceUrl"], "periodEnd": report["periodEnd"],
+                    "publishedAt": report["publishedAt"], "kind": report["kind"], "title": report["title"],
+                    "page": page_num, "text": detail.group(1).strip(), "assetAllocationText": rows[0].strip()}
     return None
 
 

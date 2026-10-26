@@ -218,6 +218,61 @@ test('no-equities records require report evidence and remain available without f
   assert.throws(() => ui.validateDataset(fixtureData([{ ...fund, noEquitiesEvidence: { confirmed: false } }])), /INVALID_DATASET/);
 });
 
+function fixtureEmptyStockFund() {
+  const fund = fixtureFund({ status: 'no-equities', rows: [] });
+  fund.selectedReport = { ...fund.selectedReport, holdings: [], noEquitiesConfirmed: true };
+  fund.noEquitiesEvidence = { confirmed: true, evidenceType: 'empty-stock-detail-section', kind: fund.selectedReport.kind,
+    sourceUrl: fund.selectedReport.sourceUrl, periodEnd: fund.selectedReport.periodEnd, publishedAt: fund.selectedReport.publishedAt,
+    page: 7, text: '5.3 期末按公允价值占基金资产净值比例大小排序的所有股票投资明细\n无。',
+    assetAllocationText: '1 权益投资 - -\n其中：股票 - -' };
+  return fund;
+}
+
+test('empty stock detail evidence requires both exact original excerpts and matching report metadata', () => {
+  for (const kind of ['quarterly', 'semiannual']) {
+    const fund = fixtureEmptyStockFund(); fund.selectedReport.kind = kind; fund.noEquitiesEvidence.kind = kind;
+    assert.equal(ui.validEmptyStockEvidence(fund.noEquitiesEvidence, fund.selectedReport, '2026-09-29'), true);
+    assert.equal(ui.validateDataset(fixtureData([fund])).funds[0].status, 'no-equities');
+    fund.noEquitiesEvidence.text = '5.3.1 期末按公允价值占基金资产净值比例大小排序的所有股票投资明细\n注：无。';
+    fund.noEquitiesEvidence.assetAllocationText = '权益投资 0.00 0\n其中: 股票 0 0.00';
+    assert.equal(ui.validateDataset(fixtureData([fund])).funds[0], fund);
+  }
+});
+
+test('empty stock detail evidence rejects nonzero amounts, incomplete tables and unrelated empty sections', () => {
+  const invalidEvidence = [
+    { assetAllocationText: '1 权益投资 10 0\n其中：股票 - -' },
+    { assetAllocationText: '1 权益投资 - -\n其中：股票 0 0.01' },
+    { assetAllocationText: '1 权益投资 0.001 0\n其中：股票 0 0' },
+    { assetAllocationText: '1 权益投资 - -' },
+    { assetAllocationText: '1 权益投资 - -\n其中：债券 - -' },
+    { assetAllocationText: '1 权益投资 - -\n其中：股票 - -\n2 固定收益投资 - -' },
+    { text: '5.4 期末按公允价值占基金资产净值比例大小排序的前十名股票投资明细\n无。' },
+    { text: '5.4 期末债券投资明细\n无。' },
+    { text: '无。' },
+    { text: '期末按公允价值占基金资产净值比例大小排序的所有股票投资明细无。' },
+    { text: '5.3.1.1 期末按公允价值占基金资产净值比例大小排序的所有股票投资明细无。' },
+    { evidenceType: 'trust-this-empty-section' },
+    { sourceUrl: 'https://example.org/other-report' },
+    { sourceUrl: 'javascript:alert(1)' },
+    { periodEnd: '2026-03-31' },
+    { publishedAt: '2026-07-21' },
+    { kind: 'annual' },
+    { kind: 'semiannual' },
+    { confirmed: false },
+    { page: null }, { page: 0 }, { page: -1 }, { page: 1.5 },
+    { text: ' '.repeat(601) }, { assetAllocationText: ' '.repeat(601) }
+  ];
+  for (const change of invalidEvidence) {
+    const fund = fixtureEmptyStockFund(); Object.assign(fund.noEquitiesEvidence, change);
+    assert.equal(ui.validEmptyStockEvidence(fund.noEquitiesEvidence, fund.selectedReport, '2026-09-29'), false, JSON.stringify(change));
+    assert.throws(() => ui.validateDataset(fixtureData([fund])), /INVALID_DATASET/, JSON.stringify(change));
+  }
+  const future = fixtureEmptyStockFund();
+  future.noEquitiesEvidence.publishedAt = future.selectedReport.publishedAt = '2026-09-30';
+  assert.throws(() => ui.validateDataset(fixtureData([future])), /INVALID_DATASET/);
+});
+
 function fixturePeriods() {
   return { schemaVersion: 1, defaultPeriod: '2026Q3', periods: [
     { id: '2026Q2', label: '2026Q2', path: './data/periods/2026Q2/', targetPeriodEnd: '2026-06-30', baselinePeriodEnd: '2026-03-31' },

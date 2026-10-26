@@ -109,6 +109,25 @@ if __name__ == "__main__":
     unittest.main()
 
 class ExtractionCoverageTests(unittest.TestCase):
+    def test_strategy_ending_on_current_page_never_leaks_following_portfolio_tables(self):
+        pages = ["4.4 报告期内基金的投资策略和运作分析\n本基金本季度继续配置高等级信用债，并根据流动性安排组合。\n"
+                 "4.5 报告期内基金的业绩表现\n本基金本季度业绩表现良好。\n§5 投资组合报告",
+                 "5.1 报告期末基金资产组合情况\n本基金组合金额为合成数据。\n5.3 基金投资组合平均剩余期限\n组合期限为合成数据。",
+                 "5.5 报告期末按债券品种分类的债券投资组合\n本基金组合持有债券。"]
+        result = report_extract.strategy_excerpts(pages, "https://example.org/report.pdf", "2026-06-30", "quarterly")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["page"], 1)
+        self.assertNotIn("5.1", result[0]["text"])
+
+    def test_strategy_boundary_on_continuation_page_stops_all_later_pages(self):
+        pages = ["4.4 报告期内基金投资策略和运作分析",
+                 "本基金依据企业经营与估值水平调整组合，保持组合流动性。\n§5 投资组合报告\n5.1 资产组合情况",
+                 "本基金投资组合平均剩余期限为合成指标。"]
+        result = report_extract.strategy_excerpts(pages, "https://example.org/report.pdf", "2026-06-30", "quarterly")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["page"], 2)
+        self.assertNotIn("投资组合报告", result[0]["text"])
+
     def test_unmarked_markdown_does_not_invent_pdf_page_numbers(self):
         text = "4.4 报告期内基金投资策略和运作分析\n本基金根据企业经营和估值调整组合。\n---\n后续说明"
         self.assertEqual(markdown_page_records(text), [(None, text)])

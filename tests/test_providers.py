@@ -280,6 +280,38 @@ if __name__ == "__main__":
     unittest.main()
 
 class ReportRecoveryTests(unittest.TestCase):
+    def test_narrative_stops_at_major_section_when_performance_heading_is_absent(self):
+        pages = ["4.4 报告期内基金投资策略和运作分析\n本基金本季度依据基本面与估值水平调整投资组合，同时关注资产流动性及行业配置变化。\n§5 投资组合报告",
+                 "5.1 报告期末基金资产组合情况\n本基金组合调整增加降低增持减持配置表格。"]
+        result = parse_pdf_pages(pages, "https://example.org/report.pdf", "2026-06-30", "quarterly")
+        self.assertEqual(result["narrative"]["page"], 1)
+        self.assertNotIn("表格", result["narrative"]["text"])
+
+    def test_empty_all_stock_detail_requires_same_page_zero_equity_and_stock_rows(self):
+        from providers import parse_no_equities
+        report = {"sourceUrl": "https://example.org/report.pdf", "periodEnd": "2026-06-30",
+                  "publishedAt": "2026-08-31", "kind": "semiannual", "title": "合成中期报告"}
+        page = ("7.1 期末基金资产组合情况\n金额单位：人民币元\n序号 项目 金额 占基金总资产的比例\n（%）\n"
+                "1 权益投资 - -\n其中：股票 - -\n2 固定收益投资 100.00 100.00\n"
+                "7.2 报告期末按行业分类的股票投资组合\n无。\n"
+                "7.3 期末按公允价值占基金资产净值比例大小排序的所有股票投资明细\n无。\n"
+                "7.4 报告期内股票投资组合的重大变动\n无。")
+        evidence = parse_no_equities(["合成封面", page], report)
+        self.assertEqual(evidence["page"], 2)
+        self.assertEqual(evidence["evidenceType"], "empty-stock-detail-section")
+        self.assertEqual(evidence["assetAllocationText"], "1 权益投资 - -\n其中：股票 - -")
+        self.assertEqual(evidence["text"], "7.3 期末按公允价值占基金资产净值比例大小排序的所有股票投资明细\n无。")
+        self.assertEqual(evidence["kind"], "semiannual")
+        self.assertNotIn("未持有", evidence["text"])
+        self.assertTrue(parse_no_equities([page.replace("- -", "0.00 0.00")], report)["confirmed"])
+        self.assertIsNone(parse_no_equities([page.replace("其中：股票 - -", "其中：股票 1.00 0.01")], report))
+        self.assertIsNone(parse_no_equities([page.replace("1 权益投资 - -", "1 权益投资 1.00 0.01")], report))
+        self.assertIsNone(parse_no_equities([page.replace("其中：股票 - -\n", "")], report))
+        self.assertIsNone(parse_no_equities([page.replace("所有股票投资明细", "前十名股票投资明细")], report))
+        self.assertIsNone(parse_no_equities([page.replace("所有股票投资明细", "受限股票投资明细")], report))
+        self.assertIsNone(parse_no_equities(page.split("7.3 "), report))
+        self.assertIsNone(parse_no_equities([page.replace("无。\n7.4", "无。只是合成样例\n7.4")], report))
+
     def test_share_class_nav_sum_requires_known_exact_columns(self):
         pages = ["基金主代码 000001\n下属分级基金的基金简称 示例A 示例C\n下属分级基金的交易代码 000001 000002\n4.期末基金资产净值 10,000,000.00 20,000,000.00\n5.期末基金份额净值 1.1234 1.3456"]
         result = parse_pdf_pages(pages, "https://example.org/report.pdf", "2026-09-30", "quarterly")

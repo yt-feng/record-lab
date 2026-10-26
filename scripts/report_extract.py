@@ -228,8 +228,19 @@ _STRATEGY_HEADING = re.compile(
     r"(?:报告期内基金(?:的)?投资策略和运作分析|报告期内基金投资策略和运作分析|"
     r"管理人对报告期内本基金的投资策略和业绩表现的说明)", re.I,
 )
-_SECTION_END = re.compile(r"(?:基金的业绩表现|报告期内基金的投资策略和运作分析|基金份额持有人信息|其他重要事项)")
+_SECTION_END = re.compile(
+    r"(?:基金的业绩表现|报告期内基金的投资策略和运作分析|基金份额持有人信息|其他重要事项)"
+    r"|§\s*\d+\s*[^\d\s]"
+    r"|(?:^|\n)\s*(?:#{1,6}\s*)?\d+(?:\.\d+){1,3}\s*"
+    r"(?:报告期|期末|基金|管理人对|投资组合|财务|托管人|重要事项|资产负债|利润表|备查)",
+)
 _STRATEGY_WORDS = re.compile(r"本基金|组合|配置|增持|减持|增配|减配|调整|买入|卖出|估值|行业|仓位|基本面")
+
+
+def strategy_section_end(text: str) -> int | None:
+    """Find the next report heading without losing line/page boundaries."""
+    match = _SECTION_END.search(text)
+    return match.start() if match else None
 
 
 def strategy_excerpts(pages: list[str], source_url: str, period_end: str, kind: str,
@@ -240,24 +251,23 @@ def strategy_excerpts(pages: list[str], source_url: str, period_end: str, kind: 
     numbers = page_numbers or list(range(1, len(pages) + 1))
     for position, raw in enumerate(pages):
         page_number = numbers[position] if position < len(numbers) else position + 1
-        text = re.sub(r"\s+", " ", raw).strip()
+        text = raw.strip()
         match = _STRATEGY_HEADING.search(text)
         if not match:
+            continue
+        tail = text[match.end():]
+        if re.match(r"[ .·…]{3,}", tail):
             continue
         # Headings are often the last line of one PDF page and the actual
         # discussion starts on the next page. Carry the section forward until
         # its next report heading while retaining each sentence's page.
-        section_pages: list[tuple[int, str]] = [(page_number, text[match.end():])]
-        for next_position in range(position + 1, min(len(pages), position + 4)):
-            next_number = numbers[next_position] if next_position < len(numbers) else next_position + 1
-            next_text = re.sub(r"\s+", " ", pages[next_position]).strip()
-            section_pages.append((next_number, next_text))
-            if _SECTION_END.search(next_text):
-                break
-        for cited_page, section in section_pages:
-            end_match = _SECTION_END.search(section)
-            if end_match:
-                section = section[:end_match.start()]
+        for next_position in range(position, min(len(pages), position + 4)):
+            cited_page = numbers[next_position] if next_position < len(numbers) else next_position + 1
+            section = tail if next_position == position else pages[next_position]
+            end = strategy_section_end(section)
+            if end is not None:
+                section = section[:end]
+            section = re.sub(r"\s+", " ", section).strip()
             sentences = [part.strip() for part in re.split(r"(?<=[。！？；])", section) if len(part.strip()) >= 12]
             for sentence in sentences:
                 if not _STRATEGY_WORDS.search(sentence):
@@ -266,6 +276,9 @@ def strategy_excerpts(pages: list[str], source_url: str, period_end: str, kind: 
                                  "periodStart": _period_start(period_end, kind), "periodEnd": period_end})
                 if len(excerpts) >= 8:
                     return excerpts
+            if end is not None:
+                # A boundary ends the entire section, including following pages.
+                break
     if not excerpts and fallback_narrative and fallback_narrative.get("text"):
         excerpts.append({"text": str(fallback_narrative["text"])[:260], "sourceUrl": source_url,
                          "page": fallback_narrative.get("page"), "periodStart": fallback_narrative.get("periodStart"),

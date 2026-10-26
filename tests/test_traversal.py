@@ -587,6 +587,66 @@ class TraversalTests(unittest.TestCase):
         self.assertEqual(accepted["processedFunds"], 1)
         self.assertEqual(accepted["companies"][1]["withoutEquities"], 1)
 
+    def empty_stock_evidence(self):
+        return {"confirmed": True, "kind": "semiannual", "evidenceType": "empty-stock-detail-section",
+                "sourceUrl": "https://example.org/report.pdf", "periodEnd": "2026-06-30", "publishedAt": "2026-07-20",
+                "page": 38, "text": "7.3 期末按公允价值占基金资产净值比例大小排序的所有股票投资明细\n无。",
+                "assetAllocationText": "1 权益投资 - -\n其中：股票 - -"}
+
+    def test_empty_stock_section_requires_both_original_zero_asset_rows(self):
+        proof = self.empty_stock_evidence()
+        self.assertTrue(traversal.no_equities_content(proof))
+        for rows in ("1 权益投资 0 0.00\n其中：股票 0.00 0", "权益投资 - 0\n其中 股票 0.00 -"):
+            self.assertTrue(traversal.no_equities_content({**proof, "assetAllocationText": rows}))
+        for rows in ("1 权益投资 100 0.01\n其中：股票 - -", "1 权益投资 - -\n其中：股票 1 0",
+                     "1 权益投资 - -", "其中：股票 - -", "1 权益投资 - -\n其中：债券 - -",
+                     "1 权益投资 - -\n其中：股票 - -\n2 债券 100 100", "1 权益投资 - - 1\n其中：股票 - -"):
+            with self.subTest(rows=rows):
+                self.assertFalse(traversal.no_equities_content({**proof, "assetAllocationText": rows}))
+        for text in ("无。", "7.4 期末基金投资组合说明\n无。", "7.3 股票投资明细\n无。", proof["text"] + "另有股票1股"):
+            self.assertFalse(traversal.no_equities_content({**proof, "text": text}))
+        self.assertFalse(traversal.no_equities_content({**proof, "evidenceType": "invented-empty"}))
+
+    def test_empty_stock_section_preserves_evidence_and_checks_source_dates_and_page(self):
+        fund = self.retained_fund()
+        proof = self.empty_stock_evidence()
+        fund.update({"status": "no-equities", "rows": [], "noEquitiesEvidence": proof})
+        fund["selectedReport"]["holdings"] = []
+        result = traversal.report_evidence(fund, PHASE, traversal.utc_now(NOW))
+        self.assertEqual(result[0], "no-equities")
+        saved = result[1]["noEquities"]
+        for key in ("evidenceType", "assetAllocationText", "periodEnd", "publishedAt"):
+            self.assertEqual(saved[key], proof[key])
+        self.assertTrue(traversal.valid_event_evidence(result[1], "no-equities", PHASE, traversal.utc_now(NOW)))
+        for key, bad in (("sourceUrl", "https://example.org/other.pdf"), ("periodEnd", "2026-03-31"),
+                         ("publishedAt", "2026-07-21"), ("page", 0), ("page", True), ("page", None)):
+            with self.subTest(key=key, bad=bad):
+                fund["noEquitiesEvidence"] = {**proof, key: bad}
+                self.assertIsNone(traversal.report_evidence(fund, PHASE, traversal.utc_now(NOW)))
+                broken = {**result[1], "noEquities": {**saved, key: bad}}
+                self.assertFalse(traversal.valid_event_evidence(broken, "no-equities", PHASE, traversal.utc_now(NOW)))
+        for key in ("assetAllocationText", "periodEnd", "publishedAt"):
+            stripped = {key2: value for key2, value in saved.items() if key2 != key}
+            self.assertFalse(traversal.valid_event_evidence({**result[1], "noEquities": stripped}, "no-equities", PHASE, traversal.utc_now(NOW)))
+
+    def test_empty_stock_section_status_survives_reconciliation_without_invented_statement(self):
+        config = {**CONFIG, "funds": [{"code": "000001", "companyCode": "co1"}]}
+        fund = self.retained_fund()
+        fund.update({"status": "no-equities", "rows": [], "noEquitiesEvidence": self.empty_stock_evidence()})
+        fund["selectedReport"]["holdings"] = []
+        snapshot = {"schemaVersion": 1, "sourceMode": "actions", "funds": [fund],
+                    "batchResults": [{"code": "000001", "status": "no-equities"}]}
+        status = traversal.build_status(config, snapshot, NOW)
+        self.assertTrue(traversal.valid_status(status, config, NOW))
+        proof = status["funds"][0]["reportEvidence"]
+        receipt = {"schemaVersion": 1, "phase": PHASE, "generatedAt": NOW, "funds": [{"code": "000001",
+                   "representativeCode": "000001", "companyCode": "co1", "status": "no-equities",
+                   "reportEvidence": proof, "priceCoverage": traversal.price_coverage(fund), "shareClassCodes": ["000001"]}]}
+        events = traversal.reconcile_observations([status], receipt, config, NOW)
+        progress = traversal.merge_progress(catalog(), None, config, events, NOW)
+        self.assertEqual(progress["funds"][0]["status"], "no-equities")
+        self.assertEqual(events[0]["funds"][0]["reportEvidence"]["noEquities"]["text"], self.empty_stock_evidence()["text"])
+
 
 if __name__ == "__main__":
     unittest.main()

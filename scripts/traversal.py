@@ -593,6 +593,34 @@ def no_equities_text(text):
         re.search(r"(?:未持有|未投资于?)股票(?:资产|投资|组合)?(?:[。；，,.;：:]|$)", excerpt))
 
 
+def no_equities_content(evidence):
+    """Require the quoted stock section and both same-page zero asset rows."""
+    if not isinstance(evidence, dict):
+        return False
+    kind = evidence.get("evidenceType")
+    if kind is None:
+        return no_equities_text(evidence.get("text"))
+    if kind != "empty-stock-detail-section":
+        return False
+    text, assets = evidence.get("text"), evidence.get("assetAllocationText")
+    if not isinstance(text, str) or not isinstance(assets, str) or len(text) > 600 or len(assets) > 600:
+        return False
+    section = re.sub(r"\s+", "", text)
+    if not re.fullmatch(r"(?:[0-9]+\.){1,2}[0-9]+期末按公允价值占基金资产净值比例大小排序的所有股票投资明细(?:注[:：])?无[。.]?", section):
+        return False
+    lines = [line.strip() for line in assets.splitlines() if line.strip()]
+    if len(lines) != 2:
+        return False
+    zero = r"(?:-|0(?:\.0+)?)"
+    equity = re.fullmatch(rf"(?:[1-9][0-9]{{0,2}}\s+)?权益投资\s+{zero}\s+{zero}", lines[0])
+    stocks = re.fullmatch(rf"其中\s*[:：]?\s*股票\s+{zero}\s+{zero}", lines[1])
+    return bool(equity and stocks)
+
+
+def evidence_page(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def valid_not_applicable(evidence, code, phase, now):
     if not isinstance(evidence, dict) or evidence.get("reason") != "ESTABLISHED_AFTER_PERIOD":
         return False
@@ -665,13 +693,14 @@ def report_evidence(fund, phase, now, planned_at=None):
               "publishedAt": report["publishedAt"], "observedAt": fund["retrievedAt"]}
     if fund.get("status") == "no-equities":
         evidence = fund.get("noEquitiesEvidence") or report.get("noEquitiesEvidence") or {}
-        text = evidence.get("text", "")
-        if (evidence.get("confirmed") is not True or evidence.get("sourceUrl") != report["sourceUrl"]
+        text = evidence.get("text", "") if isinstance(evidence, dict) else ""
+        if (not isinstance(evidence, dict) or evidence.get("confirmed") is not True or evidence.get("sourceUrl") != report["sourceUrl"]
                 or evidence.get("periodEnd") != report["periodEnd"] or evidence.get("publishedAt") != report["publishedAt"]
-                or not isinstance(evidence.get("page"), int) or evidence["page"] <= 0
-                or not no_equities_text(text)):
+                or not evidence_page(evidence.get("page")) or not no_equities_content(evidence)):
             return None
         result["noEquities"] = {"confirmed": True, "sourceUrl": evidence["sourceUrl"], "page": evidence["page"], "text": text[:600]}
+        if evidence.get("evidenceType") == "empty-stock-detail-section":
+            result["noEquities"].update({key: evidence[key] for key in ("evidenceType", "assetAllocationText", "periodEnd", "publishedAt")})
         return "no-equities", result
     if fund.get("status") == "ok" and isinstance(report.get("holdings"), list) and report["holdings"] and fund.get("rows"):
         return "complete", result
@@ -767,10 +796,11 @@ def valid_event_evidence(evidence, status, phase, attempted_at):
         return False
     if status == "no-equities":
         noeq = evidence.get("noEquities") or {}
-        if noeq.get("confirmed") is not True or noeq.get("sourceUrl") != evidence["sourceUrl"] or not isinstance(noeq.get("page"), int) or noeq["page"] <= 0:
+        if not isinstance(noeq, dict) or noeq.get("confirmed") is not True or noeq.get("sourceUrl") != evidence["sourceUrl"] or not evidence_page(noeq.get("page")):
             return False
-        text = noeq.get("text", "")
-        return no_equities_text(text)
+        if noeq.get("evidenceType") == "empty-stock-detail-section" and any(noeq.get(key) != evidence[key] for key in ("periodEnd", "publishedAt")):
+            return False
+        return no_equities_content(noeq)
     return status == "complete"
 
 

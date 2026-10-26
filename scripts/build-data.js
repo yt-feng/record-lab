@@ -80,6 +80,16 @@ function isValidNoEq(evidence, { asOf, code } = {}) {
     || typeof evidence.text !== 'string' || (evidence.fundCode !== undefined && evidence.fundCode !== code)) return false;
   const excerpt = evidence.text.slice(0, 600).replace(/\s+/g, '');
   if (/并非未|不是未|不能确认|尚未确认|无法确认/.test(excerpt)) return false;
+  if (evidence.evidenceType === 'empty-stock-detail-section') {
+    if (evidence.text.length > 600 || typeof evidence.assetAllocationText !== 'string' || evidence.assetAllocationText.length > 600) return false;
+    const zero = '(?:[-—－–]|0(?:\\.0+)?)';
+    const allocation = evidence.assetAllocationText.trim().split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    return /^\d+(?:\.\d+){1,2}期末按公允价值占基金资产净值比例大小排序的所有股票投资明细(?:注[:：])?无[。.]?$/.test(excerpt)
+      && allocation.length === 2
+      && new RegExp('^\\d*\\s*权益投资\\s+' + zero + '\\s+' + zero + '$').test(allocation[0])
+      && new RegExp('^其中[：:]?\\s*股票\\s+' + zero + '\\s+' + zero + '$').test(allocation[1]);
+  }
+  if (evidence.evidenceType != null) return false;
   return /(?:未持有|未投资于?)(?:股票)(?:资产|投资|组合)?(?:[。；，,.;：:]|$)/.test(excerpt);
 }
 
@@ -88,6 +98,8 @@ function noEquitiesReport(evidence, code) {
   const normalizedEvidence = { confirmed: true, sourceUrl: evidence.sourceUrl,
     periodEnd: evidence.periodEnd, publishedAt: evidence.publishedAt, page: evidence.page,
     text: evidence.text.slice(0, 600), kind,
+    ...(evidence.evidenceType === 'empty-stock-detail-section' ? { evidenceType: evidence.evidenceType,
+      assetAllocationText: evidence.assetAllocationText.slice(0, 600) } : {}),
     title: typeof evidence.title === 'string' ? evidence.title.slice(0, 200) : null };
   return { fundCode: code, periodEnd: evidence.periodEnd, publishedAt: evidence.publishedAt,
     kind, coverage: 'full', sourceUrl: evidence.sourceUrl,

@@ -131,6 +131,21 @@
       return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password && !credentialQuery ? url.href : null;
     } catch (_) { return null; }
   }
+  function validEmptyStockEvidence(evidence, report, asOf) {
+    if (!isRecord(evidence) || evidence.evidenceType !== 'empty-stock-detail-section' || !isRecord(report) ||
+      evidence.confirmed !== true || !['quarterly', 'semiannual'].includes(evidence.kind) || evidence.kind !== report.kind ||
+      typeof evidence.text !== 'string' || evidence.text.length > 600 || typeof evidence.assetAllocationText !== 'string' || evidence.assetAllocationText.length > 600 ||
+      !Number.isInteger(evidence.page) || evidence.page < 1 || !safeHttpUrl(evidence.sourceUrl) ||
+      evidence.sourceUrl !== report.sourceUrl || evidence.periodEnd !== report.periodEnd || evidence.publishedAt !== report.publishedAt ||
+      !dateOnly(evidence.periodEnd) || !dateOnly(evidence.publishedAt) || !dateOnly(asOf) || evidence.periodEnd > evidence.publishedAt || evidence.publishedAt > asOf) return false;
+    const excerpt = evidence.text.replace(/\s+/g, '');
+    const zero = '(?:[-—－–]|0(?:\\.0+)?)';
+    const allocation = evidence.assetAllocationText.trim().split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    return /^\d+(?:\.\d+){1,2}期末按公允价值占基金资产净值比例大小排序的所有股票投资明细(?:注[:：])?无[。.]?$/.test(excerpt)
+      && allocation.length === 2
+      && new RegExp('^\\d*\\s*权益投资\\s+' + zero + '\\s+' + zero + '$').test(allocation[0])
+      && new RegExp('^其中[：:]?\\s*股票\\s+' + zero + '\\s+' + zero + '$').test(allocation[1]);
+  }
 
   function validateDataset(data) {
     function fail() { throw new Error('INVALID_DATASET'); }
@@ -167,6 +182,13 @@
       if (fund.status === 'no-equities') {
         const evidence = fund.noEquitiesEvidence || fund.selectedReport?.noEquitiesEvidence;
         if (!isRecord(evidence) || evidence.confirmed !== true || !safeHttpUrl(evidence.sourceUrl) || evidence.periodEnd !== fund.selectedReport.periodEnd || fund.rows.length) fail();
+        if (evidence.evidenceType === 'empty-stock-detail-section') {
+          if (!validEmptyStockEvidence(evidence, fund.selectedReport, data.asOf)) fail();
+        } else {
+          const text = typeof evidence.text === 'string' ? evidence.text.replace(/\s+/g, '') : '';
+          if (evidence.evidenceType != null || /并非未|不是未|不能确认|尚未确认|无法确认/.test(text) ||
+            !/(?:未持有|未投资于?)股票(?:资产|投资|组合)?(?:[。；，,.;：:]|$)/.test(text)) fail();
+        }
       }
       if (fund.notApplicableEvidence != null) {
         const evidence = fund.notApplicableEvidence;
@@ -725,6 +747,10 @@
       } else if (fund.status === 'no-equities') {
         const evidence = fund.noEquitiesEvidence || fund.selectedReport?.noEquitiesEvidence;
         const note = emptyState('报告确认本期期末未持有股票', evidence?.text || '按报告证据记录本期期末无股票持仓，不按基金类型推断。', true);
+        if (evidence?.evidenceType === 'empty-stock-detail-section') {
+          note.append(el('p', 'narrative-meta', `同一物理页第 ${evidence.page} 页 · 股票明细原文与资产组合表共同核验`),
+            el('p', 'narrative-text', evidence.assetAllocationText));
+        } else if (evidence?.page) note.append(el('p', 'narrative-meta', `原报告第 ${evidence.page} 页`));
         addLink(note, '无股票持仓披露来源 ↗', evidence?.sourceUrl || fund.selectedReport?.sourceUrl); body.append(note);
       } else if (!fund.visibleRows.length) body.append(emptyState('暂无可展示持仓', '这只基金尚无可用的持仓披露明细；报告与经理信息仅按已提供字段展示。', true));
       else {
@@ -944,6 +970,6 @@
     initializePeriods();
   }
 
-  return { validateDataset, validateCatalog, validateProgress, validatePeriods, selectQuarter, periodDataPath, validatePeriodDataset, responseText, researchOverview, retryState, formatRetryAt, fundQuality, catalogComplete, catalogFreshness, companyDirectoryLabel, safeCompanyPath, companyPages, catalogIndex, companyCoverage, coverageOverview, safeHttpUrl, managerNames, managerAttributionLabel, reportPeriod, changeGroup, latestFunds, filterFunds,
+  return { validateDataset, validateCatalog, validateProgress, validatePeriods, selectQuarter, periodDataPath, validatePeriodDataset, responseText, researchOverview, retryState, formatRetryAt, fundQuality, catalogComplete, catalogFreshness, companyDirectoryLabel, safeCompanyPath, companyPages, catalogIndex, companyCoverage, coverageOverview, safeHttpUrl, validEmptyStockEvidence, managerNames, managerAttributionLabel, reportPeriod, changeGroup, latestFunds, filterFunds,
     formatNumber, formatMoney, signed, holdingValue, priceDescription, csvCell, exportCsv, observationState, mount };
 });
