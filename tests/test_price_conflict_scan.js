@@ -8,6 +8,8 @@ const { spawnSync } = require('node:child_process');
 const { priceRange } = require('../lib/fund-analysis');
 const { expectedSessions } = require('../lib/price-coverage');
 const { scan, scanRegistry, numericDifference, requestFacts, PHASES, MAX_OUTPUT } = require('../scripts/price-conflict-scan');
+const { conflictFor } = require('../lib/price-consistency');
+const { calendar } = require('../lib/price-coverage');
 const NOW = '2026-10-27T02:00:00Z';
 const COMMIT = 'a'.repeat(40);
 const source = 'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=1.600001&klt=101&fqt=0&beg=20260401&end=20260630&fields1=f1%2Cf2%2Cf3%2Cf4%2Cf5%2Cf6&fields2=f51%2Cf52%2Cf53%2Cf54%2Cf55%2Cf56%2Cf57%2Cf58%2Cf59%2Cf60%2Cf61';
@@ -42,6 +44,36 @@ function treeBytes(root) {
   return Object.fromEntries(fs.readdirSync(root, { recursive: true }).filter(name => fs.statSync(path.join(root, name)).isFile())
     .map(name => [name, fs.readFileSync(path.join(root, name), 'utf8')]));
 }
+test('three scanner passes preserve every occurrence and observation with bounded validation caching', t => {
+  const root = fixture(t, quarter => {
+    const a = makeFund('000001', 'CN', '600001', quarter, 1, 2), b = makeFund('000002', 'CN', '600001', quarter, .9, 2.1);
+    const p = a.rows[0].priceRange, identity = { market: 'CN', stockCode: '600001', currency: 'CNY', rangeStart: p.rangeStart,
+      rangeEnd: p.rangeEnd, calendarId: calendar.id };
+    const witness = conflictFor([a, b].map(fund => { const price = fund.rows[0].priceRange;
+      return { price, sourceUrl: price.sourceUrl, sourceUrls: price.sourceUrls, fetchedAt: price.fetchedAt }; }), identity, NOW);
+    return Array.from({ length: 12 }, (_, i) => {
+      const fund = structuredClone(i % 2 ? a : b); fund.code = String(100000 + i);
+      fund.rows[0].priceRange.globalPriceConflict = structuredClone(witness);
+      if (i < 8) fund.rows[0].priceRange.fetchedAt = `2026-10-26T09:00:0${i}Z`;
+      if (i === 10) fund.retrievedAt = '2026-10-28T00:00:00Z';
+      if (i === 11) fund.selectedReport.periodEnd = '2025-12-31';
+      return fund;
+    });
+  });
+  const before = treeBytes(root);
+  for (const quarter of Object.keys(PHASES)) {
+    const a = [], b = [];
+    const cached = scanRegistry(root, quarter, { now: NOW, dataCommit: COMMIT, onProgress: value => a.push(value) });
+    const original = scanRegistry(root, quarter, { now: NOW, dataCommit: COMMIT, cacheValidation: false, onProgress: value => b.push(value) });
+    assert.deepEqual(cached, original); assert.equal(cached.scannedFunds, 12);
+    assert.ok(cached.records[0].groups.some(group => group.omittedObservationCount > 0));
+    assert.ok(a.at(-1).validation.hits > 30); assert.ok(a.at(-1).validation.checks < b.at(-1).validation.checks / 2);
+    assert.ok(a.at(-1).validation.entries <= 4096); assert.ok(a.at(-1).validation.bytes <= 16 * 1024 * 1024);
+    assert.deepEqual(a.map(value => value.phase), ['index', 'index', 'extremes', 'facts']);
+    assert.equal(JSON.stringify(a).includes('https://'), false);
+  }
+  assert.deepEqual(treeBytes(root), before);
+});
 test('strict source conflicts stay unresolved and diagnostics do not rewrite any source byte', t => {
   const root = fixture(t), before = treeBytes(root), result = scan(root, { now: NOW, dataCommit: COMMIT });
   assert.deepEqual(treeBytes(root), before); assert.equal(result.dataCommit, COMMIT);

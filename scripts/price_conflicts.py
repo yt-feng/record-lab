@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -225,13 +226,39 @@ def read_json(path):
     except (ValueError, OSError): fail('CONFLICT_INPUT_INVALID')
 
 
+def scanner_progress(raw, quarter):
+    """Return only fixed counters; never relay raw child errors or paths."""
+    fields = {'hits', 'misses', 'bypasses', 'evictions', 'checks', 'entries', 'bytes', 'maxEntries', 'maxBytes'}
+    if isinstance(raw, bytes): raw = raw[-65536:].decode('utf-8', errors='replace')
+    if not isinstance(raw, str): return None
+    for line in reversed(raw[-65536:].splitlines()):
+        try: value = json.loads(line)
+        except ValueError: continue
+        if (not isinstance(value, dict) or value.get('kind') != 'price-conflict-scan-progress'
+                or value.get('phase') not in ('index', 'extremes', 'facts')
+                or type(value.get('totalCompanyPages')) is not int or not 0 <= value['totalCompanyPages'] <= 10000
+                or type(value.get('completedCompanyPages')) is not int or not 0 <= value['completedCompanyPages'] <= value['totalCompanyPages']
+                or not isinstance(value.get('validation'), dict) or set(value['validation']) != fields
+                or any(type(x) is not int or not 0 <= x <= 1_000_000_000 for x in value['validation'].values())): continue
+        return {'quarter': quarter, 'phase': value['phase'], 'completedCompanyPages': value['completedCompanyPages'],
+                'totalCompanyPages': value['totalCompanyPages'], 'validation': value['validation']}
+    return None
+
+
 def scan_registry(data_root, quarter, now=None):
     if os.environ.get('GITHUB_ACTIONS') != 'true': fail('CONFLICT_REQUIRES_ACTIONS')
     if quarter not in PHASES: fail('CONFLICT_IDENTITY_INVALID')
     with tempfile.TemporaryDirectory(prefix='conflict-scan-') as temporary:
         output = Path(temporary) / 'observations.json'
-        result = subprocess.run(['node', str(Path(__file__).with_name('price-conflict-scan.js')), '--data', str(data_root),
-                                 '--output', str(output), '--registry-quarter', quarter], capture_output=True, timeout=600)
+        try:
+            result = subprocess.run(['node', str(Path(__file__).with_name('price-conflict-scan.js')), '--data', str(data_root),
+                                     '--output', str(output), '--registry-quarter', quarter], capture_output=True, timeout=600)
+        except subprocess.TimeoutExpired as error:
+            progress = scanner_progress(error.stderr, quarter)
+            if progress: print(json.dumps({'status': 'scanner-timeout', **progress}), file=sys.stderr)
+            fail('CONFLICT_SCAN_TIMEOUT')
+        progress = scanner_progress(result.stderr, quarter)
+        if progress: print(json.dumps({'status': 'scanner-progress', **progress}), file=sys.stderr)
         if result.returncode: fail('CONFLICT_SCAN_FAILED')
         return registry_from_observations(read_json(output), now)
 

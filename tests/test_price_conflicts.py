@@ -1,6 +1,8 @@
 """Synthetic security-quarter conflicts; no real directory or quote requests."""
 import copy
 import datetime as dt
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -54,6 +56,27 @@ def registry(groups=None, quarter='2026Q2'):
 
 
 class PriceConflictsTests(unittest.TestCase):
+    def test_scanner_timeout_is_explicit_and_only_fixed_progress_counters_are_relayed(self):
+        progress = {'kind': 'price-conflict-scan-progress', 'phase': 'index', 'completedCompanyPages': 25, 'totalCompanyPages': 200,
+                    'validation': dict(hits=50, misses=5, bypasses=1, evictions=0, checks=5, entries=4, bytes=1000, maxEntries=4096, maxBytes=16777216)}
+        raw = b'untrusted child error text\n' + json.dumps(progress).encode() + b'\n'
+        error = subprocess.TimeoutExpired(['node'], 600, stderr=raw)
+        output = io.StringIO()
+        with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), patch.object(conflicts.subprocess, 'run', side_effect=error) as command, contextlib.redirect_stderr(output):
+            with self.assertRaisesRegex(conflicts.ConflictError, 'CONFLICT_SCAN_TIMEOUT'):
+                conflicts.scan_registry('synthetic-data', '2026Q2')
+        self.assertEqual(command.call_args.kwargs['timeout'], 600)
+        value = json.loads(output.getvalue()); self.assertEqual(value['status'], 'scanner-timeout')
+        self.assertEqual(value['completedCompanyPages'], 25); self.assertNotIn('untrusted', output.getvalue())
+        self.assertNotIn('synthetic-data', output.getvalue())
+
+    def test_scanner_progress_rejects_unbounded_or_unknown_diagnostic_values(self):
+        self.assertIsNone(conflicts.scanner_progress('not json', '2026Q2'))
+        for value in ({'kind': 'price-conflict-scan-progress', 'phase': 'unknown'},
+                      {'kind': 'price-conflict-scan-progress', 'phase': 'index', 'totalCompanyPages': 10001},
+                      {'kind': 'price-conflict-scan-progress', 'phase': 'index', 'totalCompanyPages': 100, 'completedCompanyPages': 101}):
+            self.assertIsNone(conflicts.scanner_progress(json.dumps(value), '2026Q2'))
+
     def test_conflicting_complete_prices_enter_independent_lane_despite_no_missing_quotes(self):
         value = registry(); before = copy.deepcopy(value)
         self.assertEqual(value['summary']['completeSourceConflictKeyCount'], 1)

@@ -67,7 +67,7 @@ jobs:
       - run: python -m pip install --disable-pip-version-check -r requirements.txt
       - name: Validate ledger and source-bound requests
         run: |
-          node --test tests/test_price_conflict_scan.js
+          node --test tests/test_price_conflict_scan.js tests/test_price_validation_cache.js
           python -m unittest discover -s tests -p 'test_price_conflicts.py'
           python -m unittest discover -s tests -p 'test_restore_price_conflict_ledger.py'
       - name: Restore explicitly bound prior ledger

@@ -6,7 +6,6 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { createPriceIndex, addPriceSources } = require('../lib/reuse-prices');
 const { validCompletePrice, calendar } = require('../lib/price-coverage');
-const { normalizeConflict } = require('../lib/price-consistency');
 const { publicUrl } = require('./build-data');
 const PHASES = { '2026Q2': { targetPeriodEnd: '2026-06-30', baselinePeriodEnd: '2026-03-31' },
   '2026Q3': { targetPeriodEnd: '2026-09-30', baselinePeriodEnd: '2026-06-30' } };
@@ -201,7 +200,7 @@ function stableSource(source) {
   }
   url.searchParams.sort(); return url.toString();
 }
-function scanRegistry(root, quarter, { now = new Date(), dataCommit = null } = {}) {
+function scanRegistry(root, quarter, { now = new Date(), dataCommit = null, cacheValidation = true, onProgress = null } = {}) {
   if (!Object.hasOwn(PHASES, quarter) || !Number.isFinite(Date.parse(now))
     || dataCommit !== null && !/^[a-f0-9]{40}$/.test(dataCommit)) fail('DIAGNOSTIC_ARGUMENTS_INVALID');
   const phase = PHASES[quarter], directory = path.join(root, quarter);
@@ -221,10 +220,15 @@ function scanRegistry(root, quarter, { now = new Date(), dataCommit = null } = {
       || document.baselinePeriodEnd !== phase.baselinePeriodEnd || !Array.isArray(document.funds) || document.funds.length > 1000) fail('DIAGNOSTIC_COMPANY_INVALID');
     return document.funds;
   };
-  const index = createPriceIndex(phase, now); let scannedFunds = 0;
-  for (const file of files) {
+  const index = createPriceIndex(phase, now, { cacheValidation }); let scannedFunds = 0;
+  const progress = (phase, completedCompanyPages) => {
+    if (typeof onProgress === 'function') onProgress({ phase, completedCompanyPages, totalCompanyPages: files.length, validation: index.validation.stats() });
+  };
+  progress('index', 0);
+  for (const [position, file] of files.entries()) {
     const funds = load(file); scannedFunds += funds.length; addPriceSources(index, funds);
     if (index.entries.size > MAX_KEYS) fail('DIAGNOSTIC_KEY_LIMIT');
+    if ((position + 1) % 25 === 0 || position + 1 === files.length) progress('index', position + 1);
   }
   const keys = new Set([...index.entries].filter(([, value]) => value.conflict).map(([key]) => key));
   const eligibleRows = function* (file) {
@@ -245,8 +249,8 @@ function scanRegistry(root, quarter, { now = new Date(), dataCommit = null } = {
         // A retained two-source witness can outlive either local quote after
         // portfolio deduplication. Validate its full identity, hashes, calendar
         // proof and original timestamps before allowing it to supply facts.
-        const witness = normalizeConflict(price.globalPriceConflict, { market: row.market, stockCode: row.stockCode,
-          currency: row.currency, rangeStart: index.interval.start, rangeEnd: index.interval.end, calendarId: calendar.id }, now);
+        const witness = index.validation.normalizeConflict(price.globalPriceConflict, { market: row.market, stockCode: row.stockCode,
+          currency: row.currency, rangeStart: index.interval.start, rangeEnd: index.interval.end, calendarId: calendar.id });
         if (witness) for (const fact of witness.facts) candidates.push({ market: row.market, stockCode: row.stockCode, currency: row.currency,
           priceRange: { ...fact.price, sourceUrl: fact.sourceUrl, sourceUrls: fact.sourceUrls, fetchedAt: fact.fetchedAt } });
         const emitted = new Set();
@@ -260,15 +264,19 @@ function scanRegistry(root, quarter, { now = new Date(), dataCommit = null } = {
       }
     }
   };
-  for (const file of files) for (const [key, row] of eligibleRows(file)) {
+  for (const [position, file] of files.entries()) {
+   for (const [key, row] of eligibleRows(file)) {
     const source = index.entries.get(key).source.price, price = row.priceRange;
     if (!validCompletePrice(price, row.market, row.stockCode, index.interval.start, index.interval.end)
       && (price.low < source.low || price.high > source.high)) keys.add(key);
     if (keys.size > MAX_CONFLICT_KEYS) fail('DIAGNOSTIC_CONFLICT_KEY_LIMIT');
+   }
+   if ((position + 1) % 25 === 0 || position + 1 === files.length) progress('extremes', position + 1);
   }
   if (keys.size > MAX_CONFLICT_KEYS) fail('DIAGNOSTIC_CONFLICT_KEY_LIMIT');
   const facts = new Map([...keys].sort().map(key => [key, new Map()])); let retainedBytes = 0;
-  for (const file of files) for (const [key, row] of eligibleRows(file)) {
+  for (const [position, file] of files.entries()) {
+   for (const [key, row] of eligibleRows(file)) {
     if (!facts.has(key)) continue;
     const price = Object.fromEntries(PRICE_FIELDS.filter(field => row.priceRange[field] !== undefined).map(field => [field, row.priceRange[field]]));
     const sourceUrl = row.priceRange.sourceUrl, fetchedAt = row.priceRange.fetchedAt;
@@ -293,6 +301,8 @@ function scanRegistry(root, quarter, { now = new Date(), dataCommit = null } = {
     }
     retainedBytes += Buffer.byteLength(JSON.stringify(group)) - oldBytes;
     if (retainedBytes > MAX_REGISTRY_BYTES - 500000) fail('DIAGNOSTIC_REGISTRY_LIMIT');
+   }
+   if ((position + 1) % 25 === 0 || position + 1 === files.length) progress('facts', position + 1);
   }
   const result = { schemaVersion: 1, kind: 'price-conflict-observations', quarter, ...phase,
     generatedAt: new Date(now).toISOString(), dataCommit, manifestContentHash: input.hash,
@@ -309,7 +319,8 @@ function main(argv = process.argv.slice(2)) {
     if ((!registryMode && argv.length !== 4) || argv[0] !== '--data' || argv[2] !== '--output') fail('DIAGNOSTIC_ARGUMENTS_INVALID');
     const relative = path.relative(path.resolve(argv[1]), path.resolve(argv[3]));
     if (!relative.startsWith('..' + path.sep) && !path.isAbsolute(relative)) fail('DIAGNOSTIC_OUTPUT_INSIDE_SOURCE');
-    const options = { dataCommit: process.env.PRICE_DIAGNOSTIC_DATA_COMMIT || null };
+    const options = { dataCommit: process.env.PRICE_DIAGNOSTIC_DATA_COMMIT || null,
+      onProgress: value => process.stderr.write(JSON.stringify({ kind: 'price-conflict-scan-progress', ...value }) + '\n') };
     const result = registryMode ? scanRegistry(argv[1], argv[5], options) : scan(argv[1], options);
     fs.mkdirSync(path.dirname(argv[3]), { recursive: true }); fs.writeFileSync(argv[3], JSON.stringify(result) + '\n');
     process.stdout.write(JSON.stringify({ status: 'diagnosed', selectedKeys: registryMode ? result.records.length : result.quarters.reduce((n, quarter) => n + quarter.selected.length, 0) }) + '\n');
