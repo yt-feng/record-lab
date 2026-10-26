@@ -1,6 +1,8 @@
 """Synthetic source-bound census proofs only; no GitHub or market requests."""
 import copy
+import contextlib
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -125,7 +127,103 @@ class SourceCensusProofTests(unittest.TestCase):
             commit = sample_checkout(directory, proof); value = scan(directory, commit, {'maxFacts': 1})
             with patch.object(census, 'DATA_COMMIT', commit): result = census.certificate(value, proof, LATER)
         self.assertEqual(result['status'], 'partial'); self.assertFalse(result['diagnosticCandidate']['eligible'])
+        self.assertFalse(result['executionSuccess']); self.assertEqual(result['dataStatus'], 'partial')
         self.assertIn('CENSUS_EVIDENCE_LIMIT', result['censusScope']['reasonCodes'])
+
+    def test_cli_complete_diagnosis_can_succeed_with_uncovered_data_without_changing_proof(self):
+        for new_observation in (False, True):
+            api, expected = fixture(); original_ledger_archive = copy.deepcopy(api.files)
+            with patch.object(census, 'PROOF', expected): proof = census.restore_proof(api, LATER)
+            with self.subTest(new_observation=new_observation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / 'data'; commit = sample_checkout(root, proof, new_observation=new_observation)
+                source_file = root / 'web/data/periods/2026Q3/companies/co1.json'; original_source = source_file.read_bytes()
+                output = Path(directory) / 'output'; stdout = io.StringIO(); actual_run = census.run
+                env = {'GITHUB_ACTIONS': 'true', 'GITHUB_REPOSITORY': census.restore.REPOSITORY,
+                       'GITHUB_WORKFLOW_REF': f'{census.restore.REPOSITORY}/{census.WORKFLOW}@refs/heads/main'}
+                api.calls.clear()
+                with patch.dict(os.environ, env), patch.object(census, 'DATA_COMMIT', commit), patch.object(census, 'PROOF', expected), \
+                     patch.object(census, 'run', side_effect=lambda data, out: actual_run(data, out, api=api, now=LATER)), \
+                     patch.object(conflicts, 'execute_rechecks', side_effect=AssertionError('no market requests')), contextlib.redirect_stdout(stdout):
+                    code = census.main(['--data-repo', str(root), '--output', str(output)])
+                result = json.loads((output / 'result.json').read_bytes()); printed = json.loads(stdout.getvalue())
+                self.assertEqual(code, 0); self.assertTrue(result['executionSuccess']); self.assertTrue(printed['executionSuccess'])
+                self.assertEqual(result['status'], 'partial' if new_observation else 'complete')
+                self.assertEqual(result['dataStatus'], result['status']); self.assertEqual(printed['dataStatus'], result['status'])
+                self.assertEqual(result['diagnosticCandidate']['eligible'], not new_observation)
+                self.assertEqual(result['diagnosticCandidate']['uncoveredObservationCount'], int(new_observation))
+                self.assertEqual(result['resolution'], 'unresolved'); self.assertFalse(result['automaticResolution'])
+                self.assertFalse(result['ledgerModified']); self.assertFalse(result['productionDataModified'])
+                self.assertEqual(result['marketDataRequests'], 0); self.assertEqual(len(api.calls), 3)
+                self.assertEqual(api.files, original_ledger_archive); self.assertEqual(source_file.read_bytes(), original_source)
+                saved_proof = json.loads((output / 'proof.json').read_bytes())
+                self.assertEqual(saved_proof['coveredObservations'], proof['coveredObservations'])
+                self.assertEqual(saved_proof['remainingAttempts'], 0)
+
+    def test_cli_incomplete_census_remains_failure_with_partial_artifact(self):
+        api, expected = fixture()
+        with patch.object(census, 'PROOF', expected): proof = census.restore_proof(api, LATER)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'data'; commit = sample_checkout(root, proof)
+            value = scan(root, commit, {'maxFacts': 1})
+            with patch.object(census, 'DATA_COMMIT', commit): result = census.certificate(value, proof, LATER)
+            output = Path(directory) / 'output'; stdout = io.StringIO()
+            def completed_scan(data, destination):
+                census.write_guarded(Path(destination) / 'result.json', result, census.MAX_RESULT_BYTES)
+                return result
+            with patch.object(census, 'run', side_effect=completed_scan), contextlib.redirect_stdout(stdout):
+                code = census.main(['--data-repo', str(root), '--output', str(output)])
+            saved = json.loads((output / 'result.json').read_bytes())
+            self.assertEqual(code, 2); self.assertFalse(json.loads(stdout.getvalue())['executionSuccess'])
+            self.assertEqual(saved['status'], 'partial'); self.assertFalse(saved['executionSuccess'])
+            self.assertFalse(saved['diagnosticCandidate']['eligible']); self.assertEqual(saved['resolution'], 'unresolved')
+
+    def test_cli_proof_api_child_and_output_errors_cannot_become_success(self):
+        for error in ('CENSUS_PROOF_ARCHIVE_INVALID', 'CENSUS_PROVENANCE_INVALID', 'CENSUS_INPUT_INVALID',
+                      'CENSUS_API_UNAVAILABLE', 'CENSUS_SCAN_TIMEOUT', 'CENSUS_OUTPUT_INVALID'):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'output'; stdout = io.StringIO()
+                with patch.object(census, 'run', side_effect=census.CensusError(error)), contextlib.redirect_stdout(stdout):
+                    code = census.main(['--data-repo', str(Path(directory) / 'data'), '--output', str(output)])
+                saved = json.loads((output / 'result.json').read_bytes())
+                self.assertEqual(code, 2); self.assertEqual(saved['errorCode'], error)
+                self.assertFalse(saved['executionSuccess']); self.assertEqual(saved['dataStatus'], 'partial')
+                self.assertFalse(json.loads(stdout.getvalue())['executionSuccess'])
+
+    def test_cli_actual_guard_or_write_failure_stays_failure(self):
+        for rejected in (False, True):
+            api, expected = fixture()
+            with patch.object(census, 'PROOF', expected): proof = census.restore_proof(api, LATER)
+            with self.subTest(publication_rejection=rejected), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / 'data'; commit = sample_checkout(root, proof, new_observation=True)
+                output = Path(directory) / 'output'; stdout = io.StringIO(); actual_run = census.run
+                env = {'GITHUB_ACTIONS': 'true', 'GITHUB_REPOSITORY': census.restore.REPOSITORY,
+                       'GITHUB_WORKFLOW_REF': f'{census.restore.REPOSITORY}/{census.WORKFLOW}@refs/heads/main'}
+                blocker = patch.object(census, 'inspect_content', return_value=['rejected']) if rejected else \
+                          patch.object(census, 'write_guarded', side_effect=OSError('private diagnostic must not leak'))
+                with patch.dict(os.environ, env), patch.object(census, 'DATA_COMMIT', commit), patch.object(census, 'PROOF', expected), \
+                     patch.object(census, 'run', side_effect=lambda data, out: actual_run(data, out, api=api, now=LATER)), \
+                     blocker, contextlib.redirect_stdout(stdout):
+                    code = census.main(['--data-repo', str(root), '--output', str(output)])
+                printed = json.loads(stdout.getvalue())
+                self.assertEqual(code, 2); self.assertFalse(printed['executionSuccess'])
+                self.assertFalse(output.exists()); self.assertNotIn('private diagnostic', stdout.getvalue())
+
+    def test_nonzero_child_exit_is_failure_even_with_a_valid_output_file(self):
+        api, expected = fixture()
+        with patch.object(census, 'PROOF', expected): proof = census.restore_proof(api, LATER)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'data'; commit = sample_checkout(root, proof); output = Path(directory) / 'output'
+            env = {'GITHUB_ACTIONS': 'true', 'GITHUB_REPOSITORY': census.restore.REPOSITORY,
+                   'GITHUB_WORKFLOW_REF': f'{census.restore.REPOSITORY}/{census.WORKFLOW}@refs/heads/main'}
+            actual_subprocess = subprocess.run
+            def failed_child(command, *args, **kwargs):
+                result = actual_subprocess(command, *args, **kwargs)
+                if command[:2] == ['node', 'scripts/price-source-census.js']: result.returncode = 2
+                return result
+            with patch.dict(os.environ, env), patch.object(census, 'DATA_COMMIT', commit), patch.object(census, 'PROOF', expected), \
+                 patch.object(census.subprocess, 'run', side_effect=failed_child), self.assertRaisesRegex(census.CensusError, 'CENSUS_SCAN_FAILED'):
+                census.run(root, output, api=api, now=LATER)
+            self.assertFalse(output.exists())
 
     def test_actions_gate_precedes_source_or_github_reads(self):
         with patch.dict(os.environ, {'GITHUB_ACTIONS': 'false'}), patch.object(census, 'data_identity', side_effect=AssertionError('no data read')):

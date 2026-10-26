@@ -345,7 +345,11 @@ def certificate(census, proof, now=None):
     candidate_digest = conflicts.digest({'schemaVersion': 1, 'key': KEY, 'proof': proof['provenance'],
         'dataCommit': census['dataCommit'], 'manifest': census['manifest'], 'partsDigest': parts_digest,
         'sourceUniverseDigest': census['sourceUniverseDigest'], 'rawRegistry': census['rawRegistry']})
-    return {'schemaVersion': 1, 'kind': 'price-source-census-verification', 'status': 'complete' if eligible else 'partial',
+    data_status = 'complete' if eligible else 'partial'
+    return {'schemaVersion': 1, 'kind': 'price-source-census-verification', 'status': data_status,
+        # A complete census can correctly find observations that the old proof
+        # does not cover. That is a successful diagnosis, not data completion.
+        'executionSuccess': census['complete'], 'dataStatus': data_status,
         'key': KEY, 'proofScope': {**proof['provenance'], 'registryDigest': proof['registryDigest'], 'attemptRounds': 2, 'remainingAttempts': 0},
         'censusScope': {'dataCommit': census['dataCommit'], 'manifest': census['manifest'], 'partsDigest': parts_digest,
                         'sourceUniverseDigest': census['sourceUniverseDigest'], 'rawRegistry': census['rawRegistry'],
@@ -400,7 +404,7 @@ def run(data_repo, output, api=None, now=None):
             child = subprocess.run(command, cwd=ROOT, env=child_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=660)
         except subprocess.TimeoutExpired: fail('CENSUS_SCAN_TIMEOUT')
         except OSError: fail('CENSUS_SCAN_FAILED')
-        if (child.returncode not in (0, 2) or not child_output.is_file() or child_output.is_symlink()
+        if (child.returncode != 0 or not child_output.is_file() or child_output.is_symlink()
                 or child_output.stat().st_size > MAX_CENSUS_BYTES): fail('CENSUS_SCAN_FAILED')
         value = parse_json(child_output.read_bytes()); normalize_census(value, now)
         if inspect_content(child_output.read_bytes(), max_bytes=MAX_CENSUS_BYTES): fail('CENSUS_OUTPUT_INVALID')
@@ -417,12 +421,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         result = run(args.data_repo, args.output)
-        print(json.dumps({'status': result['status'], 'marketDataRequests': 0, 'ledgerModified': False,
+        print(json.dumps({'status': result['status'], 'dataStatus': result['dataStatus'],
+                          'executionSuccess': result['executionSuccess'], 'marketDataRequests': 0, 'ledgerModified': False,
                           'eligible': result['diagnosticCandidate']['eligible']}))
-        return 0 if result['status'] == 'complete' else 2
+        return 0 if result['executionSuccess'] is True else 2
     except Exception as error:
         code = str(error) if isinstance(error, CensusError) and str(error) in ERRORS else 'CENSUS_INPUT_INVALID'
         result = {'schemaVersion': 1, 'kind': 'price-source-census-verification', 'status': 'partial', 'errorCode': code,
+                  'executionSuccess': False, 'dataStatus': 'partial',
                   'key': KEY, 'marketDataRequests': 0, 'ledgerModified': False, 'productionDataModified': False,
                   'automaticResolution': False, 'resolution': 'unresolved'}
         try:
@@ -430,7 +436,8 @@ def main(argv=None):
             if not destination.is_relative_to(Path(args.data_repo).resolve()):
                 write_guarded(destination / 'result.json', result, MAX_RESULT_BYTES)
         except Exception: pass
-        print(json.dumps({'status': 'partial', 'errorCode': code, 'marketDataRequests': 0})); return 2
+        print(json.dumps({'status': 'partial', 'dataStatus': 'partial', 'executionSuccess': False,
+                          'errorCode': code, 'marketDataRequests': 0})); return 2
 
 
 if __name__ == '__main__': raise SystemExit(main())
