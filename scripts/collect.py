@@ -141,7 +141,12 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         return fund, errors
     snapshots = {}
     year = int((target_period or as_of)[:4])
-    for selected_year in range(year, year - min(max(1, history_years), 3), -1):
+    needed = {p for p in (target_period, baseline_period) if p}
+    # Explicit comparison periods identify the only relevant year tables.
+    # Failure of a 2026 table cannot be repaired by querying unrelated 2025.
+    years = sorted({int(period[:4]) for period in needed}, reverse=True) if target_period else range(
+        year, year - min(max(1, history_years), 3), -1)
+    for selected_year in years:
         if expired():
             return fund, errors
         try:
@@ -149,7 +154,6 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         except Exception as error:
             errors.append(safe_error(code, "holdings", error))
         # Two distinct visible periods are sufficient for the initial comparison.
-        needed = {p for p in (target_period, baseline_period) if p}
         if (needed and needed.issubset(snapshots)) or (not needed and len([p for p in snapshots if p <= as_of]) >= 2):
             break
     extraction_keys = ("parseMethod", "parseErrorCode", "sourceTextHash", "pageStats",

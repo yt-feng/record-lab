@@ -530,3 +530,99 @@ class DiscardedHoldingTests(unittest.TestCase):
         fund, _errors = collect_fund({"code": "000001"}, "2026-10-26", provider=Source(), target_period="2026-09-30")
         self.assertTrue(fund["reports"][0]["holdingsIncomplete"])
         self.assertEqual(fund["reports"][0]["holdingsExcludedRowCount"], 1)
+
+
+class CollectionSchedulingTests(unittest.TestCase):
+    class Source:
+        def __init__(self, periods, fail_overview=False, fail_holdings=True):
+            self.periods = periods
+            self.fail_overview = fail_overview
+            self.fail_holdings = fail_holdings
+            self.calls = []
+
+        def overview(self, code):
+            self.calls.append(('overview', code))
+            if self.fail_overview:
+                raise DataError('NETWORK_ERROR')
+            return {'name': '合成基金', 'company': '合成机构', 'managers': []}
+
+        def announcements(self, code, as_of):
+            self.calls.append(('announcements', code))
+            return [{'title': '合成报告', 'periodEnd': period, 'kind': 'quarterly',
+                     'publishedAt': (dt.date.fromisoformat(period) + dt.timedelta(days=20)).isoformat(),
+                     'sourceUrl': f'https://example.org/report-{period}.pdf'} for period in self.periods]
+
+        def holdings(self, code, year):
+            self.calls.append(('holdings', year))
+            if self.fail_holdings:
+                raise DataError('NETWORK_ERROR')
+            return {}
+
+        def report_details(self, report):
+            self.calls.append(('pdf', report['periodEnd']))
+            # Retain a useful PDF row without manufacturing complete-table proof.
+            return {'navYuan': 10000, 'narrative': {'text': '本基金调整了组合配置。', 'page': 1,
+                    'sourceUrl': report['sourceUrl'], 'periodEnd': report['periodEnd']},
+                    'pdfHoldings': [{'stockCode': '600001', 'market': 'CN', 'currency': 'CNY',
+                                     'shares': 100, 'weightPct': 1, 'marketValueYuan': 100}]}
+
+    def test_overview_has_one_short_attempt_without_changing_report_transport_budget(self):
+        from requests.exceptions import ConnectionError
+        source = PublicProvider()
+        with patch.object(source.session, 'get', side_effect=ConnectionError('synthetic unavailable endpoint')) as request, \
+                patch('providers.time.sleep') as sleep:
+            with self.assertRaises(DataError):
+                source.overview('000001')
+            self.assertEqual(request.call_count, 1)
+            self.assertEqual(request.call_args.kwargs['timeout'], (2, 2))
+            sleep.assert_not_called()
+            self.assertEqual((source.timeout, source.attempts), (18, 2))
+            for operation in (lambda: source.announcements('000001', '2026-10-26'),
+                              lambda: source.report_details({'sourceUrl': 'https://example.org/report.pdf'})):
+                request.reset_mock(); sleep.reset_mock()
+                with self.assertRaises(DataError):
+                    operation()
+                self.assertEqual(request.call_count, 2)
+                self.assertEqual(request.call_args.kwargs['timeout'], (8, 18))
+                sleep.assert_called_once()
+
+    def test_overview_failure_still_reaches_target_pdf_and_preserves_error(self):
+        source = self.Source(['2026-09-30'], fail_overview=True)
+        fund, errors = collect_fund({'code': '000001', 'name': '目录基金'}, '2026-10-26', provider=source,
+                                    target_period='2026-09-30', baseline_period='2026-06-30')
+        self.assertEqual(source.calls, [('overview', '000001'), ('announcements', '000001'),
+                                        ('holdings', 2026), ('pdf', '2026-09-30')])
+        self.assertEqual(fund['name'], '目录基金')
+        self.assertEqual(fund['reports'][0]['holdings'][0]['stockCode'], '600001')
+        self.assertNotIn('holdingsPdfEvidence', fund['reports'][0])
+        self.assertIn({'code': '000001', 'stage': 'metadata', 'errorCode': 'NETWORK_ERROR'}, errors)
+        self.assertTrue(fund['collectionAttempt']['attempted'])
+
+    def test_same_year_target_and_baseline_skip_unrelated_year_even_when_table_fails_or_is_empty(self):
+        for target, baseline in [('2026-06-30', '2026-03-31'), ('2026-09-30', '2026-06-30')]:
+            for failed in [True, False]:
+                with self.subTest(target=target, failed=failed):
+                    source = self.Source([target, baseline], fail_holdings=failed)
+                    fund, _ = collect_fund({'code': '000001'}, '2026-10-26', provider=source, history_years=3,
+                                           target_period=target, baseline_period=baseline)
+                    self.assertEqual([value for stage, value in source.calls if stage == 'holdings'], [2026])
+                    self.assertEqual([value for stage, value in source.calls if stage == 'pdf'], [target, baseline])
+                    self.assertEqual([r['periodEnd'] for r in fund['reports']], [target, baseline])
+
+    def test_explicit_cross_year_comparison_fetches_both_needed_years_even_with_one_history_year(self):
+        source = self.Source(['2026-03-31', '2025-12-31'])
+        fund, _ = collect_fund({'code': '000001'}, '2026-10-26', provider=source, history_years=1,
+                               target_period='2026-03-31', baseline_period='2025-12-31')
+        self.assertEqual([value for stage, value in source.calls if stage == 'holdings'], [2026, 2025])
+        self.assertEqual([r['periodEnd'] for r in fund['reports']], ['2026-03-31', '2025-12-31'])
+
+    def test_target_without_baseline_requests_only_its_actual_year(self):
+        source = self.Source(['2026-09-30'])
+        collect_fund({'code': '000001'}, '2026-10-26', provider=source, history_years=3, target_period='2026-09-30')
+        self.assertEqual([value for stage, value in source.calls if stage == 'holdings'], [2026])
+
+    def test_unspecified_target_keeps_bounded_history_fallback(self):
+        for history, expected in [(1, [2026]), (2, [2026, 2025]), (7, [2026, 2025, 2024])]:
+            source = self.Source(['2026-09-30', '2026-06-30'])
+            collect_fund({'code': '000001'}, '2026-10-26', provider=source, history_years=history)
+            self.assertEqual([value for stage, value in source.calls if stage == 'holdings'], expected)

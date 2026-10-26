@@ -609,7 +609,11 @@ class PublicProvider:
         raise DataError(error)
 
     def overview(self, code):
-        return parse_overview(self.get(f"https://fundf10.eastmoney.com/jbgk_{code}.html"))
+        # Catalog identity and report PDFs remain useful when this optional
+        # profile endpoint is slow. Keep its connection/read windows short,
+        # without changing the independent announcement or PDF retry budget.
+        return parse_overview(self.get(f"https://fundf10.eastmoney.com/jbgk_{code}.html",
+                                       timeout_seconds=2, attempts_override=1))
 
     def holdings(self, code, year):
         text = self.get("https://fundf10.eastmoney.com/FundArchivesDatas.aspx",
