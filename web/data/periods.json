@@ -1,0 +1,1 @@
+{"schemaVersion":1,"defaultPeriod":"2026Q3","periods":[{"id":"2026Q2","label":"2026Q2","path":"./data/periods/2026Q2/","targetPeriodEnd":"2026-06-30","baselinePeriodEnd":"2026-03-31"},{"id":"2026Q3","label":"2026Q3","path":"./data/periods/2026Q3/","targetPeriodEnd":"2026-09-30","baselinePeriodEnd":"2026-06-30"}]}
