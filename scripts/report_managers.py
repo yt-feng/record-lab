@@ -36,11 +36,12 @@ _BIOGRAPHY_WORDS = ("曾", "历任", "担任", "毕业", "加入", "学历", "�
 _METHOD = "explicit-report-manager-table"
 _MAX_TABLE_PAGES = 6
 _MAX_MANAGERS = 30
+PARSER_VERSION = 2
 _CANDIDATE = re.compile(
     rf"(?m)^[ \t]*(?!姓名\s|任职日期\s|离任日期\s|证券从业)(?P<name>[{_CJK}]{{1,16}}(?:[·•][{_CJK}]{{1,16}})?|[A-Za-z][A-Za-z .'-]{{1,60}})\s+"
     rf"(?P<role>[^\d\n]{{1,90}}(?:\n(?!\s*(?:[{_CJK}]{{1,16}}|[A-Za-z][A-Za-z .'-]{{1,60}})\s+(?:本基金|基金经理))[^\d\n]{{1,90}}){{0,3}})"
 )
-_SECTION_STOP = re.compile(r"(?m)^\s*(?P<section>4\s*\.\s*[1-9](?:\s*\.\s*[1-9])?|[5-9](?:\s*\.\s*\d+)?)\s+[^\n]*")
+_SECTION_STOP = re.compile(r"(?m)^\s*(?P<section>4\s*\.\s*[1-9](?:\s*\.\s*[1-9])?|[5-9](?:\s*\.\s*\d+)?(?=\s+(?:投资组合|报告期|基金|期末|备查|资产|管理人)))\s+[^\n]*")
 _COUNT_FIELDS = ("candidateRows", "parsedRows", "ignoredKnownRoleRows", "excludedRows", "outsidePeriodRows", "duplicateRows")
 
 
@@ -57,7 +58,8 @@ def manager_key(manager):
 
 
 def empty_coverage(pages, report):
-    return {"schemaVersion": 1, "sourceUrl": report.get("sourceUrl"), "periodEnd": report.get("periodEnd"),
+    return {"schemaVersion": 1, "parserVersion": PARSER_VERSION, "extractionMethod": "plain-text-manager-table",
+            "sourceUrl": report.get("sourceUrl"), "periodEnd": report.get("periodEnd"),
             "kind": report.get("kind", "quarterly"), "periodStart": None, "publishedAt": report.get("publishedAt"),
             "sourceTextHash": hashlib.sha256("\n\f\n".join(map(str, pages)).encode()).hexdigest(),
             "tables": [], **dict.fromkeys(_COUNT_FIELDS, 0), "outputManagerCount": 0, "managerKeys": [],
@@ -116,7 +118,7 @@ def normalize_manager_table_coverage(raw, managers=None, period_end=None):
         if ignored_valid:
             for item in ignored:
                 ignored_valid = (isinstance(item, dict) and isinstance(item.get("name"), str) and isinstance(item.get("role"), str)
-                    and ("基金经理助理" in item["role"] or item["role"] in {"董事长", "公司总经理", "总经理", "投资总监"})
+                    and _ignored_role_allowed(item["name"], item["role"])
                     and type(item.get("page")) is int and pages and start_page <= item["page"] <= end_page
                     and isinstance(item.get("text"), str) and 1 <= len(item["text"]) <= 240
                     and re.sub(r"\s+", "", item["text"]).startswith(item["name"]) and item["role"] in re.sub(r"\s+", "", item["text"]))
@@ -138,11 +140,20 @@ def normalize_manager_table_coverage(raw, managers=None, period_end=None):
         except (TypeError, KeyError, AttributeError):
             aligned = False
     published = _date(raw.get("publishedAt"))
-    complete = bool(published and published >= raw["periodEnd"] and raw.get("complete") is True and aligned and keys and tables and all(table_complete)
+    parser_version = raw.get("parserVersion", 1)
+    extraction = raw.get("extractionMethod", "plain-text-manager-table")
+    geometry = None
+    if extraction == "pdf-clipping-manager-table":
+        from manager_cells import normalize_geometry_evidence
+        geometry = normalize_geometry_evidence(raw.get("geometryEvidence"), raw)
+    method_valid = extraction == "plain-text-manager-table" or extraction == "pdf-clipping-manager-table" and geometry is not None
+    complete = bool(parser_version == PARSER_VERSION and method_valid and published and published >= raw["periodEnd"] and raw.get("complete") is True and aligned and keys and tables and all(table_complete)
                     and all(raw[key] == sum(table[key] for table in tables) for key in _COUNT_FIELDS)
                     and raw["candidateRows"] == raw["parsedRows"] + raw["ignoredKnownRoleRows"]
                     and raw["parsedRows"] == raw["outputManagerCount"] + raw["outsidePeriodRows"] + raw["duplicateRows"])
-    return {"schemaVersion": 1, "sourceUrl": raw["sourceUrl"], "periodStart": raw["periodStart"], "periodEnd": raw["periodEnd"],
+    return {"schemaVersion": 1, "parserVersion": parser_version if type(parser_version) is int else 1,
+            "extractionMethod": extraction, **({"geometryEvidence": geometry} if geometry is not None else {}),
+            "sourceUrl": raw["sourceUrl"], "periodStart": raw["periodStart"], "periodEnd": raw["periodEnd"],
             "kind": raw["kind"], "publishedAt": published, "sourceTextHash": raw["sourceTextHash"], "method": raw["method"],
             "tables": cleaned, **{key: raw[key] for key in counts}, "managerKeys": sorted(keys),
             "complete": complete, "status": "complete" if complete else "partial" if keys or tables else "missing"}
@@ -218,7 +229,16 @@ def _role_allowed(role: str) -> bool:
         return False
     if "证券投资基金" in role or len(role) > 60:
         return False
-    return bool(re.search(r"本基金(?:的)?基金经理", role) or role.startswith("基金经理"))
+    return bool(re.search(r"本基金(?:的)?基金经理", role) or role.startswith("基金经理")
+                or re.search(r"(?:部|中心|团队)[-－—/、兼]基金经理$", role))
+
+
+def _ignored_role_allowed(name, role):
+    if not re.fullmatch(rf'[{_CJK}]{{2,6}}(?:[·•][{_CJK}]{{1,6}})?', name):
+        return False
+    return (role in {"董事长", "公司总经理", "总经理", "投资总监"}
+            or role.count("基金经理") == 1 and "基金经理助理" in role
+            and not any(word in role for word in _BIOGRAPHY_WORDS))
 
 
 def parse_report_managers(
@@ -293,7 +313,7 @@ def parse_report_managers(
                      "ignoredRoles": [], **dict.fromkeys(_COUNT_FIELDS, 0)}
             consumed.append((first_page, end_index, section))
             matches = {match.start("name"): match for match in _ROW.finditer(body, header_end)}
-            candidates = list(_CANDIDATE.finditer(scope, header_end))
+            candidates = list(_CANDIDATE.finditer(body, header_end))
             spans = []
             for candidate in candidates:
                 role_candidate = re.sub(r"\s+", "", candidate["role"])
@@ -307,7 +327,7 @@ def parse_report_managers(
                     continue
                 table["candidateRows"] += 1
                 spans.append((candidate.start(), candidate.end()))
-                if "基金经理助理" in role_candidate or role_candidate in {"董事长", "公司总经理", "总经理", "投资总监"}:
+                if _ignored_role_allowed(candidate["name"], role_candidate):
                     table["ignoredKnownRoleRows"] += 1
                     candidate_page = next((i for offset, i in reversed(offsets) if offset <= candidate.start()), first_page)
                     table["ignoredRoles"].append({"name": candidate["name"], "role": role_candidate, "page": numbers[candidate_page],
@@ -371,15 +391,15 @@ def parse_report_managers(
                     table["excludedRows"] += 1
             # Catch unsupported names/row layouts without requiring valid dates
             # or the strict CJK parser to recognize them as rows first.
-            for mention in re.finditer(r"基\s*金\s*经\s*理", scope[header_end:]):
+            for mention in re.finditer(r"基\s*金\s*经\s*理", body[header_end:]):
                 position = header_end + mention.start()
                 if any(begin <= position < finish for begin, finish in spans):
                     continue
-                line_start = scope.rfind('\n', 0, position) + 1
-                prefix = re.sub(r"\s+", "", scope[line_start:position])
+                line_start = body.rfind('\n', 0, position) + 1
+                prefix = re.sub(r"\s+", "", body[line_start:position])
                 if any(word in prefix for word in _BIOGRAPHY_WORDS) or "任本基金的" in prefix or re.search(r"4\s*\.\s*1", prefix):
                     continue
-                context = re.sub(r"\s+", "", scope[max(header_end, position - 180):position])
+                context = re.sub(r"\s+", "", body[max(header_end, position - 180):position])
                 possible_name = ("本基金" in prefix or bool(re.fullmatch(r"[A-Za-z][A-Za-z.'-]{1,60}", prefix))
                                  or bool(re.fullmatch(rf"[{_CJK}]{{2,8}}", prefix)) and prefix not in {"基金", "经理"}
                                  and not any(word in prefix for word in ("投资", "证券", "公司", "部门", "工作")))

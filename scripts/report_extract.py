@@ -408,6 +408,9 @@ def extract_report(pdf_bytes: bytes, source_url: str, period_end: str, kind: str
         result = _details_for_pages(pages, source_url, period_end, kind, parse_pages, enrich_pages,
                                     total_pages=getattr(pages, "total_pages", len(pages)), published_at=published_at,
                                     retrieved_at=retrieved_at, pdf_sha256=pdf_sha256)
+        from manager_cells import enrich_manager_details
+        enrich_manager_details(result, pdf_bytes,
+            {"sourceUrl": source_url, "periodEnd": period_end, "kind": kind, "publishedAt": published_at}, pages)
         result["parseMethod"] = "pypdf-fallback" if mineru_error else "pypdf"
         if mineru_error:
             result["parseErrorCode"] = mineru_error

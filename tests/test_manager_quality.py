@@ -98,8 +98,8 @@ class ManagerQualityTests(unittest.TestCase):
         progress = previous({'fields': fields, 'attempts': 3, 'totalAttempts': 3})
         attempt = event(at='2026-09-29T11:00:00Z')
         attempt['funds'][0].update(qualityAttempt=True, managerAttempt=True,
-                                  managerTableCoverageVersion=1,
-                                  reportQuality={'fields': {**fields, 'managers': 'complete'}, 'managerTableCoverageVersion': 1, 'priceCoverageVersion': 2})
+                                  managerTableCoverageVersion=traversal.MANAGER_TABLE_COVERAGE_VERSION,
+                                  reportQuality={'fields': {**fields, 'managers': 'complete'}, 'managerTableCoverageVersion': traversal.MANAGER_TABLE_COVERAGE_VERSION, 'priceCoverageVersion': 2})
         progress = traversal.merge_progress(catalog(), progress, config, [attempt], NOW)
         quality = progress['funds'][0]['quality']
         self.assertEqual(quality['missingFields'], ['nav'])
@@ -123,11 +123,34 @@ class ManagerQualityTests(unittest.TestCase):
         config = {**CONFIG, 'collectorVersion': 4, 'requireReportQuality': True}
         attempt = event(at='2026-09-29T11:00:00Z')
         attempt['funds'][0].update(qualityAttempt=True, reportQuality={'fields': fields})
-        progress = traversal.merge_progress(catalog(), previous({'fields': {**fields, 'managers': 'complete'}, 'attempts': 1, 'managerTableCoverageVersion': 1}),
+        progress = traversal.merge_progress(catalog(), previous({'fields': {**fields, 'managers': 'complete'}, 'attempts': 1, 'managerTableCoverageVersion': traversal.MANAGER_TABLE_COVERAGE_VERSION}),
                                             config, [attempt], NOW)
         self.assertEqual(progress['funds'][0]['quality']['fields']['managers'], 'complete')
         self.assertEqual(progress['research']['completeFunds'], 1)
         self.assertEqual(progress['funds'][0]['quality']['managerAttempts'], 0)
+
+    def test_new_parser_version_reopens_only_manager_budget_and_legacy_receipt_cannot_reconsume_it(self):
+        fields = {key: 'complete' for key in traversal.QUALITY_FIELDS}
+        prior = {'fields': fields, 'attempts': 3, 'totalAttempts': 8, 'managerAttempts': 3, 'managerTotalAttempts': 6,
+                 'managerTableCoverageVersion': 1, 'priceCoverageVersion': 2, 'strategySectionCoverageVersion': 1,
+                 'strategyAttempts': 2, 'strategyTotalAttempts': 4}
+        normalized = traversal.normalize_quality(prior, 'complete', traversal.utc_now(NOW))
+        self.assertEqual(normalized['fields']['managers'], 'partial')
+        self.assertEqual(normalized['managerAttempts'], 0)
+        self.assertEqual(normalized['managerTotalAttempts'], 6)
+        self.assertEqual(normalized['attempts'], 3)
+        self.assertEqual(normalized['strategyAttempts'], 2)
+        self.assertEqual(normalized['missingFields'], ['managers'])
+        attempt = event(at='2026-09-29T11:00:00Z')
+        attempt['funds'][0].update(qualityAttempt=True, managerAttempt=True, managerTableCoverageVersion=1,
+            reportQuality={'fields': fields, 'managerTableCoverageVersion': 1, 'priceCoverageVersion': 2, 'strategySectionCoverageVersion': 1})
+        config = {**CONFIG, 'collectorVersion': 4, 'requireReportQuality': True}
+        progress = traversal.merge_progress(catalog(), previous(prior), config, [attempt], NOW)
+        quality = progress['funds'][0]['quality']
+        self.assertEqual(quality['managerAttempts'], 0)
+        self.assertEqual(quality['managerTotalAttempts'], 6)
+        self.assertNotEqual(quality['fields']['managers'], 'complete')
+        self.assertEqual(quality['attempts'], 3)
 
 
 if __name__ == '__main__':

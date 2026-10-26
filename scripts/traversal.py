@@ -14,6 +14,7 @@ from report_managers import normalize_manager_table_coverage, manager_key
 from strategy_sections import normalize_strategy_section_coverage
 from price_coverage import CALENDAR, VERSION as PRICE_COVERAGE_VERSION, valid_complete_price
 from price_patches import valid_binding as valid_price_binding, valid_target as valid_price_target, status_for as price_patch_status
+from source_dates import china_date
 
 FUND_CODE = re.compile(r"\d{6}\Z")
 COMPANY_CODE = re.compile(r"[A-Za-z0-9_-]{1,40}\Z")
@@ -25,7 +26,7 @@ QUALITY_VALUES = {"complete", "missing", "partial", "truncated", "wrong-period",
 QUALITY_ACCEPTED = {"complete", "not-applicable"}
 QUALITY_MAX_ATTEMPTS = 3
 MANAGER_MAX_ATTEMPTS = 3
-MANAGER_TABLE_COVERAGE_VERSION = 1
+MANAGER_TABLE_COVERAGE_VERSION = 2
 STRATEGY_SECTION_COVERAGE_VERSION = 1
 STRATEGY_MAX_ATTEMPTS = 3
 ERROR_CODES = {
@@ -527,7 +528,7 @@ def valid_baseline_exemption(evidence, now):
     if not isinstance(evidence, dict) or evidence.get("reason") != "ESTABLISHED_AFTER_BASELINE" or not is_code(evidence.get("fundCode")):
         return False
     established, baseline, target = (date(evidence.get(key)) for key in ("date", "baselinePeriodEnd", "periodEnd"))
-    if not (bool(established and baseline and target) and baseline < established <= target <= now.date()
+    if not (bool(established and baseline and target) and baseline < established <= target <= china_date(now)
             and public_url(evidence.get('sourceUrl'))):
         return False
     from historical_inception import profile_source
@@ -643,7 +644,7 @@ def report_quality(fund, phase, now):
             or not public_url(report.get("sourceUrl")) or not observed or observed > now + dt.timedelta(minutes=5)):
         return None
     published = date(report.get("publishedAt"))
-    if not published or published < date(report["periodEnd"]) or published > observed.date():
+    if not published or published < date(report["periodEnd"]) or published > china_date(observed):
         return None
     if report.get("fundCode") not in (None, fund["code"]) or report.get("sourceFundCode") not in (None, fund["code"]):
         return None
@@ -690,7 +691,7 @@ def report_quality(fund, phase, now):
         if period_conflict or strategy_proof["kind"] != "quarterly" or strategy_proof["periodStart"] != quarter_start(phase["targetPeriodEnd"]):
             fields["strategy"] = "wrong-period"
         elif (strategy_proof["complete"] and strategy_observed and strategy_observed <= now + dt.timedelta(minutes=5)
-              and date(strategy_proof["publishedAt"]) <= strategy_observed.date()):
+              and date(strategy_proof["publishedAt"]) <= china_date(strategy_observed)):
             fields["strategy"] = "complete"
         elif strategy_proof["sections"] and fields["strategy"] == "missing":
             fields["strategy"] = "partial"
@@ -706,7 +707,7 @@ def report_quality(fund, phase, now):
     if (isinstance(baseline, dict) and baseline.get("periodEnd") == phase["baselinePeriodEnd"]
             and public_url(baseline.get("sourceUrl")) and date(baseline.get("publishedAt"))
             and date(baseline["publishedAt"]) >= date(baseline["periodEnd"])
-            and date(baseline["publishedAt"]) <= observed.date()
+            and date(baseline["publishedAt"]) <= china_date(observed)
             and (baseline.get("holdings") or baseline.get("noEquitiesConfirmed") is True
                  and no_equities_report_matches(baseline, baseline.get("noEquitiesEvidence")))):
         fields["baseline"] = "complete"
@@ -896,12 +897,12 @@ def clean_not_applicable(evidence, code, phase, now):
     if not isinstance(evidence, dict) or not public_url(evidence.get("sourceUrl")):
         return None
     if evidence.get("reason") == "TERMINATED_BEFORE_PERIOD":
-        return normalize_lifecycle_evidence(evidence, code, phase["targetPeriodEnd"], now.date().isoformat())
+        return normalize_lifecycle_evidence(evidence, code, phase["targetPeriodEnd"], china_date(now).isoformat())
     if evidence.get("reason") != "ESTABLISHED_AFTER_PERIOD":
         return None
     established = date(evidence.get("date"))
     if (evidence.get("fundCode") == code and evidence.get("periodEnd") == phase["targetPeriodEnd"]
-            and established is not None and date(phase["targetPeriodEnd"]) < established <= now.date()
+            and established is not None and date(phase["targetPeriodEnd"]) < established <= china_date(now)
             and urlparse(evidence["sourceUrl"]).path.endswith(f"jbgk_{code}.html")):
         return {key: evidence[key] for key in ("reason", "date", "sourceUrl", "periodEnd", "fundCode")}
     return None
@@ -1155,7 +1156,7 @@ def report_evidence(fund, phase, now, planned_at=None):
     if report.get("fundCode") not in (None, fund["code"]) or report.get("sourceFundCode") not in (None, fund["code"]):
         return None
     published = date(report.get("publishedAt"))
-    if not published or published < date(report["periodEnd"]) or published > now.date() or published > observed.date():
+    if not published or published < date(report["periodEnd"]) or published > china_date(now) or published > china_date(observed):
         return None
     result = {"sourceUrl": report["sourceUrl"], "periodEnd": report["periodEnd"],
               "publishedAt": report["publishedAt"], "observedAt": fund["retrievedAt"]}
@@ -1282,7 +1283,7 @@ def valid_event_evidence(evidence, status, phase, attempted_at):
     if not isinstance(evidence, dict) or not public_url(evidence.get("sourceUrl")) or evidence.get("periodEnd") != phase["targetPeriodEnd"]:
         return False
     published, observed = date(evidence.get("publishedAt")), instant(evidence.get("observedAt"))
-    if not published or published < date(phase["targetPeriodEnd"]) or not observed or published > observed.date() or observed > attempted_at:
+    if not published or published < date(phase["targetPeriodEnd"]) or not observed or published > china_date(observed) or observed > attempted_at:
         return False
     if status == "no-equities":
         noeq = evidence.get("noEquities") or {}

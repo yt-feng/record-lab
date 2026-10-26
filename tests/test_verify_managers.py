@@ -107,6 +107,7 @@ class VerifyManagersTests(unittest.TestCase):
             def fake(sample):
                 result = diagnose(HEADER + ROW + END)
                 result.update(code=sample['code'], case=sample['case'], sourceUrl=sample['sourceUrl'])
+                result['normalizedManagerCheck'] = {'complete': True}
                 if sample['code'] == '005892': result['tableCoverageComplete'] = False
                 return result
             with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), patch.object(verify, 'OUTPUT', path), patch.object(verify, 'run_sample', side_effect=fake):

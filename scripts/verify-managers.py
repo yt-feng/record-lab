@@ -144,14 +144,16 @@ def diagnose_pages(pages, sample, *, pdf_sha256, total_pages=None):
     report = {**sample, 'kind': 'quarterly', 'periodEnd': '2026-06-30'}
     rows, trace = trace_parser(pages, report)
     if not trace['counterAlignmentVerified']: raise DiagnosticError('PARSER_TRACE_MISMATCH')
-    coverage = rows.coverage; budget = ExcerptBudget()
+    # Reserve 200 characters for a previously missing manager recovered by the
+    # cell parser. The total original-source budget remains 800 characters.
+    coverage = rows.coverage; budget = ExcerptBudget(MAX_CONTEXT_CHARACTERS - 200)
     cleaned = [managers._clean_page(page) for page in pages]
     headings = []
     for index, page in enumerate(cleaned):
         for heading in managers._TITLE.finditer(page):
             if len(headings) < 4:
                 headings.append({'page': index + 1, 'text': budget.take(heading.group(), 55)})
-    parsed = [{'name': budget.take(row['name'], 12), 'startDate': row['startDate'], 'endDate': row['endDate'],
+    parsed = [{'name': budget.take(row['name'], 12), 'role': budget.take(row['role'], 60), 'startDate': row['startDate'], 'endDate': row['endDate'],
                'pages': row['evidence']['pages'], 'tablePage': row['evidence']['tablePage'], 'section': row['evidence']['section']}
               for row in rows]
     tables = []
@@ -212,8 +214,9 @@ def layout_structure(text, page):
 
 def add_layout_diagnostics(result, data):
     from pypdf import PdfReader
-    page_numbers = sorted({table.get(key) for table in result['tables'] for key in ('startPage', 'endPage')
-                           if type(table.get(key)) is int} | {heading['page'] for heading in result['headings']})
+    table_pages = sorted({table.get(key) for table in result['tables'] for key in ('startPage', 'endPage')
+                          if type(table.get(key)) is int})
+    page_numbers = table_pages + [heading['page'] for heading in result['headings'] if heading['page'] not in table_pages]
     reader = PdfReader(io.BytesIO(data)); summaries = []
     for number in page_numbers[:2]:
         if not 1 <= number <= min(len(reader.pages), MAX_PAGES): continue
@@ -221,6 +224,21 @@ def add_layout_diagnostics(result, data):
         summaries.append(layout_structure(text, number))
     result['layoutDiagnostics'] = summaries
     result['layoutPageLimitReached'] = len(page_numbers) > 2
+
+
+def normalized_manager_check(sample, details, now):
+    """Exercise the production JS normalizer and Python completeness gate."""
+    from verify_repairs import normalized_snapshot
+    from traversal import valid_report_managers
+    metadata = {**sample, 'kind': 'quarterly', 'periodEnd': '2026-06-30',
+                'title': '公开基金2026年第2季度报告', 'check': 'managers'}
+    fund = normalized_snapshot(metadata, details, now)
+    proof = fund.get('managerTableCoverage') or {}
+    return {'managerCount': len(fund.get('reportManagers', [])), 'parserVersion': proof.get('parserVersion'),
+            'extractionMethod': proof.get('extractionMethod'),
+            'complete': valid_report_managers(fund, fund.get('selectedReport') or {}, {'targetPeriodEnd': '2026-06-30'}),
+            'geometryPreserved': bool(proof.get('geometryEvidence')),
+            'sourcePreserved': proof.get('sourceUrl') == sample['sourceUrl']}
 
 
 def run_sample(sample):
@@ -234,6 +252,38 @@ def run_sample(sample):
     pages = _pypdf_pages(data, MAX_PAGES)
     if not any(page.strip() for page in pages): raise DiagnosticError('PDF_TEXT_EMPTY')
     result = diagnose_pages(pages, sample, pdf_sha256=hashlib.sha256(data).hexdigest(), total_pages=pages.total_pages)
+    from manager_cells import enrich_manager_details
+    baseline = managers.parse_report_managers(pages, dict(sample, kind='quarterly', periodEnd='2026-06-30'))
+    details = {'reportManagers': baseline, 'managerTableCoverage': baseline.coverage}
+    enrich_manager_details(details, data, dict(sample, kind='quarterly', periodEnd='2026-06-30'), pages)
+    final = details['reportManagers']; proof = details['managerTableCoverage']
+    # Replace the old row list instead of publishing a second copy of quotes;
+    # keep the original branch counts as the before-cells diagnosis.
+    budget = ExcerptBudget(MAX_CONTEXT_CHARACTERS - result['sourceContextCharacters'])
+    prior_text = sum(len(row.get(key, '')) for row in result['parsedManagers'] for key in ('name', 'role'))
+    budget.remaining += prior_text; budget.used = -prior_text
+    final_rows = [{'name': budget.take(row['name'], 12), 'role': budget.take(row['role'], 60),
+                   'startDate': row['startDate'], 'endDate': row['endDate'], 'pages': row['evidence']['pages'],
+                   'tablePage': row['evidence']['tablePage'], 'section': row['evidence']['section']} for row in final]
+    result['sourceContextCharacters'] += budget.used
+    result.update(parsedManagers=final_rows, baselineTableCoverageComplete=result['tableCoverageComplete'],
+                  tableCoverageComplete=proof.get('complete') is True, coverageStatus=proof.get('status'),
+                  effectiveCounts={key: proof.get(key, 0) for key in COUNTS},
+                  managerExtractionMethod=proof.get('extractionMethod'), managerParserVersion=proof.get('parserVersion'),
+                  managerCellErrorCode=details.get('managerCellErrorCode'))
+    geometry = proof.get('geometryEvidence')
+    if geometry:
+        result['geometrySummary'] = {key: geometry[key] for key in ('pdfSha256', 'sourceTextHash', 'tablePages',
+            'physicalRowCount', 'logicalRowCount', 'continuationCount', 'emptyRowCount', 'unresolvedRows')}
+        result['geometrySummary']['tables'] = [{'section': table['section'], 'columns': table['columns'],
+            'rows': [{'classification': row['classification'], 'fragments': [{key: fragment[key] for key in
+                    ('page', 'pageBox', 'cells', 'cellTextHashes', 'continuationType', 'emptyIdentityRegion') if key in fragment}
+                    for fragment in row['fragments']]} for row in table['rows']]}
+            for table in geometry['tables']]
+    try:
+        result['normalizedManagerCheck'] = normalized_manager_check(sample, details, dt.datetime.now(dt.timezone.utc))
+    except Exception:
+        result['normalizedManagerCheck'] = {'complete': False, 'errorCode': 'NORMALIZATION_CHECK_FAILED'}
     try:
         add_layout_diagnostics(result, data)
     except Exception:
@@ -255,7 +305,7 @@ def main():
         results.append(result)
     control = next(result for result in results if result['code'] == '009817')
     passed = all(result['status'] == 'diagnosed' and not result['pageReadLimitReached'] for result in results)
-    control_passed = control.get('tableCoverageComplete') is True
+    control_passed = control.get('tableCoverageComplete') is True and (control.get('normalizedManagerCheck') or {}).get('complete') is True
     result = {'schemaVersion': 1, 'status': 'diagnosed' if passed and control_passed else 'partial',
               'observedAt': dt.datetime.now(dt.timezone.utc).isoformat(), 'controlPassed': control_passed,
               'productionDataModified': False, 'results': results}

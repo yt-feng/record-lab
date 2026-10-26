@@ -8,7 +8,7 @@ from test_traversal import traversal, CONFIG, PHASE, NOW, catalog, event
 def previous(quality):
     return {"schemaVersion": 1, "phase": PHASE, "collectorVersion": 4, "funds": [{"code": "000001", "companyCode": "co1",
         "status": "complete", "attempts": 1, "lastAttemptAt": "2026-09-29T10:00:00Z",
-        "quality": {"managerTableCoverageVersion": 1, "priceCoverageVersion": 2, **quality}}]}
+        "quality": {"managerTableCoverageVersion": traversal.MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2, **quality}}]}
 
 
 class StrategyQualityTests(unittest.TestCase):
@@ -48,7 +48,7 @@ class StrategyQualityTests(unittest.TestCase):
     def test_legacy_strategy_complete_gets_only_its_own_new_budget(self):
         fields = {key: "complete" for key in traversal.QUALITY_FIELDS}
         old = {"fields": fields, "attempts": 3, "totalAttempts": 8, "managerAttempts": 2, "managerTotalAttempts": 4,
-               "managerTableCoverageVersion": 1, "priceCoverageVersion": 2, "strategyAttempts": 3, "strategyTotalAttempts": 3}
+               "managerTableCoverageVersion": traversal.MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2, "strategyAttempts": 3, "strategyTotalAttempts": 3}
         value = traversal.normalize_quality(old, "complete", traversal.utc_now(NOW))
         self.assertEqual(value["missingFields"], ["strategy"])
         self.assertEqual(value["fields"]["strategy"], "partial")

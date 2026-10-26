@@ -14,7 +14,8 @@ const manager = (name = '季度经理', changes = {}) => ({ name, role: '本基�
     tablePage: 5, section: '4.1', text: `${name} 本基金基金经理 2025年1月1日 -`, method: 'explicit-report-manager-table', periodEnd: target }, ...changes });
 function coverage(managers, changes = {}) {
   const counts = { candidateRows: managers.length, parsedRows: managers.length, ignoredKnownRoleRows: 0, excludedRows: 0, outsidePeriodRows: 0, duplicateRows: 0 };
-  return { schemaVersion: 1, method: 'bounded-report-manager-tables', sourceUrl: 'https://example.org/quarter.pdf',
+  return { schemaVersion: 1, parserVersion: 2, extractionMethod: 'plain-text-manager-table',
+    method: 'bounded-report-manager-tables', sourceUrl: 'https://example.org/quarter.pdf',
     periodStart: '2026-04-01', periodEnd: target, publishedAt: '2026-07-20', kind: 'quarterly', sourceTextHash: 'a'.repeat(64), ...counts,
     outputManagerCount: managers.length, managerKeys: managers.map(item => JSON.stringify([item.name, item.startDate, item.endDate, item.role])),
     tables: [{ section: '4.1', startPage: 5, endPage: 5, endSection: '4.2', heading: '4.1 基金经理简介', endHeading: '4.2 运作说明',

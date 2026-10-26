@@ -90,7 +90,9 @@
       "complete": true,
       "status": "complete",
       "method": "bounded-report-manager-tables",
-      "publishedAt": "2026-07-20"
+      "publishedAt": "2026-07-20",
+      "parserVersion": 2,
+      "extractionMethod": "plain-text-manager-table"
     }
   },
   "invalid-date": {
@@ -162,7 +164,9 @@
       "complete": false,
       "status": "partial",
       "method": "bounded-report-manager-tables",
-      "publishedAt": "2026-07-20"
+      "publishedAt": "2026-07-20",
+      "parserVersion": 2,
+      "extractionMethod": "plain-text-manager-table"
     }
   },
   "missing-date": {
@@ -234,7 +238,9 @@
       "complete": false,
       "status": "partial",
       "method": "bounded-report-manager-tables",
-      "publishedAt": "2026-07-20"
+      "publishedAt": "2026-07-20",
+      "parserVersion": 2,
+      "extractionMethod": "plain-text-manager-table"
     }
   },
   "unknown-page": {
@@ -306,7 +312,9 @@
       "complete": false,
       "status": "partial",
       "method": "bounded-report-manager-tables",
-      "publishedAt": "2026-07-20"
+      "publishedAt": "2026-07-20",
+      "parserVersion": 2,
+      "extractionMethod": "plain-text-manager-table"
     }
   },
   "no-end-boundary": {
@@ -378,7 +386,9 @@
       "complete": false,
       "status": "partial",
       "method": "bounded-report-manager-tables",
-      "publishedAt": "2026-07-20"
+      "publishedAt": "2026-07-20",
+      "parserVersion": 2,
+      "extractionMethod": "plain-text-manager-table"
     }
   },
   "internal-six-page-cap": {
@@ -450,7 +460,9 @@
       "complete": false,
       "status": "partial",
       "method": "bounded-report-manager-tables",
-      "publishedAt": "2026-07-20"
+      "publishedAt": "2026-07-20",
+      "parserVersion": 2,
+      "extractionMethod": "plain-text-manager-table"
     }
   },
   "unsupported-name": {
@@ -522,7 +534,9 @@
       "complete": false,
       "status": "partial",
       "method": "bounded-report-manager-tables",
-      "publishedAt": "2026-07-20"
+      "publishedAt": "2026-07-20",
+      "parserVersion": 2,
+      "extractionMethod": "plain-text-manager-table"
     }
   },
   "other-partial": {
@@ -594,7 +608,9 @@
       "complete": false,
       "status": "partial",
       "method": "bounded-report-manager-tables",
-      "publishedAt": "2026-07-20"
+      "publishedAt": "2026-07-20",
+      "parserVersion": 2,
+      "extractionMethod": "plain-text-manager-table"
     }
   },
   "interim": {
@@ -688,7 +704,9 @@
       "complete": true,
       "status": "complete",
       "method": "bounded-report-manager-tables",
-      "publishedAt": "2026-08-28"
+      "publishedAt": "2026-08-28",
+      "parserVersion": 2,
+      "extractionMethod": "plain-text-manager-table"
     }
   }
 }

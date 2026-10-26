@@ -20,6 +20,7 @@ import time
 from collect import pdf_holdings_evidence
 from providers import PublicProvider
 from publication_guard import inspect_content
+from source_dates import china_today
 from traversal import report_quality
 
 
@@ -100,7 +101,7 @@ def normalized_snapshot(sample, details, now):
         # Manager checks deliberately do not assert that this report's equity
         # table was fully recovered. A report-only record supports attribution.
         report["reportOnly"] = True
-    payload = {"asOf": now.date().isoformat(), "retrievedAt": now.isoformat(), "errors": [], "barsByStock": {},
+    payload = {"asOf": china_today(now), "retrievedAt": now.isoformat(), "errors": [], "barsByStock": {},
                "funds": [{"code": sample["code"], "name": "公开报告验证", "reports": [report], "managers": []}]}
     config = {**phase_for(sample), "funds": [{"code": sample["code"]}]}
     try:

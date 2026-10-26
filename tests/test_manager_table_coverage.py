@@ -55,6 +55,14 @@ class ManagerTableCoverageTests(unittest.TestCase):
         forged = copy.deepcopy(rows.coverage); forged['tables'][0]['ignoredRoles'] = []
         self.assertFalse(normalize_manager_table_coverage(forged, rows, REPORT['periodEnd'])['complete'])
 
+    def test_biography_name_or_ambiguous_assistant_role_never_bypasses_whole_table_counting(self):
+        for extra in ['纯债债券型证券投资基金 基金经理助理、研究员。\n',
+                      '王明 本基金基金经理兼基金经理助理 2025年1月1日 - 5年\n']:
+            rows = parse_report_managers([HEADER + FIRST + extra + '4.2 运作说明'], REPORT)
+            self.assertFalse(rows.coverage['complete'])
+            self.assertEqual(rows.coverage['ignoredKnownRoleRows'], 0)
+            self.assertGreater(rows.coverage['excludedRows'], 0)
+
     def test_forged_counts_keys_hash_or_boundary_cannot_make_complete(self):
         rows = parse_report_managers([HEADER + FIRST + SECOND], REPORT)
         for alter in [lambda value: value.update(sourceTextHash='bad'), lambda value: value.update(outputManagerCount=1),
