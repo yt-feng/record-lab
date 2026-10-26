@@ -158,12 +158,20 @@
   }
   function retryState(progress) {
     if (!progress) return { label: '研究完整度待核验', detail: '' };
+    if (progress.quarterUniverse?.required === true && progress.quarterUniverse.historicalUniverseVerified !== true
+      && progress.completionAudit?.knownDirectoryComplete === true) return { label: '已知目录字段齐全，历史范围待核验', detail: '' };
     if (progress.completionStatus === 'complete') return { label: '适用产品研究字段已齐', detail: '' };
     const scheduled = validTimestamp(progress.nextRetryAt);
     const detail = scheduled ? `后续复查不早于 ${formatRetryAt(progress.nextRetryAt)}，具体执行以任务运行记录为准。` : '';
     if (scheduled && (progress.continueRun === false || progress.completionStatus === 'incomplete-exhausted')) return { label: '本轮结束，等待复查', detail };
     if (progress.completionStatus === 'incomplete-exhausted') return { label: '仍有缺项，需继续处理', detail };
     return { label: '仍在补采', detail };
+  }
+  function universeDescription(progress, catalog, targetPeriodEnd) {
+    const candidate = progress?.quarterUniverse || catalog?.quarterUniverse;
+    const value = isRecord(candidate) && candidate.schemaVersion === 1 && candidate.targetPeriodEnd === targetPeriodEnd ? candidate : {};
+    const added = countValue(value.historicalAddedFundCount) ? value.historicalAddedFundCount : 0;
+    return `报告期历史产品名单尚未完整核验；当前分母为已发现的基金份额代码${added ? `，其中历史来源补入 ${formatNumber(added, 0)} 个` : ''}。${value.historicalParseStatus === 'complete' ? '历史文件已解析，产品及份额范围仍需逐项核对。' : '期后清盘或合并、已从当前目录消失的产品仍在核对。'}`;
   }
   function fundQuality(progress, fund) {
     const direct = progress?.funds?.find(item => item.code === fund.code);
@@ -623,7 +631,7 @@
       const overview = coverageOverview(state.catalog, state.progress, state.manifest || state.data);
       $('stat-funds').textContent = `${formatNumber(overview.coveredFunds, 0)} / ${overview.totalFunds === null ? '—' : formatNumber(overview.totalFunds, 0)}`;
       $('stat-companies').textContent = `${formatNumber(overview.coveredCompanies, 0)} / ${overview.totalCompanies === null ? '—' : formatNumber(overview.totalCompanies, 0)}`;
-      $('stat-scope').textContent = overview.totalFunds !== null ? '目录按份额计数；同组合持仓不重复合计' : '全量目录生成中，分母尚未确认';
+      $('stat-scope').textContent = overview.totalFunds !== null ? '已发现目录按份额计数；历史范围仍待核验' : '目录生成中，历史分母尚未确认';
       $('stat-company-note').textContent = overview.totalCompanies !== null ? '目录公司均可查询处理状态' : '全量目录生成中，已有报告不代表全量';
       const freshness = catalogFreshness(state.catalog);
       if (freshness.staleCompanyCount) $('stat-company-note').textContent = `${freshness.staleCompanyCount} 家归属沿用缓存，核验日期见公司行`;
@@ -667,6 +675,7 @@
         const retry = retryState(state.progress);
         if (retry.detail) quality.append(el('p', '', `${retry.label}。${retry.detail}`));
       }
+      quality.append(el('p', 'narrative-meta', universeDescription(state.progress, state.catalog, state.period?.targetPeriodEnd)));
       $('catalog-dates').textContent = [state.catalog ? `主目录截至 ${state.catalog.asOf} · 本次目录获取 ${state.catalog.retrievedAt}` : '目录待生成',
         state.progress ? `进度更新 ${state.progress.updatedAt}` : '进度待生成'].join(' · ');
       const companies = companyCoverage(state.catalog, state.progress, $('company-search').value);
@@ -1139,5 +1148,5 @@
   }
 
   return { validateDataset, validateCatalog, validateProgress, validatePeriods, selectQuarter, periodDataPath, validatePeriodDataset, responseText, researchOverview, notApplicableBreakdown, retryState, formatRetryAt, fundQuality, catalogComplete, catalogFreshness, companyDirectoryLabel, safeCompanyPath, companyPages, companyRecordSummaries, catalogIndex, companyCoverage, coverageOverview, safeHttpUrl, validEmptyStockEvidence, managerNames, managerAttributionLabel, managerTermLabel, reportPeriod, changeGroup, latestFunds, filterFunds,
-    strategyEvidence, formatNumber, formatMoney, signed, holdingValue, priceDescription, csvCell, exportCsv, observationState, mount };
+    strategyEvidence, universeDescription, formatNumber, formatMoney, signed, holdingValue, priceDescription, csvCell, exportCsv, observationState, mount };
 });

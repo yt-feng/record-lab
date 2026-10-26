@@ -207,12 +207,23 @@ function boundedParts(kind, field, items, prefix, phase, limit, writePart, onPar
 
 function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = () => {}, maxPartBytes = PART_LIMIT,
   now = new Date() } = {}) {
-  if (!manifest || manifest.schemaVersion !== 1 || manifest.sourceMode !== 'actions' || !stamp(manifest.retrievedAt)
-    || !validDate(manifest.asOf) || !Array.isArray(manifest.companyFiles) || manifest.companyFiles.length > 10000) fail('INVALID_ANALYSIS_MANIFEST');
+  const awaitingData = manifest?.coverage?.status === 'awaiting-data';
+  const emptyObservation = awaitingData && manifest.asOf === null && manifest.retrievedAt === null
+    && manifest.priceUpdatedAt == null && manifest.coverage.fundCount === 0 && manifest.coverage.complete !== true
+    && Array.isArray(manifest.funds) && manifest.funds.length === 0
+    && Array.isArray(manifest.companyFiles) && manifest.companyFiles.length === 0
+    && ['companyCount', 'holdingCount', 'priceAvailable', 'priceComplete', 'narrativeCount', 'noEquitiesFundCount',
+      'notApplicableFundCount', 'establishedAfterPeriodFundCount', 'terminatedBeforePeriodFundCount', 'reportOnlyFundCount',
+      'catalogAvailableFundCount', 'unmatchedCompanyFundCount'].every(key => manifest.coverage[key] === undefined || manifest.coverage[key] === 0)
+    && (manifest.companyCoverage === undefined || Array.isArray(manifest.companyCoverage) && manifest.companyCoverage.every(company => company
+      && ['availableFundCount', 'availablePortfolioCount'].every(key => company[key] === undefined || company[key] === 0)));
+  if (!manifest || manifest.schemaVersion !== 1 || manifest.sourceMode !== 'actions'
+    || !Array.isArray(manifest.companyFiles) || manifest.companyFiles.length > 10000
+    || (awaitingData ? !emptyObservation : !stamp(manifest.retrievedAt) || !validDate(manifest.asOf))) fail('INVALID_ANALYSIS_MANIFEST');
   const phase = datesFor(manifest.targetPeriodEnd, manifest.baselinePeriodEnd);
   const currentTime = new Date(now);
-  if (!Number.isFinite(currentTime.getTime()) || manifest.asOf > currentTime.toISOString().slice(0, 10)
-    || Date.parse(manifest.retrievedAt) > currentTime.getTime() + 300000 || manifest.asOf < phase.target) fail('ANALYSIS_FUTURE_OBSERVATION');
+  if (!Number.isFinite(currentTime.getTime()) || !awaitingData && (manifest.asOf > currentTime.toISOString().slice(0, 10)
+    || Date.parse(manifest.retrievedAt) > currentTime.getTime() + 300000 || manifest.asOf < phase.target)) fail('ANALYSIS_FUTURE_OBSERVATION');
   if (manifest.priceUpdatedAt != null && (!stamp(manifest.priceUpdatedAt)
     || Date.parse(manifest.priceUpdatedAt) > currentTime.getTime() + 300000)) fail('ANALYSIS_FUTURE_OBSERVATION');
   phase.generation = currentTime.toISOString();
@@ -360,7 +371,7 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
     for (const field of Object.keys(stock).filter(key => key.startsWith('_'))) delete stock[field];
   }
   const research = progress?.research;
-  const coverage = { status: 'partial', complete: false, inputRecords, analyzedRecords: portfolios.length,
+  const coverage = { status: awaitingData ? 'awaiting-data' : 'partial', complete: false, inputRecords, analyzedRecords: portfolios.length,
     currentHoldingRecords, noEquityRecords, reportOnlyRecords, excludedNotApplicable, duplicatesRemoved,
     stockCount: ordered.length, contributionCount: ordered.reduce((sum, stock) => sum + Object.values(stock.changes).reduce((a, b) => a + b, 0), 0),
     identityUnresolvedRecords: unknownIdentityRecords, identityUnresolvedHoldingRecords: unknownIdentityHoldingRecords,
@@ -380,16 +391,21 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
     sourceProcessedShareCodes: progress?.processedFunds ?? null, sourceResearchCompleteShareCodes: research?.completeFunds ?? null,
     sourceResearchApplicableShareCodes: research?.applicableFunds ?? null,
     sourceCompletionStatus: progress?.completionStatus || 'unknown',
+    // A complete current directory is not a certificate for products that
+    // disappeared before discovery. No such historical certificate exists yet.
+    historicalUniverseVerified: false,
+    historicalUniverseStatus: ['current-directory-only', 'supplemented-unverified'].includes(progress?.quarterUniverse?.status)
+      && progress.quarterUniverse.targetPeriodEnd === phase.target ? progress.quarterUniverse.status : 'unchecked',
     valueAggregationScope: 'source-verified-portfolios-only', holdingsScope: 'disclosed-holdings-only',
     recordCountScope: 'proven-portfolios-and-unresolved-fund-records', strategyScope: 'report-level-selected-evidence',
     changeCountsScope: 'record-level-disclosure-changes-not-trades',
     managerEvidenceScope: 'bounded-complete-report-manager-tables', managerCountsScope: 'report-period-managers-not-exclusive-period-end-owners', actualCostsKnown: false };
-  if (progress?.completionStatus === 'complete' && Number.isInteger(research?.completeFunds)
+  if (!awaitingData && coverage.historicalUniverseVerified && progress?.completionStatus === 'complete' && Number.isInteger(research?.completeFunds)
     && Number.isInteger(research?.applicableFunds) && research.completeFunds === research.applicableFunds
     && !unknownIdentityHoldingRecords && !conflicts && !invalidRows && !reportOnlyRecords && !coverage.managerEvidenceMissingRecords
     && !coverage.incompletePriceStocks && !coverage.strategySectionIncompleteRecords
     && inputRecords === manifest.coverage?.fundCount) { coverage.status = 'complete'; coverage.complete = true; }
-  const output = { schemaVersion: 1, analysisVersion: 4, kind: 'quarter-analysis', targetPeriodEnd: phase.target, baselinePeriodEnd: phase.baseline,
+  const output = { schemaVersion: 1, analysisVersion: 5, kind: 'quarter-analysis', targetPeriodEnd: phase.target, baselinePeriodEnd: phase.baseline,
     asOf: manifest.asOf, retrievedAt: manifest.retrievedAt, priceUpdatedAt: manifest.priceUpdatedAt || null,
     generatedAt: phase.generation, generation: phase.generation, coverage,
     stocks: ordered, portfolioFiles,

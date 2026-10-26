@@ -941,7 +941,27 @@ def eligible_work(states, config):
     return source_codes, quality_codes, enrich_codes
 
 
-def completion_audit(states, config, now, directory_pending=False):
+def quarter_universe_audit(catalog, config):
+    """Keep known-directory work separate from an audited historical universe.
+
+    No historical adapter in this release certifies all period-end products and
+    share classes. A caller-supplied boolean cannot manufacture that certificate.
+    """
+    raw = catalog.get("quarterUniverse", {}) if isinstance(catalog, dict) else {}
+    if not isinstance(raw, dict) or raw.get("schemaVersion") != 1 or raw.get("targetPeriodEnd") != config.get("targetPeriodEnd"):
+        raw = {}
+    return {"schemaVersion": 1, "targetPeriodEnd": config.get("targetPeriodEnd"),
+            "required": config.get("requireHistoricalUniverse") is True,
+            "historicalUniverseVerified": False,
+            "status": raw.get("status") if raw.get("status") in {"current-directory-only", "supplemented-unverified"} else "unchecked",
+            "currentDirectoryComplete": raw.get("currentDirectoryComplete") is True,
+            "historicalParseStatus": raw.get("historicalParseStatus") if raw.get("historicalParseStatus") in {"unchecked", "partial", "complete"} else "unchecked",
+            "historicalSourceCount": counter(raw.get("historicalSourceCount")),
+            "historicalAddedFundCount": counter(raw.get("historicalAddedFundCount")),
+            "recordUnit": "fund-share-code"}
+
+
+def completion_audit(states, config, now, directory_pending=False, universe=None):
     """Small public counters for review; overlapping dimensions are explicit.
 
     No absence or exhausted attempt is converted into a completed observation.
@@ -969,9 +989,14 @@ def completion_audit(states, config, now, directory_pending=False):
     attention = [item for item in unresolved_tasks if item["code"] not in actionable]
     field_states = {key: {value: sum(item["quality"]["fields"][key] == value for item in applicable)
                           for value in sorted(QUALITY_VALUES)} for key in QUALITY_FIELDS}
+    universe = universe or quarter_universe_audit({}, config)
+    known_complete = len(complete) == len(applicable) and not directory_pending
+    historical_pending = universe["required"] and not universe["historicalUniverseVerified"]
     return {"schemaVersion": 1, "asOf": now.isoformat(), "coverageUnit": "fund-share-code",
             "taskUnit": "representative-product-code", "directoryPending": bool(directory_pending),
-            "complete": len(complete) == len(applicable) and not directory_pending,
+            "knownDirectoryComplete": known_complete, "quarterUniverse": universe,
+            "historicalUniverseReviewRequired": historical_pending,
+            "complete": known_complete and not historical_pending,
             "sourceCoverage": {"totalFunds": len(rows), "pendingFunds": sum(item["status"] == "pending" for item in rows),
                 "failedFunds": len(failed), "observedFunds": sum(item["status"] in SUCCESS for item in rows),
                 "notApplicableFunds": len(rows) - len(applicable),
@@ -1629,7 +1654,9 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
     research_pending = sum(state["status"] in SUCCESS and state["quality"]["status"] == "pending" for state in all_states)
     research_exhausted = sum(state["status"] in SUCCESS and state["quality"]["status"] == "exhausted" for state in all_states)
     applicable = len(records) - not_applicable
-    completed = (research_complete == applicable if quality_enabled(config) else processed == applicable) and not directory_incomplete(companies, records)
+    universe = quarter_universe_audit(catalog, config)
+    audit = completion_audit(states, config, current, directory_incomplete(companies, records), universe)
+    completed = audit["complete"]
     directory_retry = midnight(current.date() + dt.timedelta(days=1)) if directory_incomplete(companies, records) and passes < 12 else None
     next_retry = min((value for value in [directory_retry, *(state.get("nextRetryAt") for state in all_states)] if value), default=None)
     return {"schemaVersion": 1, "phase": phase, "updatedAt": current.isoformat(), "collectorVersion": collector_version(config),
@@ -1644,7 +1671,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
             "retryableFailedFunds": sum(state["status"] == "failed" and state["attempts"] < 2 for state in all_states),
             "unmappedFunds": sum(state["companyCode"] is None for state in all_states),
             "completionStatus": "complete" if completed else "incomplete-running" if continuing else "incomplete-exhausted",
-            "completionAudit": completion_audit(states, config, current, directory_incomplete(companies, records)),
+            "completionAudit": audit, "quarterUniverse": universe,
             "research": {"enabled": quality_enabled(config), "applicableFunds": applicable, "completeFunds": research_complete,
                          "sixFieldsCompleteFunds": six_fields_complete,
                          "incompleteFunds": applicable - research_complete, "pendingFunds": research_pending,

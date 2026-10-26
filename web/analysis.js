@@ -21,6 +21,7 @@
   }
   const generationValue = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(Date.parse(value));
   const money = x => finite(x) ? new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(x / 1e8) + ' 亿元' : '未取得';
+  const priceNumber = x => new Intl.NumberFormat('zh-CN', { maximumFractionDigits: Math.abs(x) < 0.01 ? 6 : 4 }).format(x);
   const url = value => { try { const u = new URL(value); return u.protocol === 'https:' && !u.username && !u.password ? u.href : null; } catch { return null; } };
   const quarter = value => typeof value === 'string' && /^2026Q[23]$/.test(value);
   const partPath = value => typeof value === 'string' && /^\.\/analysis\/details-(?:portfolios-)?\d+\.json(?:\.gz)?$/.test(value);
@@ -35,6 +36,11 @@
       || data.targetPeriodEnd !== end || data.baselinePeriodEnd !== baseline || !generationValue(data.generation) || !object(data.coverage)
       || !Array.isArray(data.stocks) || data.stocks.length > 30000 || !Array.isArray(data.portfolioFiles)
       || !Array.isArray(data.themes)) throw new Error('INVALID_ANALYSIS');
+    if (data.coverage.status === 'awaiting-data' && (data.asOf !== null || data.retrievedAt !== null
+      || data.priceUpdatedAt != null || data.coverage.complete !== false
+      || !['inputRecords', 'analyzedRecords', 'stockCount', 'contributionCount'].every(key => data.coverage[key] === 0)
+      || data.stocks.length || data.portfolioFiles.length || data.themes.length
+      || !Array.isArray(data.topStockKeys) || data.topStockKeys.length)) throw new Error('INVALID_ANALYSIS');
     const seen = new Set();
     for (const stock of data.stocks) {
       if (!object(stock) || typeof stock.key !== 'string' || seen.has(stock.key) || typeof stock.stockName !== 'string'
@@ -127,7 +133,7 @@
         const priceCoverage = prices?.coverageVersion === 2 && prices?.completeness === 'complete'
           ? '交易日完整' : '已观测，完整区间待补全';
         const interval = prices?.status === 'observed' && finite(prices.low) && finite(prices.high)
-          ? `${prices.low} — ${prices.high} ${prices.currency} · ${priceCoverage}` : '未取得可比较区间';
+          ? `${priceNumber(prices.low)} — ${priceNumber(prices.high)} ${prices.currency} · ${priceCoverage}` : '未取得可比较区间';
         [`${stock.currentPortfolioCount} / ${stock.identityUnresolvedCount}`, money(stock.disclosedValueYuan), money(stock.navWeightEstimateYuan),
           `${stock.changes.increase || 0} / ${stock.changes.decrease || 0}`, `${stock.changes.enteredDisclosure || 0} / ${stock.changes.leftDisclosure || 0}`, interval].forEach(value => row.append(element('td', value)));
         body.append(row);
@@ -217,11 +223,17 @@
       try {
         const value = validate(await read('analysis.json', controller.signal, selected), selected);
         if (current !== request) return;
+        if (value.coverage.status === 'awaiting-data') {
+          reset(`${selected} · 等待有效报告数据，尚无可分析记录。采集未完成，暂未形成报告或行情观测时间。`);
+          $('analysis-result-count').textContent = '0 条已取得记录 · 等待数据';
+          return;
+        }
         data = value;
         $('analysis-status').textContent = `${selected} · ${data.stocks.length.toLocaleString()} 只证券已建立分析索引 · 观察截至 ${data.asOf || data.retrievedAt || '见来源'}。经理表完整 ${data.coverage.reportManagerRecords || 0} 条组合记录，部分 ${data.coverage.reportManagerPartialRecords || 0} 条，待补总计 ${data.coverage.managerEvidenceMissingRecords || 0} 条。当前为已采集样本，完整度以本季度覆盖清单为准。金额以人民币计，价格保留原币种。`;
         const themes = $('analysis-themes'); themes.replaceChildren(element('h3', '基金报告中的策略主题'));
         if (generationValue(data.priceUpdatedAt)) themes.append(element('p', `行情单独更新 ${data.priceUpdatedAt}；报告原有观测日期保留。`, 'narrative-meta'));
         themes.append(element('p', `策略章节完整提取 ${data.coverage.strategySectionCompleteRecords || 0} 条组合记录，待完整核验 ${data.coverage.strategySectionIncompleteRecords ?? data.coverage.analyzedRecords ?? 0} 条；已有摘录 ${data.coverage.strategyRecords || 0} 条。摘录可用与整节完整分开计数。`, 'narrative-meta'));
+        themes.append(element('p', '报告期历史产品名单尚未完整核验；本页汇总当前已取得的记录，不能据此视为全行业完整结果。', 'narrative-meta'));
         themes.append(element('p', '主题按本季度报告原文规则归类；计数为有对应表述的组合，不能解释为全行业结论或单只股票交易动机。', 'filter-tip'));
         const list = element('div', undefined, 'analysis-theme-list');
         for (const theme of data.themes) if (typeof theme.name === 'string' && count(theme.portfolioCount)) list.append(element('span', `${theme.name} · ${theme.portfolioCount} 个组合`, 'badge'));
