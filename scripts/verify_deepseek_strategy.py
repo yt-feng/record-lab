@@ -35,12 +35,38 @@ RESULT_FIELDS = {'schemaVersion', 'kind', 'sample', 'generatedAt', 'requestedMod
     'semanticAnalysisComplete', 'productionAdmission', 'quotePoolIntegration'}
 INFERENCE_FIELDS = {'schemaVersion', 'provider', 'requestedModel', 'promptVersion', 'endpoint', 'status',
     'attempted', 'requestCount', 'errorCode', 'receipt', 'usage', 'responseModel', 'responseDigest',
-    'analysis', 'semanticAnalysisComplete', 'productionReady', 'formatDiagnostics'}
+    'analysis', 'semanticAnalysisComplete', 'productionReady', 'formatDiagnostics', 'bindingDiagnostics'}
 PRIVATE_FIELDS = {'body', 'content', 'section_text', 'sentences', 'messages', 'reasoning_content',
     'raw', 'rawText', 'fullText', 'markdown', 'authorization', 'api_key', 'credential', 'sectionsText'}
 FORMAT_FIELDS = {'schemaVersion', 'digestEncoding', 'originalBytes', 'originalCharacters', 'originalDigest',
     'leadingToken', 'fence', 'normalization', 'normalizedBytes', 'normalizedCharacters', 'normalizedDigest',
     'jsonStatus', 'jsonError'}
+BINDING_FIELDS = {'schemaVersion', 'method', 'modelSpanFormat', 'status', 'sentenceCount',
+    'examinedClaimCount', 'examinedSpanCount', 'boundSpanCount', 'errorCode', 'boundResponseDigest'}
+BINDING_ERRORS = ('STRICT_VALIDATOR_PREFLIGHT_REJECTED', 'MODEL_SPAN_SHAPE_INVALID',
+    'MODEL_LITERAL_EMPTY', 'MODEL_LITERAL_NOT_FOUND', 'MODEL_LITERAL_AMBIGUOUS', 'MODEL_BINDING_LIMIT')
+
+
+def valid_binding_diagnostics(value):
+    """Expose fixed binding counters and hashes, never a model literal or error body."""
+    if value is None:
+        return True
+    if (type(value) is not dict or set(value) != BINDING_FIELDS
+            or type(value['schemaVersion']) is not int or value['schemaVersion'] != 1
+            or value['method'] != 'unique-exact-sentence-span-v1'
+            or value['modelSpanFormat'] != 'text-only-v1' or value['status'] not in ('bound', 'rejected')):
+        return False
+    for key, maximum in (('sentenceCount', 128), ('examinedClaimCount', 512),
+                         ('examinedSpanCount', 19456), ('boundSpanCount', 19456)):
+        if type(value[key]) is not int or not 0 <= value[key] <= maximum:
+            return False
+    if value['boundSpanCount'] > value['examinedSpanCount']:
+        return False
+    if value['status'] == 'bound':
+        return (value['sentenceCount'] > 0 and value['boundSpanCount'] == value['examinedSpanCount']
+                and value['errorCode'] is None and isinstance(value['boundResponseDigest'], str)
+                and re.fullmatch(r'[a-f0-9]{64}', value['boundResponseDigest']) is not None)
+    return value['errorCode'] in BINDING_ERRORS and value['boundResponseDigest'] is None
 
 
 def valid_format_diagnostics(value):
@@ -126,9 +152,12 @@ def write_result(result, output=OUTPUT):
             or result['inference'] is not None and (not isinstance(result['inference'], dict)
                 or set(result['inference']) != INFERENCE_FIELDS
                 or not valid_format_diagnostics(result['inference']['formatDiagnostics'])
+                or not valid_binding_diagnostics(result['inference']['bindingDiagnostics'])
                 or result['inference']['status'] == 'validated' and
                     (result['inference']['formatDiagnostics'] is None
-                     or result['inference']['formatDiagnostics']['jsonStatus'] != 'valid'))):
+                     or result['inference']['formatDiagnostics']['jsonStatus'] != 'valid'
+                     or result['inference']['bindingDiagnostics'] is None
+                     or result['inference']['bindingDiagnostics']['status'] != 'bound'))):
         raise ValueError('PUBLICATION_REJECTED')
     encoded = json.dumps(result, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
     if len(encoded) > MAX_ARTIFACT_BYTES or inspect_content(encoded, max_bytes=MAX_ARTIFACT_BYTES):

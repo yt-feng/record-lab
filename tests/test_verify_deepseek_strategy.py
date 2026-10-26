@@ -74,6 +74,10 @@ class VerifyDeepSeekTests(unittest.TestCase):
         analysis = result['inference']['analysis']
         self.assertEqual(analysis['coverage']['unknown'], 2)
         self.assertFalse(analysis['semanticCorrectnessVerified']); self.assertEqual(result['publicEvidence'], [])
+        diagnostic = result['inference']['bindingDiagnostics']
+        self.assertEqual(diagnostic['status'], 'bound')
+        self.assertEqual((diagnostic['examinedClaimCount'], diagnostic['examinedSpanCount'], diagnostic['boundSpanCount']), (0, 0, 0))
+        self.assertTrue(verify.valid_binding_diagnostics(diagnostic))
 
     def test_transport_timeout_retains_started_receipt_without_retry(self):
         calls = []
@@ -148,6 +152,10 @@ class VerifyDeepSeekTests(unittest.TestCase):
             self.assertEqual(result['modelReceipt'], result['inference']['receipt'])
             self.assertEqual(result['modelRequests'], 1); self.assertFalse(result['productionReady'])
             self.assertFalse(result['semanticAnalysisComplete'])
+            binding = result['inference']['bindingDiagnostics']
+            self.assertTrue(verify.valid_binding_diagnostics(binding)); self.assertEqual(binding['status'], 'bound')
+            self.assertGreater(binding['examinedSpanCount'], 0)
+            self.assertEqual(binding['boundSpanCount'], binding['examinedSpanCount'])
             with tempfile.TemporaryDirectory() as directory:
                 output = Path(directory) / 'result.json'; verify.write_result(result, output)
                 saved = json.loads(output.read_bytes())
@@ -218,9 +226,105 @@ class VerifyDeepSeekTests(unittest.TestCase):
         self.assertEqual(len(calls), 1); self.assertEqual(result['status'], 'unknown')
         self.assertEqual(result['modelRequests'], 1); self.assertEqual(result['modelReceipt']['outcome'], 'unknown')
         self.assertIsNone(result['inference']['formatDiagnostics'])
+        self.assertIsNone(result['inference']['bindingDiagnostics'])
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / 'result.json'; verify.write_result(result, output)
             self.assertNotIn('PRIVATE_', output.read_text())
+
+    def test_binding_diagnostics_have_exact_fields_counts_and_no_literal_or_error_text(self):
+        good = self.run_sample(); original = good['inference']['bindingDiagnostics']
+        self.assertTrue(verify.valid_binding_diagnostics(original))
+        malformed = []
+        for key, value in [('schemaVersion', True), ('method', 'repair-model-text'), ('modelSpanFormat', 'offsets'),
+                           ('status', 'complete'), ('sentenceCount', 0), ('sentenceCount', 129),
+                           ('examinedClaimCount', 1.0), ('examinedClaimCount', 513),
+                           ('examinedSpanCount', True), ('examinedSpanCount', 19457),
+                           ('boundSpanCount', -1), ('boundSpanCount', original['examinedSpanCount'] + 1),
+                           ('boundSpanCount', original['examinedSpanCount'] - 1),
+                           ('errorCode', 'PRIVATE_BINDING_ERROR_SENTINEL'), ('boundResponseDigest', None),
+                           ('boundResponseDigest', 'G' * 64), ('boundResponseDigest', {'text': 'PRIVATE_SENTINEL'})]:
+            changed = copy.deepcopy(original); changed[key] = value; malformed.append(changed)
+        for key in ('text', 'message', 'body', 'privateTrace', 'span'):
+            changed = copy.deepcopy(original); changed[key] = 'PRIVATE_LITERAL_SENTINEL'; malformed.append(changed)
+        rejected = {**copy.deepcopy(original), 'status': 'rejected', 'errorCode': 'MODEL_LITERAL_AMBIGUOUS',
+                    'boundSpanCount': 0, 'boundResponseDigest': None}
+        self.assertTrue(verify.valid_binding_diagnostics(rejected))
+        for update in ({'errorCode': None}, {'errorCode': 'MODEL_LITERAL_AMBIGUOUS: PRIVATE_SENTINEL'},
+                       {'boundResponseDigest': '0' * 64}):
+            malformed.append({**rejected, **update})
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'result.json'
+            for diagnostic in malformed:
+                with self.subTest(diagnostic=diagnostic):
+                    self.assertFalse(verify.valid_binding_diagnostics(diagnostic))
+                    changed = copy.deepcopy(good); changed['inference']['bindingDiagnostics'] = diagnostic
+                    with self.assertRaisesRegex(ValueError, 'PUBLICATION_REJECTED'): verify.write_result(changed, output)
+                    self.assertFalse(output.exists())
+            for diagnostic in (None, rejected):
+                changed = copy.deepcopy(good); changed['inference']['bindingDiagnostics'] = diagnostic
+                with self.assertRaisesRegex(ValueError, 'PUBLICATION_REJECTED'): verify.write_result(changed, output)
+
+    def test_nonliteral_binding_rejection_has_no_model_text_and_does_not_repeat_request(self):
+        calls, events = [], []
+        private = 'PRIVATE_MODEL_LITERAL_SENTINEL'
+        def transport(_, body):
+            calls.append(True); self.assertEqual(events[-1]['modelReceipt']['outcome'], 'started')
+            value = envelope(body); outer = json.loads(value['body']); content = json.loads(outer['choices'][0]['message']['content'])
+            content['sentences'][0]['claims'][0]['predicate'] = {'text': private}
+            outer['choices'][0]['message']['content'] = json.dumps(content, ensure_ascii=False)
+            value['body'] = json.dumps(outer, ensure_ascii=False); return value
+        result = verify.verify('synthetic', fetch_pdf=lambda: b'%PDF synthetic', extractor=extractor, transport=transport,
+                               checkpoint=lambda value: events.append(copy.deepcopy(value)))
+        self.assertEqual(result['status'], 'rejected'); self.assertFalse(result['executionSuccess'])
+        self.assertEqual((len(calls), result['modelRequests']), (1, 1))
+        self.assertEqual(result['modelReceipt']['outcome'], 'rejected')
+        self.assertEqual(result['source']['retrievedAt'], result['pdfReceipt']['fetchedAt'])
+        binding = result['inference']['bindingDiagnostics']
+        self.assertEqual(binding['status'], 'rejected'); self.assertEqual(binding['errorCode'], 'MODEL_LITERAL_NOT_FOUND')
+        self.assertTrue(verify.valid_binding_diagnostics(binding)); self.assertIsNone(binding['boundResponseDigest'])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'result.json'; verify.write_result(result, output)
+            self.assertNotIn(private, output.read_text())
+        self.assertFalse(result['semanticAnalysisComplete']); self.assertFalse(result['productionReady'])
+
+    def test_literal_binding_success_does_not_bypass_strict_attribution_validator(self):
+        def transport(_, body):
+            value = envelope(body); outer = json.loads(value['body']); content = json.loads(outer['choices'][0]['message']['content'])
+            # This text occurs exactly once, but is not an allowed fund-report speaker.
+            content['sentences'][0]['claims'][0]['subject']['span'] = {'text': '科技行业'}
+            outer['choices'][0]['message']['content'] = json.dumps(content, ensure_ascii=False)
+            value['body'] = json.dumps(outer, ensure_ascii=False); return value
+        result = verify.verify('synthetic', fetch_pdf=lambda: b'%PDF synthetic', extractor=extractor, transport=transport)
+        self.assertEqual(result['inference']['bindingDiagnostics']['status'], 'bound')
+        self.assertEqual(result['status'], 'rejected'); self.assertFalse(result['executionSuccess'])
+        self.assertEqual(result['inference']['analysis']['reasonCodes'], ['INDIVIDUAL_MANAGER_ATTRIBUTION_NOT_PROVEN'])
+        self.assertEqual(result['modelRequests'], 1); self.assertFalse(result['semanticAnalysisComplete'])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'result.json'; verify.write_result(result, output)
+            saved = json.loads(output.read_bytes()); self.assertEqual(saved['status'], 'rejected')
+            self.assertEqual(saved['modelReceipt'], result['modelReceipt'])
+
+    def test_repeated_literal_is_ambiguous_and_never_selects_first_occurrence(self):
+        def repeated_extractor(raw, source_url, period_end, kind, **options):
+            pages = ['合成基金2026年第2季度报告\n§2 基金产品概况\n2.1 基金基本情况\n基金主代码 168401\n'
+                     '§3 主要财务指标和基金净值表现\n',
+                     '4.4 报告期内基金的投资策略和运作分析\n本基金看好科技行业，本基金保持谨慎。\n'
+                     '4.5 报告期内基金的业绩表现\n本基金净值表现。']
+            return _details_for_pages(pages, source_url, period_end, kind, options['parse_pages'], None,
+                published_at=options['published_at'], retrieved_at=options['retrieved_at'],
+                pdf_sha256=hashlib.sha256(raw).hexdigest(), total_pages=2)
+        calls = []
+        def transport(_, body): calls.append(True); return envelope(body)
+        result = verify.verify('synthetic', fetch_pdf=lambda: b'%PDF synthetic', extractor=repeated_extractor, transport=transport)
+        self.assertEqual(result['status'], 'rejected'); self.assertEqual((len(calls), result['modelRequests']), (1, 1))
+        binding = result['inference']['bindingDiagnostics']
+        self.assertEqual(binding['errorCode'], 'MODEL_LITERAL_AMBIGUOUS'); self.assertEqual(binding['status'], 'rejected')
+        self.assertEqual((binding['examinedSpanCount'], binding['boundSpanCount']), (1, 0))
+        self.assertTrue(verify.valid_binding_diagnostics(binding)); self.assertIsNone(binding['boundResponseDigest'])
+        self.assertFalse(result['executionSuccess']); self.assertFalse(result['semanticAnalysisComplete'])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'result.json'; verify.write_result(result, output)
+            self.assertNotIn('本基金看好科技行业，本基金保持谨慎', output.read_text())
 
 
 if __name__ == '__main__':

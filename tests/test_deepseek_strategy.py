@@ -12,12 +12,22 @@ import deepseek_strategy as adapter
 from test_strategy_semantics import packet, claim
 
 
+def text_only(value):
+    if isinstance(value, list):
+        return [text_only(item) for item in value]
+    if isinstance(value, dict):
+        if set(value) == {'start', 'end', 'text'}:
+            return {'text': value['text']}
+        return {key: text_only(item) for key, item in value.items()}
+    return value
+
+
 def envelope(body, *, interpreted=True):
     source = json.loads(body['messages'][1]['content'])
     value = {'schemaVersion': 1, 'inputDigest': source['inputDigest'], 'sentences': [
         {'sentence_id': row['sentence_id'], 'status': 'interpreted' if interpreted and row['index'] == 0 else 'unknown',
          'reason': None if interpreted and row['index'] == 0 else 'not-classified',
-         'claims': [claim(row['text'])] if interpreted and row['index'] == 0 else []}
+         'claims': [text_only(claim(row['text']))] if interpreted and row['index'] == 0 else []}
         for row in source['sentences']]}
     return {'httpStatus': 200, 'body': json.dumps({'model': adapter.MODEL,
         'choices': [{'finish_reason': 'stop', 'message': {'role': 'assistant', 'content': json.dumps(value, ensure_ascii=False)}}],
@@ -274,6 +284,124 @@ class DeepSeekStrategyTests(unittest.TestCase):
         self.assertEqual(diagnostic['originalCharacters'], len(content))
         self.assertGreater(diagnostic['originalBytes'], diagnostic['originalCharacters'])
         self.assertEqual(diagnostic['originalDigest'], diagnostic['normalizedDigest'])
+
+    def test_model_schema_is_text_only_and_bound_output_restores_core_offsets(self):
+        value = packet('😀本基金看好科技行业。')
+        schema = adapter.model_response_schema(value)
+        def walk(node):
+            if isinstance(node, dict):
+                if node.get('type') == 'object':
+                    self.assertNotIn('start', node['properties']); self.assertNotIn('end', node['properties'])
+                    self.assertFalse(node['additionalProperties'])
+                for item in node.values(): walk(item)
+            elif isinstance(node, list):
+                for item in node: walk(item)
+        walk(schema)
+        body = adapter.request_body(value)
+        raw = json.loads(json.loads(envelope(body)['body'])['choices'][0]['message']['content'])
+        original = copy.deepcopy(raw)
+        bound, diagnostic, preflight = adapter.bind_literal_response(value, raw)
+        self.assertIsNone(preflight); self.assertEqual(raw, original)
+        self.assertEqual(bound['sentences'][0]['claims'][0]['subject']['span'], {'text': '本基金', 'start': 1, 'end': 4})
+        self.assertEqual(diagnostic['status'], 'bound')
+        self.assertEqual(diagnostic['examinedSpanCount'], diagnostic['boundSpanCount'])
+        self.assertEqual(diagnostic['boundResponseDigest'], hashlib.sha256(adapter.canonical(bound).encode()).hexdigest())
+        self.assertNotIn('本基金', json.dumps(diagnostic, ensure_ascii=False))
+        analysis = adapter.validate_semantic_response(value, bound)
+        self.assertEqual(analysis['status'], 'structure-and-evidence-validated')
+        self.assertFalse(analysis['semanticAnalysisComplete'])
+
+    def test_binding_rejects_old_offsets_extra_fields_non_dict_empty_and_fuzzy_text(self):
+        value = packet(); body = adapter.request_body(value)
+        source = json.loads(json.loads(envelope(body)['body'])['choices'][0]['message']['content'])
+        cases = [({'text': '看好', 'start': 3, 'end': 5}, 'MODEL_SPAN_SHAPE_INVALID'),
+                 ({'text': '看好', 'other': 1}, 'MODEL_SPAN_SHAPE_INVALID'),
+                 ('看好', 'MODEL_SPAN_SHAPE_INVALID'), ({'text': ''}, 'MODEL_LITERAL_EMPTY'),
+                 ({'text': ' '}, 'MODEL_LITERAL_EMPTY'), ({'text': ' 看好'}, 'MODEL_LITERAL_NOT_FOUND'),
+                 ({'text': '看 好'}, 'MODEL_LITERAL_NOT_FOUND'), ({'text': '看好。'}, 'MODEL_LITERAL_NOT_FOUND')]
+        for span_value, code in cases:
+            changed = copy.deepcopy(source); changed['sentences'][0]['claims'][0]['predicate'] = span_value
+            bound, diagnostic, _ = adapter.bind_literal_response(value, changed)
+            self.assertIsNone(bound); self.assertEqual(diagnostic['errorCode'], code)
+            self.assertIsNone(diagnostic['boundResponseDigest'])
+
+    def test_unique_match_rejects_overlapping_and_repeated_literals(self):
+        for text, target in [('本基金看好哈哈哈行业。', '哈哈'), ('本基金看好科技行业及科技行业。', '科技行业')]:
+            value = packet(text); item = text_only(claim(text, target=target))
+            raw = {'schemaVersion': 1, 'inputDigest': value['inputDigest'], 'sentences': [
+                {'sentence_id': value.model_input()['sentences'][0]['sentence_id'], 'status': 'interpreted', 'reason': None, 'claims': [item]}]}
+            bound, diagnostic, _ = adapter.bind_literal_response(value, raw)
+            self.assertIsNone(bound); self.assertEqual(diagnostic['errorCode'], 'MODEL_LITERAL_AMBIGUOUS')
+
+    def test_preflight_never_repairs_unknown_ids_duplicates_fields_status_or_reason(self):
+        value = packet('本基金看好科技行业。市场情况难以判断。')
+        body = adapter.request_body(value)
+        raw = json.loads(json.loads(envelope(body, interpreted=False)['body'])['choices'][0]['message']['content'])
+        mutations = [lambda row: row.update(extra=True),
+            lambda row: row['sentences'][0].update(extra=True),
+            lambda row: row['sentences'][0].update(sentence_id='unknown'),
+            lambda row: row['sentences'][1].update(sentence_id=row['sentences'][0]['sentence_id']),
+            lambda row: row['sentences'][0].update(status='invalid'),
+            lambda row: row['sentences'][0].update(reason='invalid'),
+            lambda row: row['sentences'][0].update(status='interpreted', reason=None),
+            lambda row: row['sentences'][0].update(claims=[{'predicate': {'text': '看好', 'start': 3, 'end': 5}}]),
+            lambda row: row['sentences'][0].update(claims=[{'predicate': '看好'}])]
+        for mutate in mutations:
+            changed = copy.deepcopy(raw); mutate(changed); original = copy.deepcopy(changed)
+            bound, diagnostic, preflight = adapter.bind_literal_response(value, changed)
+            self.assertIsNone(bound); self.assertEqual(changed, original)
+            self.assertEqual(diagnostic['errorCode'], 'STRICT_VALIDATOR_PREFLIGHT_REJECTED')
+            self.assertEqual(preflight['status'], 'rejected')
+
+    def test_binding_does_not_bypass_negation_condition_or_author_attribution(self):
+        cases = [
+            ('本基金并不看好科技行业。', 'NEGATION_REQUIRES_REVIEW'),
+            ('如果盈利改善，本基金看好科技行业。', 'CONDITION_NOT_PRESERVED'),
+            ('报告引用：“本基金看好科技行业”。', 'QUOTED_ATTRIBUTION_CHANGED')]
+        for text, reason in cases:
+            value = packet(text); body = adapter.request_body(value)
+            result = adapter.run_packet(value, 'synthetic', checkpoint=lambda _: None,
+                transport=lambda *_: envelope(body))
+            self.assertEqual(result['bindingDiagnostics']['status'], 'bound')
+            self.assertEqual(result['status'], 'rejected')
+            self.assertIn(reason, result['analysis']['reasonCodes'])
+            self.assertFalse(result['semanticAnalysisComplete'])
+
+    def test_binding_success_changes_only_span_positions_and_keeps_other_extra_fields_for_core(self):
+        value = packet(); body = adapter.request_body(value)
+        raw = json.loads(json.loads(envelope(body)['body'])['choices'][0]['message']['content'])
+        raw['sentences'][0]['claims'][0]['fabricatedSummary'] = 'must be rejected'
+        bound, diagnostic, _ = adapter.bind_literal_response(value, raw)
+        self.assertEqual(diagnostic['status'], 'bound')
+        self.assertEqual(bound['sentences'][0]['claims'][0]['fabricatedSummary'], 'must be rejected')
+        self.assertEqual(adapter.validate_semantic_response(value, bound)['status'], 'rejected')
+
+    def test_binding_zero_spans_for_unknown_remains_accounted_and_not_semantic_complete(self):
+        value = packet(); body = adapter.request_body(value)
+        result = adapter.run_packet(value, 'synthetic', checkpoint=lambda _: None,
+            transport=lambda *_: envelope(body, interpreted=False))
+        self.assertEqual(result['bindingDiagnostics']['status'], 'bound')
+        self.assertEqual(result['bindingDiagnostics']['examinedSpanCount'], 0)
+        self.assertEqual(result['bindingDiagnostics']['boundSpanCount'], 0)
+        self.assertEqual(result['analysis']['coverage']['unknown'], 1)
+        self.assertFalse(result['analysis']['semanticCorrectnessVerified'])
+
+    def test_model_can_cite_unique_verbatim_context_but_adapter_never_expands_a_span(self):
+        text = '本基金持续看好科技行业，也看好消费行业。'
+        value = packet(text); row = text_only(claim(text))
+        raw = {'schemaVersion': 1, 'inputDigest': value['inputDigest'], 'sentences': [
+            {'sentence_id': value.model_input()['sentences'][0]['sentence_id'], 'status': 'interpreted', 'reason': None, 'claims': [row]}]}
+        bound, diagnostic, _ = adapter.bind_literal_response(value, raw)
+        self.assertIsNone(bound); self.assertEqual(diagnostic['errorCode'], 'MODEL_LITERAL_AMBIGUOUS')
+        raw['sentences'][0]['claims'][0]['predicate'] = {'text': '持续看好'}
+        bound, diagnostic, _ = adapter.bind_literal_response(value, raw)
+        self.assertEqual(diagnostic['status'], 'bound')
+        self.assertEqual(bound['sentences'][0]['claims'][0]['predicate']['text'], '持续看好')
+        self.assertEqual(adapter.validate_semantic_response(value, bound)['status'], 'structure-and-evidence-validated')
+        raw['sentences'][0]['claims'][0]['subject']['span'] = {'text': '本基金持续看好科技行业'}
+        bound, diagnostic, _ = adapter.bind_literal_response(value, raw)
+        self.assertEqual(diagnostic['status'], 'bound')
+        self.assertIn('INDIVIDUAL_MANAGER_ATTRIBUTION_NOT_PROVEN', adapter.validate_semantic_response(value, bound)['reasonCodes'])
 
 
 if __name__ == '__main__':
