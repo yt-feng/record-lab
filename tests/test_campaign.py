@@ -44,7 +44,8 @@ class CampaignTests(unittest.TestCase):
                     result = plan('both', '2026-10-26', refresh=False, historical_overlays={})
                 self.assertEqual(result['batchCount'], 32)
                 matrix = read_json('.cache/plan/matrix.json')
-                self.assertEqual([item['id'] for item in matrix], [str(index) for index in range(32)])
+                self.assertEqual([item['id'] for item in matrix],
+                                 [str(index + offset) for index in range(16) for offset in (0, 16)])
                 task_count = 0
                 for quarter in ('2026Q2', '2026Q3'):
                     scoped = [item for item in matrix if item['quarter'] == quarter]

@@ -15,7 +15,8 @@ from traversal import atomic_json, read_json
 from publication_guard import inspect_content, content_limit
 from quarter_catalog import (compose_quarter_catalog, freeze_catalog, validate_catalog_lock,
                              normalize_overlay, recover_historical_overlay, combine_historical_overlays,
-                             historical_candidate_codes, report_candidate_codes)
+                             historical_candidate_codes, report_candidate_codes, copy_frozen_catalog)
+from report_identity_catalog import supplement_catalog
 
 PERIODS = {
     '2026Q2': ('2026-06-30', '2026-03-31'),
@@ -156,6 +157,14 @@ def quarter_history(root, quarter, *, explicit=None, now=None):
         return result(cached, state)
 
 
+def interleave_matrix(matrix, quarters):
+    """Give each quarter early runner slots without changing batch identities."""
+    groups = {quarter: [] for quarter in quarters}
+    for item in matrix: groups[item['quarter']].append(item)
+    return [groups[quarter][index] for index in range(max((len(group) for group in groups.values()), default=0))
+            for quarter in quarters if index < len(groups[quarter])]
+
+
 def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True, historical_overlays=None):
     selected = selected_periods(quarter)
     # Planning, Actions output and missing-part reconciliation share one bound.
@@ -172,23 +181,25 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
     catalog = read_json(root / 'catalog.json')
     base = read_json('config/universe.json')
     configs = {name: quarter_config(base, name, as_of) for name in selected}
-    scoped_catalogs = {}
+    scoped_catalogs, identity_parts = {}, {}
     for name in selected:
         overlay, status = quarter_history(root, name, explicit=historical_overlays)
         candidates = status.pop('candidateCodes', [])
         scoped_catalogs[name] = compose_quarter_catalog(catalog, name, overlay, candidates=candidates)
         scoped_catalogs[name]['quarterUniverse']['historicalRefresh'] = status
+        scoped_catalogs[name], identity_parts[name] = supplement_catalog(
+            scoped_catalogs[name], root / 'periods' / name, name)
     matrix, catalogs = [], {}
     for name in selected:
         output = seed_quarter(root, name)
         config = configs[name]
         scoped_catalog = scoped_catalogs[name]
-        binding = freeze_catalog(scoped_catalog, name)
+        binding = freeze_catalog(scoped_catalog, name, identity_parts=identity_parts[name])
         catalogs[name] = binding
         config.update(catalogLockVersion=1, catalogDigest=binding['sha256'], catalogPath=binding['path'])
         atomic_json(Path('.cache/campaign') / f'{name}.json', config)
         frozen = Path('.cache/campaign') / binding['path']
-        shutil.copy2(frozen, output / 'catalog.json')
+        copy_frozen_catalog(frozen, output, name)
         # CLI hydration reads existing reports without serializing their raw text
         # into the public batch plan.
         private_plan = Path('.cache') / ('plan-' + name)
@@ -203,6 +214,7 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
             filename = f'batch-{index}.json'
             atomic_json(Path('.cache/plan') / filename, batch)
             matrix.append({'id': index, 'config': filename, 'quarter': name})
+    matrix = interleave_matrix(matrix, selected)
     atomic_json('.cache/plan/matrix.json', matrix)
     atomic_json('.cache/plan/meta.json', {'quarters': selected, 'asOf': as_of, 'hasWork': bool(matrix), 'directoryRefresh': directory_status})
     atomic_json('.cache/campaign/selection.json', {'quarters': selected, 'asOf': as_of, 'selection': quarter,
@@ -214,17 +226,24 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
 def scan_campaign_files():
     """The recursive artifact includes frozen catalogues, not just root JSON."""
     root = Path('.cache/campaign')
+    registry_sizes = {}
     for file in root.rglob('*'):
         if file.is_symlink(): raise ValueError('PLAN_PUBLICATION_REJECTED')
         if file.is_dir(): continue
         relative = file.relative_to(root).as_posix()
         match = re.fullmatch(r'catalogs/(2026Q[23])\.json', relative)
-        if file.suffix != '.json' or file.parent.is_symlink() or '/' in relative and not match:
+        identity = re.fullmatch(r'catalogs/(2026Q[23])-identities/part-[a-f0-9]{64}\.json', relative)
+        if file.suffix != '.json' or file.parent.is_symlink() or '/' in relative and not (match or identity):
             raise ValueError('PLAN_PUBLICATION_REJECTED')
         policy_name = f'web/data/periods/{match[1]}/catalog.json' if match else f'config/{file.name}'
-        maximum = content_limit(policy_name)
+        maximum = 5_000_000 if identity else content_limit(policy_name)
         if file.stat().st_size > maximum or inspect_content(file.read_bytes(), maximum):
             raise ValueError('PLAN_PUBLICATION_REJECTED')
+        if identity:
+            count, total = registry_sizes.get(identity[1], (0, 0))
+            registry_sizes[identity[1]] = (count + 1, total + file.stat().st_size)
+            if count + 1 > 128 or total + file.stat().st_size > 256_000_000:
+                raise ValueError('PLAN_PUBLICATION_REJECTED')
 
 
 def frozen_catalogs_for_publish(selection, matrix, root):
@@ -297,7 +316,7 @@ def publish(data='web/data', parts='.cache/parts'):
     for quarter in selection['quarters']:
         if quarter not in PERIODS: raise ValueError('INVALID_PERIOD')
         output = seed_quarter(root, quarter)
-        shutil.copy2(catalogs[quarter], output / 'catalog.json')
+        copy_frozen_catalog(catalogs[quarter], output, quarter)
         scoped_parts = Path('.cache') / ('parts-' + quarter)
         scoped_parts.mkdir(parents=True, exist_ok=True)
         for item in matrix:

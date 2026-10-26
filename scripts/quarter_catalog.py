@@ -289,7 +289,22 @@ def scan_catalog(raw, quarter):
         raise ValueError("CATALOG_PUBLICATION_REJECTED")
 
 
-def freeze_catalog(catalog, quarter, campaign_root=".cache/campaign"):
+def freeze_catalog(catalog, quarter, campaign_root=".cache/campaign", *, identity_parts=None):
+    from report_identity_catalog import part_path, load_registry, MAX_PART_BYTES
+    if identity_parts is not None:
+        if not isinstance(identity_parts, dict): raise ValueError("INVALID_IDENTITY_REGISTRY")
+        for name, contents in identity_parts.items():
+            if not isinstance(contents, bytes) or inspect_content(contents, MAX_PART_BYTES):
+                raise ValueError("IDENTITY_REGISTRY_PUBLICATION_REJECTED")
+            file = part_path(campaign_root, quarter, name, frozen=True)
+            file.parent.mkdir(parents=True, exist_ok=True)
+            if file.is_symlink() or file.parent.is_symlink() or file.parent.parent.is_symlink():
+                raise ValueError("INVALID_IDENTITY_REGISTRY_PATH")
+            with tempfile.NamedTemporaryFile(dir=file.parent, delete=False) as handle:
+                temporary = Path(handle.name); handle.write(contents)
+            try: os.replace(temporary, file)
+            finally: temporary.unlink(missing_ok=True)
+    load_registry(catalog, campaign_root, quarter, frozen=True)
     relative = frozen_relative_path(quarter)
     raw = (json.dumps(catalog, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
     scan_catalog(raw, quarter)
@@ -300,6 +315,14 @@ def freeze_catalog(catalog, quarter, campaign_root=".cache/campaign"):
         temporary = Path(handle.name); handle.write(raw)
     try: os.replace(temporary, destination)
     finally: temporary.unlink(missing_ok=True)
+    registry = catalog.get("quarterUniverse", {}).get("reportIdentityRegistry") or {}
+    active_parts = {Path(item["path"]).name for item in registry.get("files", [])}
+    registry_folder = Path(campaign_root) / "catalogs" / (quarter + "-identities")
+    if registry_folder.exists():
+        for obsolete in registry_folder.glob("part-*.json"):
+            if obsolete.name not in active_parts and re.fullmatch(r"part-[a-f0-9]{64}\.json", obsolete.name):
+                if obsolete.is_symlink(): raise ValueError("INVALID_IDENTITY_REGISTRY_PATH")
+                obsolete.unlink()
     return {"path": relative, "sha256": hashlib.sha256(raw).hexdigest(), "targetPeriodEnd": PERIODS[quarter]}
 
 
@@ -322,4 +345,33 @@ def validate_catalog_lock(quarter, config, binding, campaign_root=".cache/campai
     if (catalog.get("targetPeriodEnd") != PERIODS[quarter] or universe.get("schemaVersion") != 1
             or universe.get("targetPeriodEnd") != PERIODS[quarter] or universe.get("historicalUniverseVerified") is not False):
         raise ValueError("INVALID_QUARTER_CATALOG")
+    from report_identity_catalog import load_registry
+    load_registry(catalog, campaign_root, quarter, frozen=True)
     return file
+
+
+def copy_frozen_catalog(catalog_file, output, quarter):
+    """Publish the exact locked directory and all its digest-bound proof parts."""
+    import shutil
+    from report_identity_catalog import load_registry, part_path
+    catalog_file, output = Path(catalog_file), Path(output)
+    catalog = json.loads(catalog_file.read_bytes())
+    campaign_root = catalog_file.parent.parent
+    load_registry(catalog, campaign_root, quarter, frozen=True)
+    registry = catalog.get("quarterUniverse", {}).get("reportIdentityRegistry") or {}
+    for item in registry.get("files", []):
+        source = part_path(campaign_root, quarter, item["path"], frozen=True)
+        destination = part_path(output, quarter, item["path"])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink() or destination.parent.is_symlink():
+            raise ValueError("INVALID_IDENTITY_REGISTRY_PATH")
+        shutil.copy2(source, destination)
+    output.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(catalog_file, output / "catalog.json")
+    active = {Path(item["path"]).name for item in registry.get("files", [])}
+    folder = output / "identity-sources"
+    if folder.exists():
+        for obsolete in folder.glob("part-*.json"):
+            if obsolete.name not in active and re.fullmatch(r"part-[a-f0-9]{64}\.json", obsolete.name):
+                if obsolete.is_symlink(): raise ValueError("INVALID_IDENTITY_REGISTRY_PATH")
+                obsolete.unlink()
