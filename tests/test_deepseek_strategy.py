@@ -1,6 +1,8 @@
 """Synthetic packets and transports only; no credentials or network required."""
 import copy
+import contextlib
 import hashlib
+import io
 import json
 from pathlib import Path
 import sys
@@ -55,7 +57,9 @@ class DeepSeekStrategyTests(unittest.TestCase):
         def transport(_credential, body):
             self.assertEqual(events[-1]['outcome'], 'started')
             self.assertEqual(body['model'], adapter.MODEL)
-            self.assertEqual(body['thinking'], {'type': 'disabled'})
+            self.assertEqual(body['thinking'], {'type': 'enabled'})
+            self.assertEqual(body['reasoning_effort'], 'high')
+            self.assertNotIn('temperature', body)
             self.assertEqual(body['response_format'], {'type': 'json_object'})
             self.assertFalse(body['stream']); self.assertNotIn('tools', body)
             self.assertEqual(body['max_tokens'], 12000)
@@ -126,6 +130,7 @@ class DeepSeekStrategyTests(unittest.TestCase):
             args, kwargs = session.post.call_args
             self.assertEqual(args, (adapter.ENDPOINT,))
             self.assertFalse(kwargs['allow_redirects']); self.assertTrue(kwargs['stream'])
+            self.assertEqual(kwargs['timeout'], (10, 130))
             self.assertEqual(session.mount.call_args.args[1].max_retries.total, 0)
             self.assertNotIn('body', result); response.close.assert_called_once()
 
@@ -519,6 +524,66 @@ class DeepSeekStrategyTests(unittest.TestCase):
         self.assertEqual(constraint['allowedNegations'], ['affirmed', 'negated', 'uncertain'])
         self.assertIsNone(constraint['conditionalRequired'])
         self.assertEqual(constraint['requiredLiteralMarkers']['negation_spans'], [])
+
+    def test_thinking_and_effort_are_bound_from_actual_request_settings(self):
+        value = packet()
+        def run():
+            return adapter.run_packet(value, 'synthetic', checkpoint=lambda _: None,
+                                      transport=lambda _, body: envelope(body))
+        base = run()
+        with patch.object(adapter, 'THINKING_MODE', 'disabled'):
+            mode_changed = run()
+        with patch.object(adapter, 'REASONING_EFFORT', 'low'):
+            effort_changed = run()
+        self.assertEqual(base['receipt']['inputDigest'], mode_changed['receipt']['inputDigest'])
+        self.assertEqual(base['receipt']['inputDigest'], effort_changed['receipt']['inputDigest'])
+        self.assertEqual(len({row['receipt']['requestDigest'] for row in (base, mode_changed, effort_changed)}), 3)
+        self.assertEqual(adapter.MAX_OUTPUT_TOKENS, 12000)
+        self.assertEqual(adapter.WALL_SECONDS, 150)
+        self.assertEqual(adapter.MAX_RESPONSE_BYTES, 600000)
+        body = adapter.request_body(value)
+        self.assertEqual(body['thinking'], {'type': 'enabled'})
+        self.assertEqual(body['reasoning_effort'], 'high'); self.assertNotIn('temperature', body)
+
+    def test_reasoning_content_never_enters_success_rejection_unknown_checkpoint_or_logs(self):
+        sentinel = 'PRIVATE_REASONING_SENTINEL_NEVER_PUBLISHED'
+        for outcome in ('validated', 'binding-rejected', 'truncated', 'no-answer', 'unknown-timeout', 'unknown-exception'):
+            checkpoints, raw_responses = [], []
+            def transport(_, body):
+                if outcome == 'unknown-timeout':
+                    return {'errorCode': 'PROVIDER_TIMEOUT', 'reasoning_content': sentinel}
+                if outcome == 'unknown-exception':
+                    raise RuntimeError(sentinel)
+                response = json.loads(envelope(body)['body'])
+                message = response['choices'][0]['message']
+                message['reasoning_content'] = sentinel
+                if outcome == 'binding-rejected':
+                    content = json.loads(message['content'])
+                    content['sentences'][0]['claims'][0]['predicate'] = {'text': 'source absent literal'}
+                    message['content'] = json.dumps(content)
+                elif outcome == 'truncated':
+                    response['choices'][0]['finish_reason'] = 'length'
+                elif outcome == 'no-answer':
+                    message['content'] = None
+                raw = json.dumps(response, ensure_ascii=False)
+                raw_responses.append(raw)
+                return {'httpStatus': 200, 'body': raw}
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                result = adapter.run_packet(packet(), 'synthetic', checkpoint=checkpoints.append, transport=transport)
+            expected = 'validated' if outcome == 'validated' else 'unknown' if outcome.startswith('unknown-') else 'rejected'
+            self.assertEqual(result['status'], expected)
+            self.assertEqual(result['requestCount'], 1)
+            self.assertEqual(checkpoints[0]['outcome'], 'started')
+            self.assertNotIn(sentinel, json.dumps(result))
+            self.assertNotIn(sentinel, json.dumps(checkpoints))
+            self.assertNotIn('reasoning_content', json.dumps(result))
+            self.assertEqual(stdout.getvalue(), ''); self.assertEqual(stderr.getvalue(), '')
+            if outcome == 'no-answer':
+                self.assertIsNone(result['analysis'])
+                self.assertEqual(result['errorCode'], 'PROVIDER_RESPONSE_INVALID')
+            elif raw_responses:
+                self.assertEqual(result['responseDigest'], hashlib.sha256(raw_responses[0].encode()).hexdigest())
 
 
 if __name__ == '__main__':

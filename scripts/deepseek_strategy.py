@@ -22,7 +22,9 @@ from strategy_semantics import (PrivateSemanticPacket, semantic_response_schema,
 
 ENDPOINT = 'https://api.deepseek.com/chat/completions'
 MODEL = 'deepseek-flash'
-PROMPT_VERSION = 'source-bound-deepseek-v4'
+PROMPT_VERSION = 'source-bound-deepseek-v5'
+THINKING_MODE = 'enabled'
+REASONING_EFFORT = 'high'
 BINDING_METHOD = 'unique-exact-sentence-span-v1'
 MODEL_SPAN_FORMAT = 'text-only-v1'
 CONSTRAINT_METHOD = 'core-validator-derived-constraints-v1'
@@ -151,8 +153,8 @@ def request_body(packet):
            'Do not copy unknown as a default. Interpret supported claims, and return every real sentence_id exactly once:\n'
          + canonical(example)},
         {'role': 'user', 'content': canonical(private)}],
-        'response_format': {'type': 'json_object'}, 'thinking': {'type': 'disabled'},
-        'temperature': 0, 'max_tokens': MAX_OUTPUT_TOKENS, 'stream': False}
+        'response_format': {'type': 'json_object'}, 'thinking': {'type': THINKING_MODE},
+        'reasoning_effort': REASONING_EFFORT, 'max_tokens': MAX_OUTPUT_TOKENS, 'stream': False}
     if len(canonical(body).encode('utf-8')) > MAX_INPUT_BYTES:
         raise ValueError('SEMANTIC_INPUT_LIMIT')
     return body
@@ -344,7 +346,7 @@ def _http_once(credential, body, *, session_factory=requests.Session):
         with session_factory() as session:
             session.mount('https://', requests.adapters.HTTPAdapter(max_retries=0))
             response = session.post(ENDPOINT, headers={'Authorization': 'Bearer ' + credential},
-                json=body, timeout=(10, 35), allow_redirects=False, stream=True)
+                json=body, timeout=(10, 130), allow_redirects=False, stream=True)
             if response.status_code != 200:
                 return {'errorCode': HTTP_ERRORS.get(response.status_code, 'PROVIDER_HTTP_REJECTED'),
                         'httpStatus': response.status_code}
@@ -422,7 +424,8 @@ def run_packet(packet, credential, *, checkpoint, transport=http_transport):
         'instructionDigest': hashlib.sha256(body['messages'][0]['content'].encode()).hexdigest(),
         'constraintsDigest': constraints_digest(_json(body['messages'][1]['content'])),
         'modelSpanFormat': MODEL_SPAN_FORMAT, 'bindingMethod': BINDING_METHOD,
-        'thinking': 'disabled', 'maxOutputTokens': MAX_OUTPUT_TOKENS}).encode()).hexdigest()
+        'thinking': body['thinking']['type'], 'reasoningEffort': body['reasoning_effort'],
+        'maxOutputTokens': MAX_OUTPUT_TOKENS}).encode()).hexdigest()
     receipt = {'schemaVersion': 1, 'requestDigest': digest, 'inputDigest': packet['inputDigest'],
                'attemptedAt': stamp(), 'finishedAt': None, 'outcome': 'started',
                'requestStage': 'request-call-entered', 'errorCode': None}
