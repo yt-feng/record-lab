@@ -31,7 +31,21 @@ MAX_OUTPUT_BYTES = 32_000
 MAX_BRIDGE_BYTES = 9_000_000
 ERRORS = PATCH_ERRORS | {'ACTIONS_REQUIRED', 'INVALID_DATA_COMMIT', 'DATA_READ_FAILED', 'DATA_READ_BOUND',
     'INVALID_DATA_MANIFEST', 'SAMPLE_NOT_FOUND_WITHIN_BOUND', 'BRIDGE_FAILED', 'VERIFICATION_FAILED',
-    'PUBLICATION_REJECTED', 'UNSUPPORTED_OUTPUT', 'DATA_CHANGED'}
+    'PUBLICATION_REJECTED', 'UNSUPPORTED_OUTPUT', 'DATA_CHANGED', 'DIAGNOSTIC_BINDING_INVALID'}
+DIAGNOSTIC_COMMIT = '63ab7e38ce388f246d80588146081991a88ff623'
+DIAGNOSTIC_SAMPLES = {
+    '000189': {'quarter': '2026Q3', 'dataPath': 'web/data/periods/2026Q3/companies/80000229-r721f3cf9b7ff16cc13d3.json',
+               'dataBlobSha': '528c5ab14093590efd50e8ee1a8f1fd2ec3946a1',
+               'beforeHash': '9a8bb978e2d9f6173533f7320eb7947e1c71075ca2fac6468ddf57aa026cdf05',
+               'observedAfterHash': 'a551017b9b92d1d637557b50c28197bfacf4387b353dc70b03638effa7ce3b6f'},
+    '002020': {'quarter': '2026Q2', 'dataPath': 'web/data/periods/2026Q2/companies/80000095-rbbbec8c43b4ba8926643.json',
+               'dataBlobSha': '845039b2440e4e8b056ef091d0a992b9ba50a373',
+               'beforeHash': 'f377757145d6acc6cf2e73b699a5edb259065ff07a328db681a0cc1d3f023a4a',
+               'observedAfterHash': 'f377757145d6acc6cf2e73b699a5edb259065ff07a328db681a0cc1d3f023a4a'},
+}
+DIFF_ROOT_FIELDS = set('code name company companyId companyMapping sourcePortfolioCode portfolioSourceUrl managers reportManagers managerAttribution managerTableCoverage managerCoverageStatus managersAsOf managerScope managerSourceUrl managerEvidenceRetrievedAt metadataSourceUrl inceptionDate inceptionSourceUrl inceptionEvidence inceptionProfileEvidence inceptionConflict shareClassCodes asOf status selectedReport previousReport reports interval rows summary warnings retrievedAt dataStatus cacheReason priceUpdatedAt aliases noEquitiesEvidence notApplicableEvidence baselineExemption portfolioDeduplicated portfolioRepresentativeCode'.split())
+DIFF_REPORT_FIELDS = set('periodEnd publishedAt kind portfolioIdentityEvidence sourceLocatorEvidence coverage navYuan reportOnly evidenceRetrievedAt navRetrievedAt reportPdfSourceUrl reportPdfPeriodEnd reportPdfKind sourceUrl fundCode sourceFundCode holdingsSourceUrl holdingsRetrieval holdingsRequestedLimit holdingsPdfEvidence holdingsPossiblyTruncated holdingsIncomplete holdingsExcludedRowCount holdingsIncompleteReason navSourceUrl managers managerTableCoverage managerSourceUrl managerEvidenceRetrievedAt noEquitiesConfirmed noEquitiesEvidence holdings parseMethod pageStats sourceTextHash strategySectionCoverage strategyEvidenceRetrievedAt'.split())
+DIFF_TYPES = {'missing', 'null', 'object', 'array', 'string', 'boolean', 'number'}
 CHECKS = ('freshFundCountZero', 'singleReceipt', 'patchAdmitted', 'mergeAccepted', 'positionsUnchanged',
           'navUnchanged', 'managersUnchanged', 'oldTimesUnchanged', 'reportSourcesUnchanged',
           'newOwnClock', 'derivedOriginalClock', 'sameAnalysisDigest', 'sameSectionProof',
@@ -62,6 +76,28 @@ try {
     'strategyEvidencePool','strategyEvidenceBudget','strategyClaimsStatus','strategyAnalysis','strategyThemes','strategyExcerpts','narrative']);
   const protectedFields=value=>Array.isArray(value)?value.map(protectedFields):value&&typeof value==='object'?
    Object.fromEntries(Object.entries(value).filter(([k])=>!mutable.has(k)).map(([k,v])=>[k,protectedFields(v)])):value;
+  const ROOT_FIELDS=new Set(__DIFF_ROOT_FIELDS__), REPORT_FIELDS=new Set(__DIFF_REPORT_FIELDS__);
+  function differences(before,after) {
+   const items=[];let mapped=0,unmapped=0;
+   const type=(value,present)=>!present?'missing':value===null?'null':Array.isArray(value)?'array':typeof value;
+   const add=(a,b,p,aPresent,bPresent)=>{mapped++;if(items.length<32)items.push({path:p,
+    beforeType:type(a,aPresent),afterType:type(b,bPresent),change:!aPresent?'added':!bPresent?'removed':'changed'});};
+   function walk(a,b,p,allowed) {
+    for(const key of [...new Set([...Object.keys(a||{}),...Object.keys(b||{})])].sort()) {
+     if(mutable.has(key))continue;
+     const ap=Object.hasOwn(a||{},key),bp=Object.hasOwn(b||{},key),av=a?.[key],bv=b?.[key];
+     if(ap===bp&&same(av,bv))continue;
+     if(!allowed.has(key)){unmapped++;continue;}
+     const field=p+'.'+key;
+     if(p==='fund'&&['selectedReport','previousReport'].includes(key)&&av&&bv&&typeof av==='object'&&typeof bv==='object')walk(av,bv,field,REPORT_FIELDS);
+     else if(p==='fund' && key==='reports' && Array.isArray(av)&&Array.isArray(bv)&&av.length===bv.length&&av.length<=32)
+      av.forEach((v,i)=>walk(v,bv[i],field+'['+i+']',REPORT_FIELDS));
+     else add(av,bv,field,ap,bp);
+    }
+   }
+   walk(protectedFields(before),protectedFields(after),'fund',ROOT_FIELDS);
+   return {differences:items,differenceCount:mapped+unmapped,reportedDifferenceCount:items.length,unmappedDifferenceCount:unmapped,truncated:mapped>items.length};
+  }
   function clocks(value,path='',out={}) {
    if(Array.isArray(value)) value.forEach((v,i)=>clocks(v,path+'/'+i,out));
    else if(value&&typeof value==='object') for(const [k,v] of Object.entries(value)) {
@@ -74,6 +110,19 @@ try {
   const before=clone(x.fund),company=before.companyId;
   const catalog={fundCount:1,companyCount:1,companies:[{code:company,name:before.company,fundCount:1}],
     funds:[{code:before.code,companyCode:company,companyName:before.company}]};
+  if(x.mode==='normalize-only') {
+   // No patch, new source observation, or file publication. Omitting the
+   // previous manifest only exposes the engine's normalized in-memory output.
+   const result=mergeSnapshots({snapshots:[],previousCompanies:{sample:{...x.envelope,funds:[clone(before)]}},
+    previousManifest:null,config:x.config,catalog,now:x.now,reusePrices:false});
+   const funds=Object.values(result.companySnapshots).flatMap(s=>s.funds),after=funds.find(f=>f.code===before.code);
+   if(funds.length!==1||!after)throw new Error('control unavailable');
+   process.stdout.write(JSON.stringify({normalizedFundCount:funds.length,
+    nonStrategyFieldsUnchanged:same(protectedFields(before),protectedFields(after)),
+    protectedBeforeHash:crypto.createHash('sha256').update(canonical(protectedFields(before))).digest('hex'),
+    normalizedHash:crypto.createHash('sha256').update(canonical(protectedFields(after))).digest('hex'),
+    ...differences(before,after)}));
+  } else {
   const part=buildSnapshot(x.raw,{config:x.config,now:x.now});
   const previous={...x.envelope,funds:[clone(before)]};
   const result=mergeSnapshots({snapshots:[part],previousCompanies:{sample:previous},previousManifest:x.manifest,
@@ -103,10 +152,12 @@ try {
    unknownClauseCount:c?.coverage.unknownClauseCount??0,
    quoteChars:a?.strategyEvidencePool?.usedQuoteChars??0,newStrategyObservedAt:c?.source.retrievedAt??null,
    protectedBeforeHash:crypto.createHash('sha256').update(canonical(protectedFields(before))).digest('hex'),
-   protectedAfterHash:after?crypto.createHash('sha256').update(canonical(protectedFields(after))).digest('hex'):null}));
+   protectedAfterHash:after?crypto.createHash('sha256').update(canonical(protectedFields(after))).digest('hex'):null,
+   ...differences(before,after||{})}));
+  }
  }
 }catch(_){process.stdout.write('{}');process.exitCode=1;}
-"""
+""".replace('__DIFF_ROOT_FIELDS__', json.dumps(sorted(DIFF_ROOT_FIELDS))).replace('__DIFF_REPORT_FIELDS__', json.dumps(sorted(DIFF_REPORT_FIELDS)))
 
 
 class VerificationError(ValueError):
@@ -121,7 +172,7 @@ def bridge(value):
     try:
         result = subprocess.run(['node', '-e', NODE_BRIDGE], input=encoded, text=True, cwd=ROOT,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=45)
-        if result.returncode or len(result.stdout.encode()) > 6000: raise VerificationError('BRIDGE_FAILED')
+        if result.returncode or len(result.stdout.encode()) > 12000: raise VerificationError('BRIDGE_FAILED')
         return json.loads(result.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         raise VerificationError('BRIDGE_FAILED') from None
@@ -203,6 +254,34 @@ def compact_receipt(raw):
     return dict(rows[0]) if len(rows) == 1 else None
 
 
+DIFF_FIELDS = {'differences', 'differenceCount', 'reportedDifferenceCount', 'unmappedDifferenceCount', 'truncated'}
+
+
+def valid_differences(value):
+    rows = value.get('differences')
+    if (not isinstance(rows, list) or len(rows) > 32 or type(value.get('truncated')) is not bool
+            or any(type(value.get(key)) is not int or not 0 <= value[key] <= 10000
+                   for key in ('differenceCount', 'reportedDifferenceCount', 'unmappedDifferenceCount'))
+            or value['reportedDifferenceCount'] != len(rows)
+            or value['differenceCount'] < len(rows) + value['unmappedDifferenceCount']
+            or value['truncated'] != (value['differenceCount'] - value['unmappedDifferenceCount'] > len(rows))):
+        return False
+    paths = set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {'path', 'beforeType', 'afterType', 'change'}: return False
+        field = row['path']
+        if not isinstance(field, str) or field in paths: return False
+        paths.add(field)
+        root = re.fullmatch(r'fund\.([A-Za-z]+)', field)
+        report = re.fullmatch(r'fund\.(?:selectedReport|previousReport|reports\[(?:[0-9]|[12][0-9]|3[01])\])\.([A-Za-z]+)', field)
+        if not (root and root[1] in DIFF_ROOT_FIELDS or report and report[1] in DIFF_REPORT_FIELDS): return False
+        if any(not isinstance(row[key], str) or row[key] not in DIFF_TYPES for key in ('beforeType', 'afterType')): return False
+        if row['change'] not in ('added', 'removed', 'changed'): return False
+        if (row['change'] == 'added') != (row['beforeType'] == 'missing'): return False
+        if (row['change'] == 'removed') != (row['afterType'] == 'missing'): return False
+    return True
+
+
 def run_sample(sample, checkpoint=None, provider_factory=PublicProvider):
     started = time.monotonic()
     task, phase = sample['task'], sample['phase']
@@ -229,7 +308,8 @@ def run_sample(sample, checkpoint=None, provider_factory=PublicProvider):
                           'manifest': sample['manifest'], 'config': config, 'raw': raw, 'now': raw['retrievedAt']})
         if (not isinstance(checked, dict) or set(checked) != {'checks', 'claimCount', 'evidenceCount', 'quoteChars',
                     'scannedClauseCount', 'classifiedClauseCount', 'unknownClauseCount', 'newStrategyObservedAt',
-                    'protectedBeforeHash', 'protectedAfterHash'} or set(checked.get('checks', {})) != set(CHECKS)
+                    'protectedBeforeHash', 'protectedAfterHash'} | DIFF_FIELDS or not valid_differences(checked)
+                or set(checked.get('checks', {})) != set(CHECKS)
                 or any(type(value) is not bool for value in checked['checks'].values())
                 or any(type(checked.get(key)) is not int or not 0 <= checked[key] <= limit
                        for key, limit in (('claimCount', 24), ('evidenceCount', 8), ('quoteChars', 1280),
@@ -285,16 +365,60 @@ def verify(reader, output=OUTPUT, provider_factory=PublicProvider):
     return value
 
 
+def diagnose_normalization(reader, code, output=OUTPUT):
+    """Exact old artifact sample, no provider construction or source requests."""
+    expected = DIAGNOSTIC_SAMPLES.get(code)
+    if reader.commit != DIAGNOSTIC_COMMIT or not expected:
+        raise VerificationError('DIAGNOSTIC_BINDING_INVALID')
+    quarter = expected['quarter']; end, baseline = PERIODS[quarter]
+    manifest = reader.read('web/data/periods/' + quarter + '/latest.json')
+    reference = './data/companies/' + expected['dataPath'].rsplit('/', 1)[1]
+    if (not isinstance(manifest, dict) or manifest.get('targetPeriodEnd') != end or manifest.get('sourceMode') != 'actions'
+            or sum(isinstance(item, dict) and item.get('path') == reference for item in manifest.get('companyFiles', [])) != 1):
+        raise VerificationError('DIAGNOSTIC_BINDING_INVALID')
+    envelope = reader.read(expected['dataPath'])
+    if reader.last_blob != expected['dataBlobSha'] or not isinstance(envelope, dict):
+        raise VerificationError('DIAGNOSTIC_BINDING_INVALID')
+    funds = [fund for fund in envelope.get('funds', []) if isinstance(fund, dict) and fund.get('code') == code]
+    if len(funds) != 1 or envelope.get('targetPeriodEnd') != end or envelope.get('sourceMode') != 'actions':
+        raise VerificationError('DIAGNOSTIC_BINDING_INVALID')
+    phase = {'targetPeriodEnd': end, 'baselinePeriodEnd': baseline}
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    if not binding_for(funds[0], phase, now): raise VerificationError('DIAGNOSTIC_BINDING_INVALID')
+    small = {key: value for key, value in envelope.items() if key not in ('funds', 'coverage', 'errors')}
+    control = bridge({'mode': 'normalize-only', 'fund': funds[0], 'envelope': small, 'config': phase, 'now': now})
+    if (not isinstance(control, dict) or set(control) != {'normalizedFundCount', 'nonStrategyFieldsUnchanged',
+                'protectedBeforeHash', 'normalizedHash'} | DIFF_FIELDS or type(control.get('normalizedFundCount')) is not int or control['normalizedFundCount'] != 1
+            or type(control.get('nonStrategyFieldsUnchanged')) is not bool or not valid_differences(control)
+            or any(not isinstance(control.get(key), str) or not re.fullmatch(r'[a-f0-9]{64}', control[key])
+                   for key in ('protectedBeforeHash', 'normalizedHash'))):
+        raise VerificationError('BRIDGE_FAILED')
+    unchanged = reader.unchanged()
+    bound = control['protectedBeforeHash'] == expected['beforeHash']
+    value = {'schemaVersion': 1, 'mode': 'diagnose-normalization', 'status': 'diagnosed' if bound and unchanged else 'partial',
+             'dataCommit': reader.commit, 'quarter': quarter, 'code': code, 'dataPath': expected['dataPath'],
+             'dataBlobSha': reader.last_blob, 'maxOriginalPdfRequests': 0, 'originalPdfRequestsStarted': 0,
+             'productionDataModified': not unchanged, 'semanticAnalysisComplete': False,
+             'control': {'scope': 'empty-patch-in-memory-normalization-sample-only-catalog', **control,
+                         'matchesPreviouslyObservedBefore': bound,
+                         'matchesPreviouslyObservedAfter': control['normalizedHash'] == expected['observedAfterHash']}}
+    save_result(output, value)
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data-repo', required=True)
     parser.add_argument('--data-commit', required=True)
+    parser.add_argument('--mode', choices=('verify', 'diagnose-normalization'), default='verify')
+    parser.add_argument('--sample-code', choices=tuple(DIAGNOSTIC_SAMPLES), default='000189')
     args = parser.parse_args()
     if os.environ.get('GITHUB_ACTIONS') != 'true': raise VerificationError('ACTIONS_REQUIRED')
-    value = verify(GitDataReader(args.data_repo, args.data_commit))
-    print(json.dumps({'status': value['status'], 'sampleCount': len(value['samples']),
+    reader = GitDataReader(args.data_repo, args.data_commit)
+    value = diagnose_normalization(reader, args.sample_code) if args.mode == 'diagnose-normalization' else verify(reader)
+    print(json.dumps({'status': value['status'], 'sampleCount': len(value.get('samples', [value])),
                       'originalPdfRequestsStarted': value['originalPdfRequestsStarted'], 'productionDataModified': value['productionDataModified']}))
-    return 0 if value['status'] == 'verified' else 2
+    return 0 if value['status'] in ('verified', 'diagnosed') else 2
 
 
 if __name__ == '__main__':

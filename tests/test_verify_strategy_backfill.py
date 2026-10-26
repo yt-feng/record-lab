@@ -101,6 +101,99 @@ def source_factory(templates, calls, *, changed=False, failure=False):
 
 
 class StrategyBackfillVerificationTests(unittest.TestCase):
+    def diagnostic_setup(self):
+        reader, _ = setup_reader()
+        sample = verifier.select_sample(reader, '2026Q2', dt.datetime.now(dt.timezone.utc).isoformat())
+        def control(fund):
+            return verifier.bridge({'mode': 'normalize-only', 'fund': fund, 'envelope': sample['envelope'],
+                'config': sample['phase'], 'now': dt.datetime.now(dt.timezone.utc).isoformat()})
+        value = control(sample['fund'])
+        expected = {'quarter': '2026Q2', 'dataPath': sample['dataPath'], 'dataBlobSha': reader.last_blob,
+                    'beforeHash': value['protectedBeforeHash'], 'observedAfterHash': value['normalizedHash']}
+        return reader, sample, expected, control
+
+    def test_zero_request_diagnosis_binds_original_blob_and_observed_hashes(self):
+        reader, _, expected, _ = self.diagnostic_setup()
+        with tempfile.TemporaryDirectory() as directory, patch.object(verifier, 'DIAGNOSTIC_COMMIT', reader.commit), \
+             patch.object(verifier, 'DIAGNOSTIC_SAMPLES', {'000001': expected}), \
+             patch.object(verifier, 'collect', side_effect=AssertionError('no source requests')), \
+             patch.object(verifier, 'PublicProvider', side_effect=AssertionError('no provider')):
+            value = verifier.diagnose_normalization(reader, '000001', Path(directory) / 'result.json')
+        self.assertEqual(value['status'], 'diagnosed')
+        self.assertEqual(value['originalPdfRequestsStarted'], 0)
+        self.assertTrue(value['control']['matchesPreviouslyObservedBefore'])
+        self.assertTrue(value['control']['matchesPreviouslyObservedAfter'])
+        self.assertTrue(value['control']['nonStrategyFieldsUnchanged'])
+        self.assertEqual(value['control']['differences'], [])
+
+    def test_zero_request_diagnosis_rejects_wrong_commit_blob_and_sample(self):
+        reader, _, expected, _ = self.diagnostic_setup()
+        with tempfile.TemporaryDirectory() as directory:
+            for change in ('commit', 'blob', 'code'):
+                altered = copy.deepcopy(expected)
+                if change == 'blob': altered['dataBlobSha'] = '0' * 40
+                with patch.object(verifier, 'DIAGNOSTIC_COMMIT', '0' * 40 if change == 'commit' else reader.commit), \
+                     patch.object(verifier, 'DIAGNOSTIC_SAMPLES', {'000001': altered}):
+                    with self.assertRaisesRegex(verifier.VerificationError, 'DIAGNOSTIC_BINDING_INVALID'):
+                        verifier.diagnose_normalization(reader, '000002' if change == 'code' else '000001', Path(directory) / 'result.json')
+
+    def test_mismatched_observed_before_hash_stays_partial_in_diagnostic_mode(self):
+        reader, _, expected, _ = self.diagnostic_setup(); expected['beforeHash'] = '0' * 64
+        with tempfile.TemporaryDirectory() as directory, patch.object(verifier, 'DIAGNOSTIC_COMMIT', reader.commit), \
+             patch.object(verifier, 'DIAGNOSTIC_SAMPLES', {'000001': expected}):
+            value = verifier.diagnose_normalization(reader, '000001', Path(directory) / 'result.json')
+        self.assertEqual(value['status'], 'partial')
+        self.assertFalse(value['control']['matchesPreviouslyObservedBefore'])
+
+    def test_safe_differences_report_added_defaults_but_never_values_or_unknown_keys(self):
+        _, sample, _, control = self.diagnostic_setup()
+        fund = copy.deepcopy(sample['fund']); fund['selectedReport'].pop('fundCode', None)
+        fund['UNAPPROVED_PRIVATE_KEY'] = 'UNAPPROVED_PRIVATE_VALUE'
+        value = control(fund)
+        self.assertTrue(verifier.valid_differences(value))
+        self.assertIn({'path': 'fund.selectedReport.fundCode', 'beforeType': 'missing', 'afterType': 'string', 'change': 'added'}, value['differences'])
+        self.assertGreaterEqual(value['unmappedDifferenceCount'], 1)
+        self.assertNotIn('UNAPPROVED', json.dumps(value))
+        self.assertFalse(value['nonStrategyFieldsUnchanged'])
+        bad = copy.deepcopy(value); bad['differences'][0]['value'] = 'UNAPPROVED_PRIVATE_VALUE'
+        self.assertFalse(verifier.valid_differences(bad))
+        bad = copy.deepcopy(value); bad['differences'][0]['path'] = 'fund.UNAPPROVED_PRIVATE_KEY'
+        self.assertFalse(verifier.valid_differences(bad))
+        bad = copy.deepcopy(value); bad['differences'][0]['beforeType'] = []
+        self.assertFalse(verifier.valid_differences(bad))
+
+    def test_empty_patch_diagnosis_exposes_sample_catalog_missing_proven_alias(self):
+        from test_strategy_evidence_pool import REPORT, extracted
+        report = {**copy.deepcopy(REPORT), **extracted(), 'navYuan': 1000, 'coverage': 'top10', 'holdings': [
+            {'market': 'CN', 'stockCode': '600001', 'stockName': '合成证券', 'currency': 'CNY',
+             'shares': 10, 'marketValueYuan': 100, 'weightPct': 10}]}
+        for key in ('strategyClaims', 'strategyClaimsIdentityEvidence', 'strategyEvidencePool', 'strategyEvidenceBudget'):
+            report.pop(key, None)
+        identity = report['portfolioIdentityEvidence']
+        phase = {'targetPeriodEnd': '2026-06-30', 'baselinePeriodEnd': '2026-03-31', 'funds': [{'code': '000001'}]}
+        raw = {'asOf': china_today(), 'retrievedAt': RECEIVED, 'funds': [{'code': '000001', 'name': '合成基金',
+               'companyId': 'co1', 'company': '合成公司', 'sourcePortfolioCode': identity['sourcePortfolioCode'],
+               'shareClassCodes': identity['shareClassCodes'], 'portfolioSourceUrl': identity['sourceUrl'],
+               'reports': [report]}], 'barsByStock': {}, 'errors': []}
+        node = """const fs=require('fs'),{buildSnapshot}=require('./scripts/build-data'),{mergeSnapshots}=require('./scripts/merge-parts');
+const x=JSON.parse(fs.readFileSync(0,'utf8')), snapshot=buildSnapshot(x.raw,{config:x.phase,now:x.now});
+const catalog={companies:[{code:'co1',name:'合成公司',fundCount:2}],funds:[
+{code:'000001',companyCode:'co1',companyName:'合成公司'},{code:'000002',companyCode:'co1',companyName:'合成公司'}]};
+const result=mergeSnapshots({snapshots:[snapshot],catalog,config:x.phase,now:x.now,reusePrices:false});
+process.stdout.write(JSON.stringify(result.companySnapshots.co1));"""
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        response = subprocess.run(['node', '-e', node], input=json.dumps({'raw': raw, 'phase': phase, 'now': now}),
+            text=True, capture_output=True, timeout=30, cwd=ROOT, check=True)
+        envelope = json.loads(response.stdout); fund = envelope['funds'][0]
+        self.assertEqual(fund['companyId'], 'co1')
+        control = verifier.bridge({'mode': 'normalize-only', 'fund': fund, 'envelope': envelope, 'config': phase, 'now': now})
+        self.assertFalse(control['nonStrategyFieldsUnchanged'])
+        self.assertTrue(verifier.valid_differences(control))
+        self.assertEqual({row['path'] for row in control['differences']},
+                         {'fund.company', 'fund.companyId', 'fund.companyMapping'})
+        self.assertTrue(all(row['beforeType'] == row['afterType'] == 'string' for row in control['differences']))
+        self.assertEqual(control['unmappedDifferenceCount'], 0)
+
     def test_real_two_quarter_collect_build_merge_preserves_original_values_and_clocks(self):
         reader, templates = setup_reader(); before = copy.deepcopy(reader.data); calls = []
         with tempfile.TemporaryDirectory() as directory:

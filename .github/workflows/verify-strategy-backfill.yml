@@ -2,6 +2,22 @@ name: Verify independent strategy backfill
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: Zero-request normalization diagnosis or bounded PDF verification
+        required: true
+        default: diagnose-normalization
+        type: choice
+        options:
+          - diagnose-normalization
+          - verify
+      sample_code:
+        description: Previously observed sample for zero-request diagnosis
+        required: true
+        default: '000189'
+        type: choice
+        options:
+          - '000189'
+          - '002020'
       data_commit:
         description: Exact immutable data commit to read
         required: true
@@ -53,10 +69,12 @@ jobs:
         run: |
           python -m unittest discover -s tests -p 'test_collect_strategy_claims.py'
           python -m unittest discover -s tests -p 'test_verify_strategy_backfill.py'
-      - name: Verify at most two original PDF requests without production writes
+      - name: Run selected read-only diagnostic or verification mode
         env:
           DATA_COMMIT: ${{ inputs.data_commit }}
-        run: python scripts/verify_strategy_backfill.py --data-repo .cache/strategy-verification-data --data-commit "$DATA_COMMIT"
+          VERIFICATION_MODE: ${{ inputs.mode }}
+          SAMPLE_CODE: ${{ inputs.sample_code }}
+        run: python scripts/verify_strategy_backfill.py --data-repo .cache/strategy-verification-data --data-commit "$DATA_COMMIT" --mode "$VERIFICATION_MODE" --sample-code "$SAMPLE_CODE"
       - name: Retain compact source and preservation checks
         if: always()
         uses: actions/upload-artifact@v4
