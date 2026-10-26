@@ -104,6 +104,15 @@ def _physical_rows(page, columns, top, bottom):
             spans = [value for x, y, value in page.spans if region[0] <= x < region[2] and region[1] <= y <= region[3] and compact(value)]
             if not spans:
                 row['emptyIdentityRegion'] = {'rect': region, 'spanCount': 0, 'textHash': EMPTY_HASH}
+        elif set(row['cells']) == {'role', 'description'}:
+            # Some original PDFs carry just the unfinished role and biography
+            # cells onto the next page. Missing identity rectangles are not
+            # enough: the corresponding page regions must contain no text.
+            regions = [[columns['name'][0], row['bottom'], columns['role'][0], row['top']],
+                       [columns['start'][0], row['bottom'], columns['description'][0], row['top']]]
+            if all(not any(left <= x < right and bottom <= y <= top and compact(value)
+                           for x, y, value in page.spans) for left, bottom, right, top in regions):
+                row['emptyIdentityRegions'] = [{'rect': region, 'spanCount': 0, 'textHash': EMPTY_HASH} for region in regions]
     return sorted(result, key=lambda row: -row['top'])[:101]
 
 
@@ -113,7 +122,9 @@ def _fragment(row):
             'cellTextHashes': {key: digest(cell.text) for key, cell in row['cells'].items()},
             'cellText': {key: compact(row['cells'][key].text) for key in IDENTITY if key in row['cells']},
             **({'continuationType': 'description-only', 'emptyIdentityRegion': row['emptyIdentityRegion']}
-               if row.get('acceptedDescriptionContinuation') else {})}
+               if row.get('acceptedDescriptionContinuation') else {}),
+            **({'continuationType': 'role-description', 'emptyIdentityRegions': row['emptyIdentityRegions']}
+               if row.get('acceptedRoleDescriptionContinuation') else {})}
 
 
 def _continuation(previous, current, *, first_on_page):
@@ -121,14 +132,16 @@ def _continuation(previous, current, *, first_on_page):
     prior = previous[-1]
     if set(previous[0]['cells']) != set(FIELDS): return False
     description_only = set(current['cells']) == {'description'} and current.get('emptyIdentityRegion')
-    if not description_only and set(current['cells']) != set(FIELDS): return False
-    if not description_only and any(compact(current['cells'][key].text) for key in ('name', 'start', 'end')): return False
+    role_description = set(current['cells']) == {'role', 'description'} and current.get('emptyIdentityRegions')
+    if not description_only and not role_description and set(current['cells']) != set(FIELDS): return False
+    if any(compact(current['cells'][key].text) for key in ('name', 'start', 'end') if key in current['cells']): return False
     # Original rectangular cells must reach both adjacent page edges. Merely
     # seeing a blank name in another row is not continuation evidence.
     accepted = (prior['pageBox'][3] > prior['pageBox'][1] and current['pageBox'][3] > current['pageBox'][1]
             and prior['bottom'] <= prior['pageBox'][1] + 120
             and current['top'] >= current['pageBox'][3] - 120)
     if accepted and description_only: current['acceptedDescriptionContinuation'] = True
+    if accepted and role_description: current['acceptedRoleDescriptionContinuation'] = True
     return accepted
 
 
@@ -145,7 +158,8 @@ def _identity(fragments):
     values = {key: ''.join(compact(row['cells'][key].text) for row in fragments if key in row['cells']) for key in IDENTITY}
     name, role = values['name'], values['role']
     start, end = _date(values['start']), _date(values['end'])
-    valid = (all(set(row['cells']) == set(FIELDS) or row.get('acceptedDescriptionContinuation') for row in fragments)
+    valid = (all(set(row['cells']) == set(FIELDS) or row.get('acceptedDescriptionContinuation')
+                 or row.get('acceptedRoleDescriptionContinuation') for row in fragments)
              and re.fullmatch(r'[\u3400-\u9fff]{2,6}(?:[·•][\u3400-\u9fff]{1,6})?', name)
              and 0 < len(role) <= 60 and len(fragments) <= 4
              and all(len(compact(row['cells'][key].text)) <= (120 if key == 'role' else 32) for row in fragments for key in IDENTITY if key in row['cells']))
@@ -289,11 +303,19 @@ def normalize_geometry_evidence(raw, coverage):
                 if type(page) is not int or not source_table['startPage'] <= page <= source_table['endPage'] or index and page != fragments[index - 1]['page'] + 1: return None
                 if not isinstance(page_box, list) or len(page_box) != 4 or any(type(n) not in (float, int) or not math.isfinite(n) for n in page_box) or page_box[0] >= page_box[2] or page_box[1] >= page_box[3]: return None
                 description_only = fragment.get('continuationType') == 'description-only'
-                if not isinstance(cells, dict) or not set(cells) <= set(FIELDS) or classification != 'unresolved' and set(cells) != set(FIELDS) and not description_only: return None
+                role_description = fragment.get('continuationType') == 'role-description'
+                if not isinstance(cells, dict) or not set(cells) <= set(FIELDS) or classification != 'unresolved' and set(cells) != set(FIELDS) and not description_only and not role_description: return None
                 if description_only:
                     region = fragment.get('emptyIdentityRegion'); bounds = cells.get('description')
                     if not index or set(cells) != {'description'} or not isinstance(region, dict) or region.get('spanCount') != 0 or region.get('textHash') != EMPTY_HASH: return None
                     if not isinstance(bounds, list) or len(bounds) != 4 or region.get('rect') != [columns['name'][0], bounds[1], columns['description'][0], bounds[3]]: return None
+                if role_description:
+                    regions = fragment.get('emptyIdentityRegions'); bounds = cells.get('role')
+                    if not index or set(cells) != {'role', 'description'} or not isinstance(regions, list) or len(regions) != 2 or not isinstance(bounds, list) or len(bounds) != 4: return None
+                    expected = [[columns['name'][0], bounds[1], columns['role'][0], bounds[3]],
+                                [columns['start'][0], bounds[1], columns['description'][0], bounds[3]]]
+                    if any(not isinstance(region, dict) or region.get('spanCount') != 0 or region.get('textHash') != EMPTY_HASH
+                           or region.get('rect') != rect for region, rect in zip(regions, expected)): return None
                 if not isinstance(hashes, dict) or set(hashes) != set(cells) or not isinstance(texts, dict) or set(texts) != set(cells) & set(IDENTITY): return None
                 for field, bounds in cells.items():
                     if not isinstance(bounds, list) or len(bounds) != 4 or any(type(n) not in (int, float) or not math.isfinite(n) for n in bounds) or bounds[0] >= bounds[2] or bounds[1] >= bounds[3]: return None
@@ -309,7 +331,7 @@ def normalize_geometry_evidence(raw, coverage):
                         or max(bound[3] for bound in cells.values()) - min(bound[3] for bound in cells.values()) > TOLERANCE): return None
                 if index:
                     previous = fragments[index - 1]
-                    if any(texts.get(field) for field in ('name', 'start', 'end')) or not description_only and set(cells) != set(FIELDS) or set(fragments[0]['cells']) != set(FIELDS): return None
+                    if any(texts.get(field) for field in ('name', 'start', 'end')) or not description_only and not role_description and set(cells) != set(FIELDS) or set(fragments[0]['cells']) != set(FIELDS): return None
                     if min(bound[1] for bound in previous['cells'].values()) > previous['pageBox'][1] + 120 or max(bound[3] for bound in cells.values()) < page_box[3] - 120: return None
                 pages.add(page)
             counter['physicalRowCount'] += len(fragments); counter['continuationCount'] += len(fragments) - 1

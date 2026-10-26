@@ -74,6 +74,50 @@ class ManagerCellTests(unittest.TestCase):
         self.assertFalse(result.coverage['complete'])
         self.assertGreater(result.coverage['excludedRows'], 0)
 
+    def test_role_and_description_only_continuation_requires_two_empty_identity_regions(self):
+        # The role split and six-cell/two-cell layout reproduce the bounded
+        # public 004845 diagnostic. Appointment dates here are synthetic.
+        prefix, suffix = '总经理助理兼权益投资部总经理、本基', '金基金经理、投资经理'
+        pages = [HEADER + f'徐超 {prefix} 2020年1月2日 - 8年\n', suffix + '\n' + END]
+        first = page(1, row(79.8, 118.56, name='徐超', role=prefix), header=True)
+        continuation = [Cell(*COLUMNS['role'], 341.81, 771.48, suffix),
+                        Cell(*COLUMNS['description'], 341.81, 771.48, '继续履历。')]
+        second = page(2, continuation, end_y=300)
+        result = parse([first, second], pages)
+        self.assertTrue(result.coverage['complete'])
+        self.assertEqual(result[0]['role'], prefix + suffix)
+        self.assertEqual(result.coverage['candidateRows'], 1)
+        self.assertEqual(result.coverage['geometryEvidence']['continuationCount'], 1)
+        fragment = result.coverage['geometryEvidence']['tables'][0]['rows'][0]['fragments'][1]
+        self.assertEqual(fragment['continuationType'], 'role-description')
+        self.assertEqual(len(fragment['emptyIdentityRegions']), 2)
+        self.assertTrue(normalize_manager_table_coverage(result.coverage, result, '2026-06-30')['complete'])
+        # Even text with no clipping rectangle can be another name/date. It
+        # must prevent joining either side of the role column.
+        for span in [(20, 600, '另一经理'), (180, 600, '2026年4月1日'), (320, 600, '8年')]:
+            second.spans = [span]
+            partial = parse([first, second], pages)
+            self.assertFalse(partial.coverage['complete'])
+            self.assertEqual(partial.coverage['excludedRows'], 2)
+        for change in ('absent', 'span', 'hash', 'bounds'):
+            proof = copy.deepcopy(result.coverage)
+            fragment = proof['geometryEvidence']['tables'][0]['rows'][0]['fragments'][1]
+            if change == 'absent': fragment.pop('emptyIdentityRegions')
+            if change == 'span': fragment['emptyIdentityRegions'][0]['spanCount'] = 1
+            if change == 'hash': fragment['emptyIdentityRegions'][1]['textHash'] = 'f' * 64
+            if change == 'bounds': fragment['emptyIdentityRegions'][1]['rect'][0] += 1
+            self.assertFalse(normalize_manager_table_coverage(proof, result, '2026-06-30')['complete'])
+
+    def test_partial_cell_role_continuation_cannot_join_nonadjacent_or_interior_rows(self):
+        prefix, suffix = '本基', '金基金经理'
+        pages = [HEADER + f'张明 {prefix} 2020年1月2日 -\n', suffix + '\n' + END]
+        for previous_bottom, next_top, page_number in [(150, 780, 2), (60, 650, 2), (60, 780, 3)]:
+            first = page(1, row(previous_bottom, 700, role=prefix), header=True)
+            second = page(page_number, [Cell(*COLUMNS['role'], 300, next_top, suffix),
+                                       Cell(*COLUMNS['description'], 300, next_top, '继续履历')], end_y=250)
+            result = parse([first, second], pages)
+            self.assertFalse(result.coverage['complete'])
+
     def test_true_assistant_and_departed_before_quarter_have_separate_accounting(self):
         body = row(550, 700) + row(400, 550, name='李明', role='本基金基金经理助理') + row(250, 400, name='王明', end='2026年3月31日')
         text = HEADER + '张明 本基金基金经理 2020年1月2日 -\n李明 本基金基金经理助理 2020年1月2日 -\n王明 本基金基金经理 2020年1月2日 2026年3月31日\n' + END

@@ -297,7 +297,7 @@ def run_sample(sample):
             'physicalRowCount', 'logicalRowCount', 'continuationCount', 'emptyRowCount', 'unresolvedRows')}
         result['geometrySummary']['tables'] = [{'section': table['section'], 'columns': table['columns'],
             'rows': [{'classification': row['classification'], 'fragments': [{key: fragment[key] for key in
-                    ('page', 'pageBox', 'cells', 'cellTextHashes', 'continuationType', 'emptyIdentityRegion') if key in fragment}
+                    ('page', 'pageBox', 'cells', 'cellTextHashes', 'continuationType', 'emptyIdentityRegion', 'emptyIdentityRegions') if key in fragment}
                     for fragment in row['fragments']]} for row in table['rows']]}
             for table in geometry['tables']]
     try:

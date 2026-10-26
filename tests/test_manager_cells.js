@@ -15,6 +15,7 @@ const script = [
   "put('complete',[page(1,row(300,700),header=True,end_y=250)],[HEADER+'张明 本基金基金经理 2020年1月2日 -\\n'+END])",
   "prefix='总经理助理兼权益投资部总经理、本基';suffix='金基金经理、投资经理'",
   "put('continued',[page(1,row(60,700,name='徐超',role=prefix),header=True),page(2,row(600,780,name='',role=suffix,start='',end='',experience=''),end_y=550)],[HEADER+'徐超 '+prefix+' 2020年1月2日 -\\n',suffix+'\\n'+END])",
+  "put('roleDescription',[page(1,row(60,700,name='徐超',role=prefix),header=True),page(2,[Cell(*COLUMNS['role'],300,780,suffix),Cell(*COLUMNS['description'],300,780,'这是已知经理的履历续写。')],end_y=250)],[HEADER+'徐超 '+prefix+' 2020年1月2日 -\\n',suffix+'\\n'+END])",
   "put('classified',[page(1,row(550,700)+row(400,550,name='李明',role='本基金基金经理助理')+row(250,400,name='王明',end='2026年3月31日'),header=True,end_y=200)],[HEADER+'张明 本基金基金经理 2020年1月2日 -\\n李明 本基金基金经理助理 2020年1月2日 -\\n王明 本基金基金经理 2020年1月2日 2026年3月31日\\n'+END])",
   "put('partial',[page(1,row(500,700)+row(300,500,name='李明',start='2026年2月31日'),header=True,end_y=250)],[HEADER+'张明 本基金基金经理 2020年1月2日 -\\n'+END])",
   "put('description',[page(1,row(60,700),header=True),page(2,[Cell(*COLUMNS['description'],600,780,'这是已知经理的履历续写。')]+row(300,600,name='李明'),end_y=250)],[HEADER+'张明 本基金基金经理 2020年1月2日 -\\n','续写履历\\n李明 本基金基金经理 2020年1月2日 -\\n'+END])",
@@ -26,7 +27,7 @@ assert.equal(generated.status, 0, generated.stderr);
 const fixtures = JSON.parse(generated.stdout);
 
 test('Python original-cell proof survives JS normalization including exact adjacent-page continuation', () => {
-  for (const key of ['complete', 'continued', 'classified', 'description', 'descriptionChain']) {
+  for (const key of ['complete', 'continued', 'classified', 'description', 'descriptionChain', 'roleDescription']) {
     const sample = fixtures[key];
     assert.equal(sample.coverage.complete, true);
     const proof = managerCoverageFor(sample.coverage, sample.managers, '2026-06-30');
@@ -43,6 +44,36 @@ test('Python original-cell proof survives JS normalization including exact adjac
   assert.equal(fixtures.description.coverage.geometryEvidence.physicalRowCount, 3);
   assert.equal(fixtures.description.coverage.geometryEvidence.logicalRowCount, 2);
   assert.equal(fixtures.descriptionChain.coverage.geometryEvidence.continuationCount, 3);
+  assert.equal(fixtures.roleDescription.coverage.geometryEvidence.tables[0].rows[0].fragments[1].continuationType, 'role-description');
+  assert.equal(fixtures.roleDescription.managers[0].role, '总经理助理兼权益投资部总经理、本基金基金经理、投资经理');
+});
+
+test('role-description continuation requires both empty identity regions and consecutive page-edge cells', () => {
+  const mutations = [
+    fragment => { delete fragment.emptyIdentityRegions; },
+    fragment => { fragment.emptyIdentityRegions.pop(); },
+    fragment => { fragment.emptyIdentityRegions[0].spanCount = 1; },
+    fragment => { fragment.emptyIdentityRegions[1].spanCount = 1; },
+    fragment => { fragment.emptyIdentityRegions[0].textHash = 'b'.repeat(64); },
+    fragment => { fragment.emptyIdentityRegions[1].textHash = 'b'.repeat(64); },
+    fragment => { fragment.emptyIdentityRegions[0].rect[0] += 1; },
+    fragment => { fragment.emptyIdentityRegions[1].rect[0] += 1; },
+    fragment => { fragment.page = 1; },
+    fragment => { fragment.page = 3; },
+    fragment => { fragment.cells.role[0] += 3; },
+    fragment => { fragment.cells.role[3] = 650; fragment.cells.description[3] = 650;
+      fragment.emptyIdentityRegions.forEach(region => { region.rect[3] = 650; }); },
+    fragment => { fragment.cellText.role = '另一位经理'; },
+    fragment => { delete fragment.continuationType; },
+  ];
+  for (const mutate of mutations) {
+    const sample = clone(fixtures.roleDescription);
+    mutate(sample.coverage.geometryEvidence.tables[0].rows[0].fragments[1]);
+    assert.equal(managerCoverageFor(sample.coverage, sample.managers).complete, false);
+  }
+  const sample = clone(fixtures.roleDescription), fragments = sample.coverage.geometryEvidence.tables[0].rows[0].fragments;
+  fragments[0] = { ...clone(fragments[1]), page: 1 };
+  assert.equal(managerCoverageFor(sample.coverage, sample.managers).complete, false);
 });
 
 test('description-only continuation requires empty identity proof, adjacent pages and original full row', () => {
