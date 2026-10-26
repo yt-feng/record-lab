@@ -22,6 +22,7 @@ from providers import (DataError, stock_identifiers, parse_eastmoney_prices,
                        parse_yahoo_prices, parse_tencent_prices)
 from foreign_prices import us_identifiers, parse_us_yahoo_prices
 from price_coverage import price_series
+from price_daily_evidence import extract_daily
 from publication_guard import inspect_content
 
 MAX_OUTPUT = 65536
@@ -163,7 +164,7 @@ def evidence_metadata(payload, provider):
         return {'metadataStatus': 'unavailable'}
 
 
-def requery(result, *, fetch=None, now=None):
+def requery(result, *, fetch=None, now=None, daily_sink=None):
     if result.get('kind') != 'price-conflict-diagnostic' or len(result.get('quarters', [])) > 2:
         raise DiagnosticError('DIAGNOSTIC_INPUT_INVALID')
     fetch = fetch or ActionsTransport()
@@ -208,6 +209,8 @@ def requery(result, *, fetch=None, now=None):
                                        'expectedDateSetHash', 'missingSessionCount', 'unexpectedSessionCount', 'rejectedRowCount', 'conflictingDateCount')}})
                     output['storedRangeExactlyReproduced'] = output['low'] == group['low'] and output['high'] == group['high']
                     daily.append((output, {value['date']: value for value in values}))
+                    if daily_sink is not None:
+                        daily_sink(extract_daily(payload, provider, row))
                 except (DiagnosticError, DataError) as error:
                     output.update(status='unavailable', errorCode=str(error))
                     category = getattr(error, 'network_error_class', None)

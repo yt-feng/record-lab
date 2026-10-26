@@ -90,7 +90,8 @@ class PriceConflictLimitTests(unittest.TestCase):
         self.assertIn('--keys-per-quarter "$KEYS_PER_QUARTER"', command)
         self.assertIn('cancel-in-progress: false', text); self.assertIn('Restore explicitly bound prior ledger', text)
         for value in ('1', '4'):
-            args = [value if item == '$KEYS_PER_QUARTER' else item for item in shlex.split(command)[2:]]
+            env = {'$KEYS_PER_QUARTER': value, '$TARGET_QUARTER': '', '$TARGET_KEY': '', '$TARGET_DIGEST': ''}
+            args = [env.get(item, item) for item in shlex.split(command)[2:]]
             with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), patch.object(conflicts, 'read_json', return_value={'parent': 'unchanged'}) as read, \
                  patch.object(conflicts, 'run', return_value={'kind': 'price-conflict-run', 'summary': {}}) as run, contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(conflicts.main(args), 0)

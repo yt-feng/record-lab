@@ -24,6 +24,7 @@ from price_coverage import CALENDAR, expected_sessions, date_set_hash, valid_com
 from price_patches import public_url, stock_key
 from publication_guard import inspect_content
 import verify_price_conflicts as diagnostic
+import price_daily_evidence as daily_evidence
 
 PHASES = {'2026Q2': ('2026-04-01', '2026-06-30', '2026-03-31'),
           '2026Q3': ('2026-07-01', '2026-09-30', '2026-06-30')}
@@ -377,13 +378,37 @@ def request_choices(row, now):
     return unique
 
 
-def plan_rechecks(registry, previous_ledger=None, *, max_keys=10, max_requests=20, now=None):
+def normalize_target(target):
+    if target is None: return None
+    if (not isinstance(target, dict) or set(target) != {'quarter', 'key', 'digest'}
+            or not isinstance(target.get('digest'), str) or not HASH.fullmatch(target['digest'])):
+        fail('CONFLICT_TARGET_INVALID')
+    identity(target.get('key'), target.get('quarter'))
+    return dict(target)
+
+
+def target_history(target, registry, ledger):
+    row = next((row for row in registry['records'] if row['key'] == target['key']), None)
+    if not row or row['digest'] != target['digest'] or target['quarter'] != registry['quarter']:
+        fail('CONFLICT_TARGET_STALE')
+    entry = next((entry for entry in ledger['entries'] if entry['key'] == target['key']), {})
+    history = next((history for history in entry.get('digests', []) if history['digest'] == target['digest']), None)
+    # A targeted precision check can only spend the existing digest's remainder.
+    # It must never become a bootstrap or a new-source-digest retry escape hatch.
+    if not history or not history['rounds']: fail('CONFLICT_TARGET_NOT_PREVIOUSLY_ATTEMPTED')
+    return history
+
+
+def plan_rechecks(registry, previous_ledger=None, *, max_keys=10, max_requests=20, now=None, target=None):
     current = clock(now); registry = normalize_registry(registry, current)
     ledger = normalize_ledger(previous_ledger, registry['quarter'], current)
     bounded_int(max_keys, MAX_PLAN_KEYS, 'CONFLICT_LIMIT_INVALID'); bounded_int(max_requests, MAX_REQUESTS, 'CONFLICT_LIMIT_INVALID')
+    target = normalize_target(target)
+    if target is not None: target_history(target, registry, ledger)
     entries = {entry['key']: entry for entry in ledger['entries']}
     candidates, blocked = [], {'exhausted': 0, 'historyFull': 0, 'sourceUnsupported': 0, 'limited': 0}
     for row in registry['records']:
+        if target is not None and row['key'] != target['key']: continue
         histories = entries.get(row['key'], {}).get('digests', [])
         history = next((item for item in histories if item['digest'] == row['digest']), None)
         rounds = history['rounds'] if history else []
@@ -397,6 +422,7 @@ def plan_rechecks(registry, previous_ledger=None, *, max_keys=10, max_requests=2
     plan = {'schemaVersion': 1, 'kind': 'price-conflict-plan', 'quarter': registry['quarter'], 'plannedAt': current.isoformat(),
             'registryManifestContentHash': registry['manifestContentHash'], 'items': [], 'maxAttemptsPerDigest': MAX_ATTEMPTS,
             'maxRequestsPerRound': 2, 'productionDataModified': False, 'automaticResolution': False}
+    if target is not None: plan['target'] = target
     total = 0
     for attempts, _, row, choices in candidates:
         if len(plan['items']) >= max_keys or total + len(choices) > max_requests: blocked['limited'] += 1; continue
@@ -417,12 +443,16 @@ def validate_plan(plan, registry, now=None):
             or len(plan['items']) > MAX_PLAN_KEYS or plan.get('maxAttemptsPerDigest') != MAX_ATTEMPTS
             or plan.get('maxRequestsPerRound') != 2 or plan.get('registryManifestContentHash') != registry['manifestContentHash']
             or plan.get('productionDataModified') is not False or plan.get('automaticResolution') is not False): fail('CONFLICT_PLAN_INVALID')
+    target = normalize_target(plan.get('target'))
+    if target is not None and (target['quarter'] != registry['quarter'] or len(plan['items']) > 1
+        or not any(row['key'] == target['key'] and row['digest'] == target['digest'] for row in registry['records'])): fail('CONFLICT_TARGET_STALE')
     rows = {row['key']: row for row in registry['records']}; seen = set(); count = 0
     for item in plan['items']:
         if not isinstance(item, dict): fail('CONFLICT_PLAN_INVALID')
         row = rows.get(item.get('key'))
         if not row or item['key'] in seen or item.get('digest') != row['digest']: fail('CONFLICT_PLAN_STALE')
         seen.add(item['key'])
+        if target is not None and any(item[key] != target[key] for key in ('key', 'digest')): fail('CONFLICT_TARGET_STALE')
         if (any(item.get(key) != row[key] for key in ('market', 'stockCode', 'currency', 'priceBasis', 'rangeStart', 'rangeEnd', 'calendarId', 'types'))
                 or type(item.get('round')) is not int or not 1 <= item['round'] <= MAX_ATTEMPTS
                 or not isinstance(item.get('requests'), list) or not 1 <= len(item['requests']) <= 2): fail('CONFLICT_PLAN_INVALID')
@@ -537,13 +567,15 @@ def execute_rechecks(plan, registry, previous_ledger=None, *, checkpoint, fetch=
     transport = fetch or diagnostic.ActionsTransport()
     existing = {(entry['key'], history['digest']): history['rounds'] for entry in ledger['entries'] for history in entry['digests']}
     histories = {entry['key']: entry['digests'] for entry in ledger['entries']}
-    receipts, skipped = [], 0
+    target = normalize_target(plan.get('target'))
+    if target is not None: target_history(target, registry, ledger)
+    receipts, skipped, daily_results = [], 0, []
     for item in plan['items']:
         old = existing.get((item['key'], item['digest']), [])
         if (len(old) != item['round'] - 1 or any(row['attemptId'] == item['attemptId'] for row in old)
                 or not old and len(histories.get(item['key'], [])) >= MAX_DIGESTS
                 or item['key'] not in histories and len(histories) >= MAX_KEYS): skipped += 1; continue
-        receipt = None; responses = []
+        receipt = None; responses = []; captures = {}
         for request in item['requests']:
             if should_start is not None and not should_start(): break
             started = (clock(now)).isoformat()
@@ -563,7 +595,8 @@ def execute_rechecks(plan, registry, previous_ledger=None, *, checkpoint, fetch=
             group = {'sourceUrl': request['sourceUrl'], 'low': request['storedLow'], 'high': request['storedHigh'], 'reusableCompleteSource': True}
             sample = {'kind': 'price-conflict-diagnostic', 'quarters': [{'quarter': plan['quarter'], 'selected': [
                 {**item, 'groups': [group], 'differences': [{'firstGroup': 0, 'secondGroup': 0}]}]}]}
-            diagnostic.requery(sample, fetch=transport, now=now)
+            sink = (lambda series, fact_id=request['factId']: captures.__setitem__(fact_id, series)) if target is not None else None
+            diagnostic.requery(sample, fetch=transport, now=now, daily_sink=sink)
             quote = sample['quarters'][0]['selected'][0]['requotes'][0]
             event['outcome'] = quote['status']; event['quote'] = quote
             responses.append(event)
@@ -571,9 +604,15 @@ def execute_rechecks(plan, registry, previous_ledger=None, *, checkpoint, fetch=
             # authorization to replace any stored quote.
             receipt['verificationStatus'] = verification_status(responses)
             checkpoint(copy.deepcopy(receipts))
+        if target is not None and receipt is not None:
+            proof = daily_evidence.build_evidence(item, receipt, captures)
+            daily_results.append(daily_evidence.normalize_evidence(proof, item, receipt))
     result = {'schemaVersion': 1, 'kind': 'price-conflict-execution', 'quarter': plan['quarter'], 'receipts': receipts,
               'summary': {'attemptedKeyCount': len(receipts), 'attemptedRequestCount': sum(len(row['requests']) for row in receipts), 'skippedKeyCount': skipped},
               'productionDataModified': False, 'automaticResolution': False}
+    if target is not None:
+        result['dailyEvidence'] = daily_results
+        if len(encoded(result)) > daily_evidence.MAX_BYTES: fail('CONFLICT_DAILY_EVIDENCE_INVALID')
     checked_bytes(result); return result
 
 
@@ -625,17 +664,20 @@ def merge_receipts(registry, previous_ledger, plan, receipts, *, now=None):
     return normalize_ledger(ledger, plan['quarter'], current)
 
 
-def run(data_root, output, *, quarters='both', max_keys=8, max_requests=16, keys_per_quarter=1, now=None, fetch=None, restored_state=None):
+def run(data_root, output, *, quarters='both', max_keys=8, max_requests=16, keys_per_quarter=1, now=None, fetch=None, restored_state=None, target=None):
     """Actions artifact run. The input tree is read-only, including its ledger."""
     if os.environ.get('GITHUB_ACTIONS') != 'true': fail('CONFLICT_REQUIRES_ACTIONS')
     bounded_int(max_keys, MAX_PLAN_KEYS, 'CONFLICT_LIMIT_INVALID'); bounded_int(max_requests, MAX_REQUESTS, 'CONFLICT_LIMIT_INVALID')
     if type(keys_per_quarter) is not int or not 1 <= keys_per_quarter <= 4: fail('CONFLICT_LIMIT_INVALID')
     if quarters not in ('both', *PHASES): fail('CONFLICT_ARGUMENTS_INVALID')
+    target = normalize_target(target)
+    if target is not None and quarters not in ('both', target['quarter']): fail('CONFLICT_TARGET_INVALID')
     source, destination = Path(data_root).resolve(), Path(output).resolve()
     if destination.is_relative_to(source): fail('CONFLICT_OUTPUT_INSIDE_SOURCE')
     selected = list(PHASES) if quarters == 'both' else [quarters]
     max_keys = min(max_keys, len(selected) * keys_per_quarter)
     max_requests = min(max_requests, len(selected) * keys_per_quarter * 2)
+    if target is not None: max_keys, max_requests = min(max_keys, 1), min(max_requests, 2)
     restored = normalize_restored_state(restored_state, now) if restored_state is not None else None
     if fetch is None and max_keys and max_requests:
         if restored is None: fail('CONFLICT_PRIOR_LEDGER_REQUIRED')
@@ -674,8 +716,13 @@ def run(data_root, output, *, quarters='both', max_keys=8, max_requests=16, keys
         directory = destination / quarter
         write_json(registry, directory / 'registry.json')
         left = len(selected) - position
-        plan = plan_rechecks(registry, ledger, max_keys=min(keys_per_quarter, (remaining_keys + left - 1) // left),
-                             max_requests=min(keys_per_quarter * 2, (remaining_requests + left - 1) // left), now=now)
+        if target is not None:
+            active = target['quarter'] == quarter
+            plan = plan_rechecks(registry, ledger, max_keys=remaining_keys if active else 0,
+                                 max_requests=remaining_requests if active else 0, now=now, target=target if active else None)
+        else:
+            plan = plan_rechecks(registry, ledger, max_keys=min(keys_per_quarter, (remaining_keys + left - 1) // left),
+                                 max_requests=min(keys_per_quarter * 2, (remaining_requests + left - 1) // left), now=now)
         write_json(plan, directory / 'plan.json'); write_json(ledger, directory / 'ledger.json')
         def checkpoint(receipts):
             nonlocal ledger
@@ -693,6 +740,9 @@ def run(data_root, output, *, quarters='both', max_keys=8, max_requests=16, keys
                                    'verificationCounts': {status: sum(receipt['verificationStatus'] == status for receipt in execution['receipts'])
                                                           for status in sorted({receipt['verificationStatus'] for receipt in execution['receipts']})},
                                    'resolution': 'unresolved'})
+        if target is not None and target['quarter'] == quarter:
+            result['target'] = target
+            result['quarters'][-1]['dailyEvidenceStatuses'] = [proof['comparison']['status'] for proof in execution.get('dailyEvidence', [])]
     result['summary'] = {'conflictKeyCount': sum(row['registry']['conflictKeyCount'] for row in result['quarters']),
                          'attemptedKeyCount': max_keys - remaining_keys, 'attemptedRequestCount': max_requests - remaining_requests,
                          'quarterCount': len(result['quarters'])}
@@ -709,10 +759,14 @@ def main(argv=None):
     parser.add_argument('--max-keys', type=int, default=10); parser.add_argument('--max-requests', type=int, default=20)
     parser.add_argument('--quarters', choices=('both', *PHASES), default='both')
     parser.add_argument('--keys-per-quarter', default='1')
+    for name in ('target-quarter', 'target-key', 'target-digest'): parser.add_argument('--' + name, default='')
     args = parser.parse_args(argv)
     try:
         if os.environ.get('GITHUB_ACTIONS') != 'true': fail('CONFLICT_REQUIRES_ACTIONS')
         if not re.fullmatch(r'[1-4]', args.keys_per_quarter): fail('CONFLICT_LIMIT_INVALID')
+        fields = (args.target_quarter, args.target_key, args.target_digest)
+        target = normalize_target(dict(zip(('quarter', 'key', 'digest'), fields))) if any(fields) else None
+        if target is not None and args.command not in ('run', 'plan'): fail('CONFLICT_TARGET_INVALID')
         if not args.output: fail('CONFLICT_ARGUMENTS_INVALID')
         targets = [args.output] + ([args.checkpoint] if args.checkpoint else [])
         if args.data and any(Path(target).resolve().is_relative_to(Path(args.data).resolve()) for target in targets): fail('CONFLICT_OUTPUT_INSIDE_SOURCE')
@@ -720,12 +774,12 @@ def main(argv=None):
             if source and any(Path(source).resolve() == Path(target).resolve() for target in targets): fail('CONFLICT_OUTPUT_OVERWRITES_INPUT')
         if args.command == 'run':
             result = run(args.data, args.output, quarters=args.quarters, max_keys=args.max_keys, max_requests=args.max_requests,
-                         keys_per_quarter=int(args.keys_per_quarter), restored_state=read_json(args.restore_state) if args.restore_state else None)
+                         keys_per_quarter=int(args.keys_per_quarter), restored_state=read_json(args.restore_state) if args.restore_state else None, target=target)
         elif args.command == 'scan': result = scan_registry(args.data, args.quarter)
         else:
             registry = normalize_registry(read_json(args.registry))
             ledger = read_json(args.ledger) if args.ledger else None
-            if args.command == 'plan': result = plan_rechecks(registry, ledger, max_keys=args.max_keys, max_requests=args.max_requests)
+            if args.command == 'plan': result = plan_rechecks(registry, ledger, max_keys=args.max_keys, max_requests=args.max_requests, target=target)
             elif args.command == 'execute':
                 if not args.checkpoint or Path(args.checkpoint).resolve() == Path(args.output).resolve(): fail('CONFLICT_ARGUMENTS_INVALID')
                 result = execute_rechecks(read_json(args.plan), registry, ledger, checkpoint=lambda receipts: write_json(receipts, args.checkpoint))

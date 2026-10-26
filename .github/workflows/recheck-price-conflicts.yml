@@ -12,6 +12,21 @@ on:
           - '2'
           - '3'
           - '4'
+      target_quarter:
+        description: Optional exact quarter for a previously attempted conflict (all three target fields required)
+        required: false
+        default: ''
+        type: string
+      target_key:
+        description: Exact existing security-quarter conflict key
+        required: false
+        default: ''
+        type: string
+      target_digest:
+        description: Exact existing conflict digest; remaining two-round budget only
+        required: false
+        default: ''
+        type: string
       data_commit:
         description: Published data commit to inspect
         required: true
@@ -80,6 +95,7 @@ jobs:
           node --test tests/test_price_conflict_scan.js tests/test_price_validation_cache.js
           python -m unittest discover -s tests -p 'test_price_conflicts.py'
           python -m unittest discover -s tests -p 'test_price_conflict_limits.py'
+          python -m unittest discover -s tests -p 'test_price_daily_evidence.py'
           python -m unittest discover -s tests -p 'test_restore_price_conflict_ledger.py'
       - name: Restore explicitly bound prior ledger
         env:
@@ -98,9 +114,12 @@ jobs:
       - name: Scan published conflicts within each quarter limit
         env:
           KEYS_PER_QUARTER: ${{ inputs.keys_per_quarter }}
+          TARGET_QUARTER: ${{ inputs.target_quarter }}
+          TARGET_KEY: ${{ inputs.target_key }}
+          TARGET_DIGEST: ${{ inputs.target_digest }}
         run: |
           export PRICE_DIAGNOSTIC_DATA_COMMIT="$(git -C .cache/conflict-source rev-parse HEAD)"
-          python scripts/price_conflicts.py run --data .cache/conflict-source/web/data/periods --output .cache/price-conflicts --quarters both --keys-per-quarter "$KEYS_PER_QUARTER" --restore-state .cache/price-conflicts-restore/state.json
+          python scripts/price_conflicts.py run --data .cache/conflict-source/web/data/periods --output .cache/price-conflicts --quarters both --keys-per-quarter "$KEYS_PER_QUARTER" --target-quarter "$TARGET_QUARTER" --target-key "$TARGET_KEY" --target-digest "$TARGET_DIGEST" --restore-state .cache/price-conflicts-restore/state.json
       - name: Retain guarded conflict ledger
         if: always()
         uses: actions/upload-artifact@v4
