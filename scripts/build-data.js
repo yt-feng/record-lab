@@ -6,6 +6,7 @@ const path = require('node:path');
 const { analyzeFund, normalizeReport, normalizeLifecycleEvidence, validDate, validHoldingIdentity } = require('../lib/fund-analysis');
 const { validCompletePrice, validCompleteQuarterPrice } = require('../lib/price-coverage');
 const { normalizePatch } = require('../lib/price-patches');
+const strategyClaimPatches = require('../lib/strategy-claim-patches');
 const { retainPortfolioIdentity } = require('../lib/portfolio-identity');
 const { chinaDate } = require('../web/source-dates');
 
@@ -34,9 +35,11 @@ const BUILD_CODES = new Set([
   'LIFECYCLE_DEADLINE_REACHED', 'LIFECYCLE_PAGINATION_STALLED', 'LIFECYCLE_ANNOUNCEMENT_PAGE_LIMIT',
   'LIFECYCLE_INVALID_PDF', 'LIFECYCLE_PDF_TOO_LARGE', 'LIFECYCLE_PDF_PAGE_LIMIT', 'LIFECYCLE_NOT_CONFIRMED',
   'INVALID_STRATEGY_CLAIMS', 'INVALID_STRATEGY_QUOTE_BUDGET',
+  'STRATEGY_CLAIMS_BINDING_INVALID', 'STRATEGY_CLAIMS_BUDGET_REACHED', 'STRATEGY_CLAIMS_REQUEST_NOT_STARTED',
+  ...strategyClaimPatches.ERROR_CODES,
 ]);
 const STAGES = new Set(['metadata', 'announcements', 'holdings', 'report', 'nav', 'narrative',
-  'join', 'prices', 'build', 'collection', 'budget', 'target-report', 'no-equities-report', 'quarterly-report', 'lifecycle']);
+  'join', 'prices', 'build', 'collection', 'budget', 'target-report', 'no-equities-report', 'quarterly-report', 'lifecycle', 'strategy-claims']);
 const fundCode = value => typeof value === 'string' && /^\d{6}$/.test(value);
 const clone = value => JSON.parse(JSON.stringify(value));
 
@@ -430,6 +433,36 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
   const pricePatches = priceItems.map(item => normalizePatch(
     (Array.isArray(raw.pricePatches) ? raw.pricePatches : []).find(patch => patch?.code === item.code),
     item, barsByStock, config, raw.retrievedAt, config.traversal?.plannedAt));
+  const strategyItems = configured.filter(item => Object.hasOwn(item, 'strategyClaimsOnly'));
+  const strategyCodes = new Set(strategyItems.map(item => item.code));
+  const strategyClaimsTasks = [], strategyClaimsReceipts = [], strategyClaimsPatches = [];
+  const strategyClaimsPlannedAt = strategyItems.length && strategyClaimPatches.instant(config.traversal?.plannedAt) !== null
+    ? config.traversal.plannedAt : null;
+  const otherLaneCodes = new Set(['qualityCodes', 'managerCodes', 'strategyCodes', 'enrichmentCodes', 'reportLocatorCodes']
+    .flatMap(key => Array.isArray(config.traversal?.[key]) ? config.traversal[key] : []));
+  for (const item of strategyItems) {
+    const task = strategyClaimPatches.normalizeTask(item.strategyClaimsOnly, config, item.code, nowValue);
+    if (!task || !strategyClaimsPlannedAt || ['priceOnly', 'reportLocator', 'reportLocatorOnly'].some(key => Object.hasOwn(item, key))
+      || otherLaneCodes.has(item.code) || configured.filter(x => x.code === item.code).length !== 1) {
+      addError('STRATEGY_CLAIMS_BINDING_INVALID', item.code); continue;
+    }
+    strategyClaimsTasks.push(task);
+    const receipts = (Array.isArray(raw.strategyClaimsReceipts) ? raw.strategyClaimsReceipts : []).filter(x => x?.code === item.code)
+      .map(x => strategyClaimPatches.normalizeReceipt(x, task, config, raw.retrievedAt, nowValue, strategyClaimsPlannedAt));
+    if (!receipts.length) continue;
+    if (receipts.some(x => !x) || new Set(receipts.map(strategyClaimPatches.canonical)).size !== 1) {
+      addError('STRATEGY_CLAIMS_BINDING_INVALID', item.code); continue;
+    }
+    const receipt = receipts[0]; strategyClaimsReceipts.push(receipt);
+    const patches = (Array.isArray(raw.strategyClaimsPatches) ? raw.strategyClaimsPatches : []).filter(x => x?.code === item.code);
+    if (!patches.length) continue;
+    const admitted = patches.map(x => strategyClaimPatches.normalizePatch(x, task, config, raw.retrievedAt, nowValue,
+      strategyClaimsPlannedAt, receipt));
+    if (admitted.some(x => !x) || new Set(admitted.map(strategyClaimPatches.canonical)).size !== 1) {
+      addError('STRATEGY_CLAIMS_INCOMPLETE', item.code); continue;
+    }
+    strategyClaimsPatches.push(admitted[0]);
+  }
   const analysisOptions = { asOf: raw.asOf, barsByStock, now: nowValue,
     periodEnd: config.targetPeriodEnd, baselinePeriodEnd: config.baselinePeriodEnd };
   const groups = new Map();
@@ -442,7 +475,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
   const reportLocatorReceipts = [];
   const { normalizeLocatorReceipt, canonical } = require('../lib/report-locators');
   for (const code of requested) {
-    if (priceCodes.has(code)) continue;
+    if (priceCodes.has(code) || strategyCodes.has(code)) continue;
     const plans = configured.filter(item => item.code === code);
     if (plans.length !== 1 || !plans[0].reportLocator) continue;
     const observations = (groups.get(code) || []).filter(item => item.reportLocatorReceipt != null);
@@ -460,6 +493,14 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
   for (const code of requested) {
     if (priceCodes.has(code)) continue;
     const items = groups.get(code) || [];
+    if (strategyCodes.has(code)) {
+      if (!strategyClaimsReceipts.some(receipt => receipt.code === code) && items.length && items.every(item => item.collectionAttempt?.attempted === false
+        && item.collectionAttempt.status === 'deferred-budget' && item.collectionAttempt.errorCode === 'BATCH_DEADLINE_REACHED')) {
+        deferredFundCount++;
+        batchResults.push({ code, status: 'deferred-budget', attempted: false, errorCode: 'BATCH_DEADLINE_REACHED' });
+      }
+      continue;
+    }
     const old = cached.get(code);
     const rawReports = items.flatMap(item => Array.isArray(item.reports) ? item.reports : []);
     const reports = new Map();
@@ -602,7 +643,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
   const inceptionPatches = raw.funds.filter(item => item && failedCodes.has(item.code)).map(item =>
     require('../lib/historical-inception').inceptionPatch(item, config, nowValue, raw.retrievedAt)).filter(Boolean);
   // A receipt-only part is necessary to preserve explicitly unstarted products.
-  if (!freshFundCount && !deferredFundCount && !pricePatches.length && !inceptionPatches.length && !reportLocatorReceipts.length) throw new SafeBuildError('NO_VALID_FRESH_FUNDS');
+  if (!freshFundCount && !deferredFundCount && !pricePatches.length && !inceptionPatches.length && !reportLocatorReceipts.length && !strategyClaimsReceipts.length) throw new SafeBuildError('NO_VALID_FRESH_FUNDS');
   let retainedFundCount = 0;
   if (preserveOthers) {
     for (const [code, old] of cached) {
@@ -631,6 +672,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
   const uniqueErrors = [...new Map(errors.map(issue => [JSON.stringify(issue), issue])).values()];
   return {
     schemaVersion: 1, asOf: raw.asOf, retrievedAt: raw.retrievedAt, sourceMode: 'actions', pricePatches, inceptionPatches, reportLocatorReceipts,
+    strategyClaimsTasks, strategyClaimsPlannedAt, strategyClaimsReceipts, strategyClaimsPatches,
     targetPeriodEnd: config.targetPeriodEnd || null, baselinePeriodEnd: config.baselinePeriodEnd || null,
     coverage: {
       targetPeriodEnd: config.targetPeriodEnd || null, baselinePeriodEnd: config.baselinePeriodEnd || null,

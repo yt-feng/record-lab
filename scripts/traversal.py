@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
 from urllib.parse import urlparse, parse_qsl
 from lifecycle import normalize_lifecycle_evidence
 from report_managers import normalize_manager_table_coverage, manager_key
@@ -32,6 +33,9 @@ STRATEGY_SECTION_COVERAGE_VERSION = 1
 STRATEGY_MAX_ATTEMPTS = 3
 REPORT_LOCATOR_MAX_ATTEMPTS = 2
 REPORT_LOCATOR_MAX_DIGESTS = 16
+STRATEGY_CLAIMS_MAX_ATTEMPTS = 2
+STRATEGY_CLAIMS_MAX_DIGESTS = 16
+STRATEGY_CLAIMS_MAX_QUOTA = 20
 ERROR_CODES = {
     "BATCH_FAILED", "FUND_FAILED", "NO_VALID_REPORTS", "TARGET_REPORT_MISSING", "FUND_NOT_COLLECTED",
     "NO_VALID_FRESH_FUNDS", "NO_REPORTS", "NO_DATED_HOLDINGS", "EMPTY_HOLDINGS", "OLDER_REPORT",
@@ -302,6 +306,18 @@ def base_states(catalog, previous, phase, now, config=None):
         ledger, full = locator_history(prior.get("reportLocatorAttempts"), now)
         states[code]["reportLocatorAttempts"] = ledger
         states[code]["reportLocatorHistoryFull"] = full or prior.get("reportLocatorHistoryFull") is True
+        history, blocked = claims_history(prior.get('strategyClaimsAttempts'), code, phase, now)
+        states[code]['strategyClaimsAttempts'] = history
+        states[code]['strategyClaimsHistoryBlocked'] = blocked or prior.get('strategyClaimsHistoryBlocked') is True
+        states[code]['strategyClaimsTask'] = None
+        states[code]['strategyClaimsStatus'] = 'unavailable'
+        states[code]['strategyClaimsErrorCode'] = 'STRATEGY_CLAIMS_SOURCE_UNAVAILABLE'
+        states[code]['strategyClaimsRepresentativeCode'] = code
+        states[code]['strategyClaimsAttribution'] = 'unavailable'
+        states[code]['strategyClaimsGroupAttempts'] = 0
+        states[code]['strategyClaimsGroupDigestCount'] = 0
+        deferred = instant(prior.get('strategyClaimsLastDeferredAt'))
+        states[code]['strategyClaimsLastDeferredAt'] = prior['strategyClaimsLastDeferredAt'] if deferred and deferred <= now else None
         if status == "not-applicable":
             states[code]["notApplicableEvidence"] = clean_not_applicable(exemption, code, phase, now)
     apply_retry_policy(states, config, now)
@@ -362,6 +378,193 @@ def locator_receipt(value, locator, now):
         return None
     from report_locators import normalize_receipt
     return normalize_receipt(value, locator, now=now)
+
+
+def claims_quota(config):
+    value = config.get('strategyClaimsQuota', STRATEGY_CLAIMS_MAX_QUOTA)
+    if type(value) is not int or not 0 <= value <= STRATEGY_CLAIMS_MAX_QUOTA:
+        raise TraversalError('INVALID_CONFIG')
+    return value
+
+
+def claims_history(previous, code, phase, now):
+    """Corrupt/oversized history blocks new requests instead of resetting it."""
+    if previous is None:
+        return {}, False
+    if not isinstance(previous, dict):
+        return {}, True
+    if len(previous) > STRATEGY_CLAIMS_MAX_DIGESTS:
+        # Never trim an oversized old ledger and publish a shorter history.
+        raise TraversalError('INVALID_PROGRESS')
+    result, blocked = {}, False
+    for digest, entry in previous.items():
+        if (not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest)
+                or not isinstance(entry, dict) or not isinstance(entry.get('receipts'), list)
+                or not 1 <= len(entry['receipts']) <= STRATEGY_CLAIMS_MAX_ATTEMPTS):
+            blocked = True; continue
+        receipts, seen = [], set()
+        for receipt in entry['receipts']:
+            started = instant(receipt.get('attemptedAt')) if isinstance(receipt, dict) else None
+            from strategy_claim_patches import ERRORS, NO_REQUEST_ERRORS, RECEIPT_FIELDS
+            outcome, error = (receipt.get('outcome'), receipt.get('errorCode')) if isinstance(receipt, dict) else (None, None)
+            outcome_ok = isinstance(outcome, str) and (error is None or isinstance(error, str)) and (
+                          outcome in {'started', 'parsed'} and error is None
+                          or outcome == 'unknown' and error == 'STRATEGY_CLAIMS_INTERRUPTED'
+                          or outcome == 'failed' and error in ERRORS - NO_REQUEST_ERRORS)
+            if (not isinstance(receipt, dict) or set(receipt) != RECEIPT_FIELDS or type(receipt.get('schemaVersion')) is not int or receipt['schemaVersion'] != 1
+                    or receipt.get('code') != code or receipt.get('targetPeriodEnd') != phase['targetPeriodEnd']
+                    or receipt.get('taskDigest') != digest or not re.fullmatch(r'[a-f0-9]{64}', str(receipt.get('analysisDigest', '')))
+                    or not public_url(receipt.get('sourceUrl')) or not started or started > now + dt.timedelta(minutes=5)
+                    or not outcome_ok
+                    or started in seen):
+                blocked = True; continue
+            seen.add(started)
+            receipts.append({key: receipt.get(key) for key in ('schemaVersion', 'code', 'targetPeriodEnd', 'taskDigest',
+                'analysisDigest', 'sourceUrl', 'attemptedAt', 'outcome', 'errorCode')})
+        if receipts:
+            receipts.sort(key=lambda item: instant(item['attemptedAt']))
+            result[digest] = {'attempts': len(receipts), 'receipts': receipts, 'lastAttemptAt': receipts[-1]['attemptedAt']}
+            if type(entry.get('attempts')) is not int or entry['attempts'] != len(receipts): blocked = True
+    return result, blocked
+
+
+def claims_task(value, code, phase, now):
+    if not isinstance(value, dict): return None
+    from strategy_claim_patches import normalize_task
+    return normalize_task(value, code=code, period_end=phase['targetPeriodEnd'], now=now)
+
+
+def claims_receipt(value, task, planned_at, retrieved_at, now):
+    if not task or not isinstance(value, dict): return None
+    from strategy_claim_patches import normalize_receipt
+    return normalize_receipt(value, task, planned_at, retrieved_at, now=now)
+
+
+def claims_eligible(states, config, exclusions=()):
+    if not claims_quota(config): return []
+    excluded = set(exclusions)
+    return [code for code, state in states.items() if code not in excluded
+            and state['status'] in SUCCESS and state.get('strategyClaimsTask')
+            and state.get('strategyClaimsRepresentativeCode') == code
+            and state.get('strategyClaimsStatus') == 'pending'
+            and not state.get('strategyClaimsHistoryBlocked')]
+
+
+class ClaimsStateValidator:
+    """One bounded synchronous NDJSON child, opened only for existing v2 scans."""
+    FIELDS = ('periodEnd', 'strategySectionCoverage', 'strategyEvidenceRetrievedAt', 'strategyClaims',
+              'strategyClaimsIdentityEvidence', 'strategyClaimsDerivedFromObservedAt', 'strategyEvidencePool',
+              'strategyEvidenceBudget', 'strategyAnalysis', 'strategyExcerpts', 'narrative')
+    def __init__(self, now):
+        self.now, self.process = now, None
+    def scanned(self, fund, task):
+        report = fund.get('selectedReport') or {}
+        if not isinstance(report.get('strategyClaims'), dict) or report['strategyClaims'].get('method') != 'explicit-strategy-claims-v2':
+            return False
+        if not date(fund.get('asOf')):
+            return False
+        try:
+            value = {'code': task['code'], 'now': self.now.isoformat(), 'asOf': fund['asOf'],
+                     'report': {key: report[key] for key in self.FIELDS if key in report}}
+            encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
+            if len(encoded.encode('utf-8')) > 80000: return False
+            if self.process is None:
+                self.process = subprocess.Popen(['node', str(Path(__file__).with_name('strategy-claims-state.js'))],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding='utf-8')
+            self.process.stdin.write(encoded + '\n'); self.process.stdin.flush()
+            line = self.process.stdout.readline(1024)
+            result = json.loads(line)
+            return result == {'code': task['code'], 'analysisDigest': task['analysisDigest'], 'scanned': True}
+        except (OSError, ValueError, TypeError, BrokenPipeError):
+            return False
+    def close(self):
+        if self.process:
+            try: self.process.stdin.close()
+            except OSError: pass
+            try: self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired: self.process.kill(); self.process.wait()
+            self.process.stdout.close()
+
+
+def hydrate_claims(state, fund, phase, now, validator, *, representative=None):
+    from strategy_claim_patches import binding_for
+    task = binding_for(fund, phase, now=now, code=state['code'])
+    if not task: return
+    state['strategyClaimsTask'] = task
+    state['strategyClaimsRepresentativeCode'] = representative or state['code']
+    state['strategyClaimsAttribution'] = 'direct' if state['code'] == fund['code'] else 'quarter-report-identity'
+    if validator.scanned(fund, task):
+        state.update(strategyClaimsStatus='scanned', strategyClaimsErrorCode=None)
+        return
+    history = state['strategyClaimsAttempts']
+    exhausted = (state['strategyClaimsHistoryBlocked'] or task['taskDigest'] not in history and len(history) >= STRATEGY_CLAIMS_MAX_DIGESTS
+                 or history.get(task['taskDigest'], {}).get('attempts', 0) >= STRATEGY_CLAIMS_MAX_ATTEMPTS)
+    receipts = history.get(task['taskDigest'], {}).get('receipts', [])
+    state.update(strategyClaimsStatus='exhausted' if exhausted else 'pending',
+                 strategyClaimsErrorCode=receipts[-1]['errorCode'] if receipts else None)
+
+
+def hydrate_claim_group(states, fund, phase, now, validator):
+    from strategy_claim_patches import binding_for
+    from portfolio_identity import normalize_portfolio_identity
+    task = binding_for(fund, phase, now=now)
+    if not task: return
+    report = fund['selectedReport']
+    identity = normalize_portfolio_identity(report.get('strategyClaimsIdentityEvidence') or report.get('portfolioIdentityEvidence'),
+        {**task['source'], 'fundCode': fund['code']}, now=now)
+    codes = {fund['code']}
+    if identity:
+        codes.update(code for code in [identity['sourcePortfolioCode'], *identity['shareClassCodes']] if code in states)
+    available = {code for code in codes if states[code]['status'] in SUCCESS}
+    representative = (identity['sourcePortfolioCode'] if identity and identity['sourcePortfolioCode'] in available
+                      else fund['code'] if fund['code'] in available else min(available) if available else fund['code'])
+    for code in sorted(codes):
+        hydrate_claims(states[code], fund, phase, now, validator, representative=representative)
+    # A/C representative selection can change across runs. Count only actual
+    # receipts in this report-proven group, without manufacturing alias events
+    # or granting a fresh source budget just because its request code changed.
+    seen, source_versions = set(), set()
+    history_blocked = any(states[code]['strategyClaimsHistoryBlocked'] for code in codes)
+    for code in codes:
+        for entry in states[code]['strategyClaimsAttempts'].values():
+            for received in entry['receipts']:
+                source_versions.add(received['analysisDigest'])
+                if (received['analysisDigest'] == task['analysisDigest']
+                        and received['sourceUrl'] == task['source']['sourceUrl']):
+                    seen.add((received['code'], received['taskDigest'], instant(received['attemptedAt'])))
+    group_exhausted = (history_blocked or len(seen) >= STRATEGY_CLAIMS_MAX_ATTEMPTS
+                       or task['analysisDigest'] not in source_versions and len(source_versions) >= STRATEGY_CLAIMS_MAX_DIGESTS)
+    for code in codes:
+        state = states[code]
+        state['strategyClaimsGroupAttempts'] = len(seen)
+        state['strategyClaimsGroupDigestCount'] = len(source_versions)
+        if group_exhausted and state['strategyClaimsStatus'] == 'pending':
+            state['strategyClaimsStatus'] = 'exhausted'
+
+
+def claims_audit(states, config):
+    rows = [state for state in states.values() if state['status'] != 'not-applicable']
+    source, quality, prices = eligible_work(states, config)
+    return {'enabled': claims_quota(config) > 0, 'quotaPerQuarter': claims_quota(config),
+            'coverageUnit': 'fund-share-code', 'taskUnit': 'verified-report-representative-code',
+            'readyFunds': len(claims_eligible(states, config, set(source) | quality | prices)),
+            **{status + 'Funds': sum(row.get('strategyClaimsStatus') == status for row in rows)
+               for status in ('scanned', 'pending', 'unavailable', 'exhausted')},
+            'attempts': sum(item['attempts'] for state in rows for item in state['strategyClaimsAttempts'].values()),
+            'maxAttemptsPerDigest': STRATEGY_CLAIMS_MAX_ATTEMPTS, 'maxTrackedDigests': STRATEGY_CLAIMS_MAX_DIGESTS,
+            'semanticAnalysisComplete': False}
+
+
+def claims_status_row(item, phase, now, planned_at, retrieved_at, supplied=None, deferred=False):
+    task = claims_task(item.get('strategyClaimsOnly'), item['code'], phase, now)
+    receipt = claims_receipt(supplied, task, planned_at, retrieved_at, now)
+    error = (receipt.get('errorCode') or ('STRATEGY_CLAIMS_INTERRUPTED' if receipt['outcome'] == 'started' else None)) if receipt else (
+        'BATCH_DEADLINE_REACHED' if deferred and task else 'STRATEGY_CLAIMS_REQUEST_NOT_STARTED' if task else 'STRATEGY_CLAIMS_BINDING_INVALID')
+    return {'code': item['code'], 'companyCode': item.get('companyCode') or item.get('companyId'),
+            'status': 'deferred-budget' if deferred and not receipt and task else 'failed', 'errorCode': error,
+            'attempted': bool(receipt), 'strategyClaimsOnly': True, 'strategyClaimsTask': task,
+            'strategyClaimsReceipt': receipt, 'strategyClaimsAttempt': bool(receipt),
+            'qualityAttempt': False, 'managerAttempt': False, 'strategyAttempt': False, 'enrichmentAttempt': False}
 
 
 def locator_report_matches(evidence, locator, receipt):
@@ -876,7 +1079,16 @@ def merge_quality_observation(previous, observation):
 
 def hydrate_quality(states, retained, phase, now):
     """Recompute quality from the merger's effective observations on every pass."""
-    for fund in retained or []:
+    def observations():
+        validator = ClaimsStateValidator(now)
+        try:
+            for fund in retained or []:
+                if isinstance(fund, dict) and fund.get('code') in states:
+                    hydrate_claim_group(states, fund, phase, now, validator)
+                yield fund
+        finally:
+            validator.close()
+    for fund in observations():
         quality = report_quality(fund, phase, now)
         if quality is None:
             continue
@@ -1025,6 +1237,7 @@ def fair_lane(codes, states):
         visits[company] = visits.get(company, 0) + state["totalAttempts"]
         visits[company] += state["quality"]["totalAttempts"] + state["enrichment"]["totalAttempts"]
         visits[company] += sum(item["attempts"] for item in state.get("reportLocatorAttempts", {}).values())
+        visits[company] += sum(item['attempts'] for item in state.get('strategyClaimsAttempts', {}).values())
     queues = {}
     def order(code):
         state = states[code]
@@ -1033,8 +1246,12 @@ def fair_lane(codes, states):
         activity = [value for value in (instant(state.get("lastAttemptAt")), instant(state.get("lastDeferredAt"))) if value]
         locator_rows = state.get("reportLocatorAttempts", {}).values()
         activity.extend(value for item in locator_rows if (value := instant(item.get("lastAttemptAt"))))
+        activity.extend(value for item in state.get('strategyClaimsAttempts', {}).values() if (value := instant(item.get('lastAttemptAt'))))
+        if instant(state.get('strategyClaimsLastDeferredAt')):
+            activity.append(instant(state['strategyClaimsLastDeferredAt']))
         return (state["totalAttempts"] + state["quality"]["totalAttempts"] + state["enrichment"]["totalAttempts"]
-                + sum(item["attempts"] for item in state.get("reportLocatorAttempts", {}).values()),
+                + sum(item["attempts"] for item in state.get("reportLocatorAttempts", {}).values())
+                + sum(item['attempts'] for item in state.get('strategyClaimsAttempts', {}).values()),
                 max(activity).timestamp() if activity else float('-inf'), code)
     for code in sorted(codes, key=order):
         queues.setdefault(states[code]["companyCode"] or "~unmapped", deque()).append(code)
@@ -1130,7 +1347,8 @@ def completion_audit(states, config, now, directory_pending=False, universe=None
     source, quality, enrichment = eligible_work(states, config)
     locators = set(locator_eligible(states))
     prices = set(enrichment) - set(quality)
-    ready = set(source) | set(quality) | prices
+    claims_ready = set(claims_eligible(states, config, set(source) | set(quality) | set(enrichment)))
+    ready = set(source) | set(quality) | prices | claims_ready
     failed = [item for item in rows if item["status"] == "failed"]
     errors = {}
     for item in failed:
@@ -1164,6 +1382,7 @@ def completion_audit(states, config, now, directory_pending=False, universe=None
                 "recoverableErrorFunds": sum(count for code, count in errors.items() if code in RECOVERABLE_ERRORS),
                 "parserOrUnsupportedErrorFunds": sum(count for code, count in errors.items() if code in PARSER_ERRORS),
                 "otherErrorFunds": sum(count for code, count in errors.items() if code not in RECOVERABLE_ERRORS | PARSER_ERRORS)},
+            "strategyClaims": claims_audit(states, config),
             "research": {"enabled": quality_enabled(config), "applicableFunds": len(applicable),
                 "completeFunds": len(complete), "incompleteFunds": len(applicable) - len(complete),
                 "sixFieldsCompleteFunds": sum(item["status"] in SUCCESS and all(item["quality"]["fields"][key] in QUALITY_ACCEPTED for key in SIX_QUALITY_FIELDS) for item in applicable),
@@ -1177,6 +1396,7 @@ def completion_audit(states, config, now, directory_pending=False, universe=None
                 "reportRepairTasks": len(quality), "priceRepairTasks": len(prices),
                 "managerRepairTasks": sum(manager_only_repair(states[code]["quality"]) for code in quality),
                 "strategyRepairTasks": sum(strategy_only_repair(states[code]["quality"]) for code in quality),
+                "strategyClaimsTasks": len(claims_ready),
                 "scheduledTasks": len(scheduled - ready), "requiresReviewTasks": len(attention),
                 "requiresReviewSourceTasks": sum(item["status"] not in SUCCESS for item in attention),
                 "requiresReviewResearchTasks": sum(item["status"] in SUCCESS for item in attention)},
@@ -1218,13 +1438,23 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
             enrich_codes.discard(code)
             if states[code]['quality']['attempts'] < QUALITY_MAX_ATTEMPTS:
                 quality_codes.add(code)
+    claims_codes = set(claims_eligible(states, config, set(source_codes) | quality_codes | enrich_codes))
+    capacity = shards * batch_size
+    other_work = bool(source_codes or quality_codes or enrich_codes)
+    # At most a tenth of a populated campaign is reserved for rule scans. A
+    # single-slot first pass keeps its source slot; claims remain visible/ready.
+    allowance = min(claims_quota(config), max(0, capacity // 10) if other_work else capacity)
+    claims_selected = list(fair_lane(claims_codes, states))[:allowance]
     if quality_enabled(config):
-        selected = fair_research_selection(states, source_codes, quality_codes, enrich_codes, shards * batch_size, locator_codes)
+        selected = fair_research_selection(states, source_codes, quality_codes, enrich_codes, capacity - len(claims_selected), locator_codes)
     else:
         for pool in (quality_codes, enrich_codes, source_codes):
             queue = fair_lane([code for code in pool if code not in selected], states)
-            while queue and len(selected) < shards * batch_size:
+            while queue and len(selected) < capacity - len(claims_selected):
                 selected.append(queue.popleft())
+    # Put the small independent work first in a batch so report timeouts do not
+    # repeatedly defer it; the reserved count cannot crowd out the first pass.
+    selected = claims_selected + selected
     batches, matrix = {}, []
     for index, start in enumerate(range(0, len(selected), batch_size)):
         batch = {key: value for key, value in config.items() if key not in {"funds", "traversal", "reportLocatorCandidates",
@@ -1233,13 +1463,15 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
         batch["funds"] = [{**records[code], **({"priceTargets": states[code]["enrichment"]["missingStocks"]}
                           if code in enrich_codes and code not in quality_codes and states[code]["enrichment"]["missingStocks"] else {}),
                            **({'priceOnly': price_only[code]} if code in price_only and code not in quality_codes else {}),
-                           **({'reportLocator': states[code]['reportLocator']} if states[code].get('reportLocator') else {}),
+                           **({'strategyClaimsOnly': states[code]['strategyClaimsTask']} if code in claims_selected else {}),
+                           **({'reportLocator': states[code]['reportLocator']} if states[code].get('reportLocator') and code not in claims_selected else {}),
                            **({'reportLocatorOnly': True} if code in locator_codes else {})} for code in batch_codes]
         batch["traversal"] = {"phase": phase, "batchId": str(index), "plannedAt": current.isoformat(),
                               "enrichmentCodes": [code for code in batch_codes if code in enrich_codes and code not in quality_codes],
                               "qualityCodes": [code for code in batch_codes if code in quality_codes],
                               "managerCodes": [code for code in batch_codes if code in quality_codes and manager_only_repair(states[code]["quality"])],
                               "strategyCodes": [code for code in batch_codes if code in quality_codes and strategy_only_repair(states[code]["quality"])],
+                              "strategyClaimsCodes": [code for code in batch_codes if code in claims_selected],
                               "reportLocatorCodes": [code for code in batch_codes if code in locator_codes]}
         filename = f"batch-{index}.json"
         batches[filename] = batch
@@ -1252,6 +1484,7 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
                      "freshCount": sum(code in source_codes and states[code]["status"] == "pending" and code not in locator_codes for code in selected),
                      "retryCount": sum(code in source_codes and states[code]["status"] != "pending" and code not in locator_codes for code in selected),
                      "reportLocatorCount": sum(code in locator_codes for code in selected),
+                     "strategyClaimsCount": len(claims_selected), "strategyClaimsReadyCount": len(claims_codes),
                      "enrichmentCount": sum(code in enrich_codes and code not in quality_codes for code in selected),
                      "managerCount": sum(code in quality_codes and manager_only_repair(states[code]["quality"]) for code in selected),
                      "strategyCount": sum(code in quality_codes and strategy_only_repair(states[code]["quality"]) for code in selected),
@@ -1342,6 +1575,13 @@ def build_status(config, snapshot=None, now=None):
                         qualities.setdefault(code, quality)
     rows = []
     for code, item in wanted.items():
+        if 'strategyClaimsOnly' in item:
+            supplied = next((value for value in (snapshot.get('strategyClaimsReceipts', []) if snapshot_ok else [])
+                             if isinstance(value, dict) and value.get('code') == code), None)
+            rows.append(claims_status_row(item, phase, current, config.get('traversal', {}).get('plannedAt'),
+                snapshot.get('retrievedAt', current.isoformat()) if snapshot_ok else current.isoformat(), supplied,
+                deferred=valid_deferred(results.get(code, {}))))
+            continue
         if 'priceOnly' in item:
             patch = next((p for p in (snapshot.get('pricePatches', []) if snapshot_ok else [])
                           if isinstance(p, dict) and p.get('code') == code), None)
@@ -1448,6 +1688,10 @@ def valid_status(document, config, now=None):
     manager_codes = set(config.get("traversal", {}).get("managerCodes", []))
     strategy_codes = set(config.get("traversal", {}).get("strategyCodes", []))
     locator_codes = set(config.get("traversal", {}).get("reportLocatorCodes", []))
+    claims_codes = set(config.get('traversal', {}).get('strategyClaimsCodes', []))
+    if (claims_codes != {item['code'] for item in config['funds'] if 'strategyClaimsOnly' in item}
+            or claims_codes.intersection(enrich_codes | quality_codes | manager_codes | strategy_codes | locator_codes)):
+        return False
     if not manager_codes.issubset(quality_codes) or not strategy_codes.issubset(quality_codes):
         return False
     if (not locator_codes.issubset(wanted) or locator_codes.intersection(enrich_codes | quality_codes | manager_codes | strategy_codes)
@@ -1458,6 +1702,16 @@ def valid_status(document, config, now=None):
             return False
         seen.add(item["code"])
         planned_item = next(row for row in config['funds'] if row['code'] == item['code'])
+        if 'strategyClaimsOnly' in planned_item:
+            if any(key in planned_item for key in ('priceOnly', 'reportLocator', 'reportLocatorOnly')):
+                return False
+            expected = claims_status_row(planned_item, phase, current, config.get('traversal', {}).get('plannedAt'),
+                document['attemptedAt'], item.get('strategyClaimsReceipt'), deferred=valid_deferred(item))
+            if any(item.get(key) != value for key, value in expected.items()): return False
+            if any(key in item for key in ('reportEvidence', 'reportQuality', 'priceCoverage', 'notApplicableEvidence')): return False
+            continue
+        if item.get('strategyClaimsOnly') or item.get('strategyClaimsReceipt') or item.get('strategyClaimsAttempt'):
+            return False
         if planned_item.get('reportLocatorOnly') is True and 'priceOnly' in planned_item:
             return False
         if 'priceOnly' in planned_item:
@@ -1573,6 +1827,11 @@ def reconcile_observations(statuses, receipt, config, now=None):
                 continue
             row = dict(original)
             observation = observations.get(row.get("code"))
+            if row.get('strategyClaimsOnly') is True:
+                # Requests and original clocks survive rejected patches. Only
+                # strict hydration of the merger's retained report marks scans.
+                result['funds'].append(row)
+                continue
             if row.get('reportLocatorOnly') is True and row.get('reportLocatorAttempt') is not True:
                 # No started PDF request exists to reconcile. Missing merger
                 # output cannot turn a capacity deferral into an attempt.
@@ -1655,6 +1914,26 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
             if item.get("companyCode") != state["companyCode"]:
                 continue
             status = item.get("status")
+            if item.get('strategyClaimsOnly') is True:
+                task = claims_task(item.get('strategyClaimsTask'), item['code'], phase, current)
+                supplied = item.get('strategyClaimsReceipt')
+                receipt = claims_receipt(supplied, task,
+                    supplied.get('attemptedAt') if isinstance(supplied, dict) else None, document['attemptedAt'], current)
+                if (not task or any(item.get(key) is not False for key in ('qualityAttempt', 'managerAttempt', 'strategyAttempt', 'enrichmentAttempt'))
+                        or item.get('strategyClaimsAttempt') is not bool(receipt) or item.get('attempted') is not bool(receipt)):
+                    continue
+                if not receipt:
+                    if valid_deferred(item) and (not instant(state.get('strategyClaimsLastDeferredAt')) or attempted > instant(state['strategyClaimsLastDeferredAt'])):
+                        state['strategyClaimsLastDeferredAt'] = document['attemptedAt']
+                    continue
+                history, digest = state['strategyClaimsAttempts'], task['taskDigest']
+                prior = history.get(digest, {'attempts': 0, 'receipts': []})
+                if (any(instant(row['attemptedAt']) == instant(receipt['attemptedAt']) for row in prior['receipts'])
+                        or prior['attempts'] >= STRATEGY_CLAIMS_MAX_ATTEMPTS or state['strategyClaimsHistoryBlocked']
+                        or digest not in history and len(history) >= STRATEGY_CLAIMS_MAX_DIGESTS): continue
+                receipts = sorted([*prior['receipts'], receipt], key=lambda row: instant(row['attemptedAt']))
+                history[digest] = {'attempts': len(receipts), 'receipts': receipts, 'lastAttemptAt': receipts[-1]['attemptedAt']}
+                continue
             if item.get('priceOnly') is True:
                 if state['status'] not in SUCCESS or item.get('qualityAttempt') or item.get('managerAttempt') or item.get('strategyAttempt'):
                     continue
@@ -1900,7 +2179,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
     processed = sum(state["status"] in SUCCESS for state in all_states)
     failed = sum(state["status"] == "failed" for state in all_states)
     not_applicable = sum(state["status"] == "not-applicable" for state in all_states)
-    continuing = bool(eligible(states) or locator_eligible(states) or enrichment_eligible(states)
+    continuing = bool(eligible(states) or locator_eligible(states) or enrichment_eligible(states) or claims_eligible(states, config)
                       or quality_enabled(config) and quality_eligible(states))
     enrichment_states = [state["enrichment"] for state in all_states if state["status"] in SUCCESS and state["attribution"] != "portfolio-evidence" and state["representativeCode"] == state["code"]]
     research_complete = sum(state["status"] in SUCCESS and state["quality"]["status"] == "complete" for state in all_states)
@@ -1928,6 +2207,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                                "attempts": sum(item['attempts'] for state in all_states for item in state['reportLocatorAttempts'].values()),
                                "maxAttemptsPerDigest": REPORT_LOCATOR_MAX_ATTEMPTS,
                                "maxTrackedDigests": REPORT_LOCATOR_MAX_DIGESTS},
+            "strategyClaims": claims_audit(states, config),
             "unmappedFunds": sum(state["companyCode"] is None for state in all_states),
             "completionStatus": "complete" if completed else "incomplete-running" if continuing else "incomplete-exhausted",
             "completionAudit": audit, "quarterUniverse": universe,
@@ -1950,7 +2230,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
             "companies": company_rows,
             # Candidate metadata lives once in the frozen registry. Progress
             # retains only its independent attempt ledger, not per-share copies.
-            "funds": [{**{key: value for key, value in state.items() if key != 'reportLocator'},
+            "funds": [{**{key: value for key, value in state.items() if key not in {'reportLocator', 'strategyClaimsTask'}},
                        "enrichment": compact_enrichment(state["enrichment"])} for state in all_states],
             "directoryPasses": passes,
             "lastDirectoryObservedAt": directory_observed, "continueRun": continuing}

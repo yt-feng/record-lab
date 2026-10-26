@@ -37,10 +37,14 @@ def quarter_config(base, quarter, as_of):
     target, baseline = PERIODS[quarter]
     if dt.date.fromisoformat(as_of).isoformat() != as_of or as_of < target:
         raise ValueError('INVALID_AS_OF')
+    claims_quota = base.get('strategyClaimsQuota', 20)
+    if type(claims_quota) is not int or not 0 <= claims_quota <= 20:
+        raise ValueError('INVALID_STRATEGY_CLAIMS_QUOTA')
     return {**base, 'funds': [], 'quarter': quarter, 'asOf': as_of,
             'targetPeriodEnd': target, 'baselinePeriodEnd': baseline,
             'collectorVersion': 5, 'requireReportQuality': True, 'requireHistoricalUniverse': True,
             'reportLocatorEnabled': base.get('reportLocatorEnabled') is True,
+            'strategyClaimsQuota': claims_quota,
             'retryPolicy': {'dailyUntil': '2026-11-30' if quarter == '2026Q3' else None,
                             'intervalDays': 7, 'maxScheduledCycles': 4},
             'scope': f'{quarter} 全目录产品与报告逐项补齐'}
@@ -228,6 +232,7 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
     atomic_json('.cache/plan/meta.json', {'quarters': selected, 'asOf': as_of, 'hasWork': bool(matrix), 'directoryRefresh': directory_status})
     atomic_json('.cache/campaign/selection.json', {'quarters': selected, 'asOf': as_of, 'selection': quarter,
                 'directoryRefresh': directory_status, 'catalogLockVersion': 1, 'catalogs': catalogs,
+                'strategyClaimsQuotas': {name: configs[name]['strategyClaimsQuota'] for name in selected},
                 'reportLocators': locator_locks})
     scan_campaign_files()
     return {'batchCount': len(matrix), 'quarters': selected, 'directoryRefresh': directory_status}
@@ -348,10 +353,37 @@ def frozen_locators_for_publish(selection, matrix):
     return paths
 
 
+def frozen_claims_quotas_for_publish(selection, matrix):
+    quotas = selection.get('strategyClaimsQuotas')
+    if quotas is None:
+        if any('strategyClaimsOnly' in fund for item in matrix
+               for fund in read_json(Path('.cache/plan') / item['config']).get('funds', [])):
+            raise ValueError('INVALID_STRATEGY_CLAIMS_QUOTA')
+        return
+    if not isinstance(quotas, dict) or set(quotas) != set(selection.get('quarters', [])):
+        raise ValueError('INVALID_STRATEGY_CLAIMS_QUOTA')
+    counts = {quarter: 0 for quarter in quotas}
+    for quarter, quota in quotas.items():
+        if (type(quota) is not int or not 0 <= quota <= 20 or quarter not in PERIODS
+                or read_json(Path('.cache/campaign') / (quarter + '.json')).get('strategyClaimsQuota') != quota):
+            raise ValueError('INVALID_STRATEGY_CLAIMS_QUOTA')
+    for item in matrix:
+        quarter = item.get('quarter')
+        batch = read_json(Path('.cache/plan') / item['config'])
+        codes = [fund['code'] for fund in batch.get('funds', []) if 'strategyClaimsOnly' in fund]
+        if (quarter not in quotas or batch.get('strategyClaimsQuota') != quotas[quarter]
+                or batch.get('traversal', {}).get('strategyClaimsCodes', []) != codes):
+            raise ValueError('INVALID_STRATEGY_CLAIMS_QUOTA')
+        counts[quarter] += len(codes)
+    if any(counts[quarter] > quotas[quarter] for quarter in quotas):
+        raise ValueError('INVALID_STRATEGY_CLAIMS_QUOTA')
+
+
 def publish(data='web/data', parts='.cache/parts'):
     root, part_root = Path(data), Path(parts)
     selection = read_json('.cache/campaign/selection.json')
     matrix = read_json('.cache/plan/matrix.json')
+    frozen_claims_quotas_for_publish(selection, matrix)
     locator_paths = frozen_locators_for_publish(selection, matrix)
     catalogs = frozen_catalogs_for_publish(selection, matrix, root)
     from importlib.util import spec_from_file_location, module_from_spec
@@ -386,9 +418,10 @@ def publish(data='web/data', parts='.cache/parts'):
             'notApplicableFunds': progress.get('notApplicableFunds'), 'research': progress.get('research'),
             'continueRun': progress.get('continueRun'), 'nextRetryAt': progress.get('nextRetryAt'),
             'completionAudit': progress.get('completionAudit'),
+            'strategyClaims': progress.get('strategyClaims'),
         })
         summary = {'quarter': quarter, **{k: progress.get(k) for k in (
-            'totalFunds', 'processedFunds', 'failedFunds', 'pendingFunds', 'research', 'completionStatus', 'continueRun')}}
+            'totalFunds', 'processedFunds', 'failedFunds', 'pendingFunds', 'research', 'strategyClaims', 'completionStatus', 'continueRun')}}
         # The analyzer reads its own compact progress view. Do not retain the
         # whole per-product checkpoint in this parent process during analysis
         # or while merging the next quarter.

@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { checkpoint, diagnose } = require('../lib/merge-diagnostics');
+const { checkpoint, diagnose, capture } = require('../lib/merge-diagnostics');
 test('checkpoints preserve the single JSON stdout contract even inside Actions', () => {
   const before = process.env.GITHUB_ACTIONS, write = process.stdout.write;
   let emitted = false;
@@ -28,4 +28,16 @@ test('invalid phases and oversized stacks cannot inject public strings', () => {
   const error = new RangeError('hidden'); error.stack = 'hidden\n' + 'x'.repeat(9000) + '/merge-storage.js:1:2';
   const value = diagnose(error); assert.equal(value.phase, 'prices'); assert.equal(value.completed, 1000);
   assert.equal(value.errorClass, 'RANGE_ERROR'); assert.deepEqual(value.frames, []);
+});
+test('native-style code accessors stay allowlisted and captured failures keep their original phase', () => {
+  checkpoint('prices', 21);
+  const error = new Error('hidden');
+  Object.defineProperty(error, 'code', { get: () => 'ENOSPC' });
+  capture(error); checkpoint('done', 22);
+  assert.equal(diagnose(error).phase, 'prices'); assert.equal(diagnose(error).completed, 21);
+  assert.equal(diagnose(error).systemCode, 'ENOSPC');
+  for (const getter of [() => 'PRIVATE_CODE', () => { throw new Error('hidden'); }]) {
+    const invalid = new Error('hidden'); Object.defineProperty(invalid, 'code', { get: getter });
+    assert.equal(diagnose(invalid).systemCode, undefined);
+  }
 });

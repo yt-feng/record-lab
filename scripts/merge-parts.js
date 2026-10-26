@@ -9,7 +9,8 @@ const { buildSnapshot, catalogDetails, deduplicatePortfolios, publicUrl } = requ
 const { validDate } = require('../lib/fund-analysis');
 const { verifiedReportManagers, normalizeManagers, evidenceFor, managerKey, managerCoverageFor, completeManagerCoverage } = require('../lib/report-managers');
 const { strategySectionCoverageFor, strategyAnalysisFor } = require('../lib/strategy-sections');
-const { retainStrategyClaims } = require('../lib/strategy-claims');
+const { retainStrategyClaims, strategyClaimsFor } = require('../lib/strategy-claims');
+const strategyClaimPatches = require('../lib/strategy-claim-patches');
 const { VERSION: PRICE_COVERAGE_VERSION, calendar, validCompletePrice, validUsableCompletePrice, validUsableCompleteQuarterPrice, retainedCoverage } = require('../lib/price-coverage');
 const { normalizeConflict } = require('../lib/price-consistency');
 const { bindingFor, validPatch, canReplacePrice, key: priceKey } = require('../lib/price-patches');
@@ -381,6 +382,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
   const priceResults = [];
   for (const snapshot of snapshots) {
     for (const patch of snapshot?.pricePatches || []) if (CODE.test(patch?.code || '')) requestedCodes.add(patch.code);
+    for (const receipt of snapshot?.strategyClaimsReceipts || []) if (CODE.test(receipt?.code || '')) requestedCodes.add(receipt.code);
     for (const item of [...(snapshot?.batchResults || []), ...(snapshot?.funds || [])]) if (CODE.test(item?.code || '')) requestedCodes.add(item.code);
     if (!validEnvelope(snapshot, currentTime, config)) continue;
     const freshCodes = new Set(snapshot.funds.filter(item => item?.dataStatus === 'fresh').map(item => item.code));
@@ -491,21 +493,76 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
       priceResults.push({ code: patch.code, binding: patch.binding, accepted: true, errorCode: null });
     }
   }
+  let acceptedStrategyClaimsPatchCount = 0;
+  const strategyResults = [], strategyEvents = new Map();
+  for (const envelope of snapshots) {
+    if (!validEnvelope(envelope, currentTime, config)) continue;
+    for (const rawReceipt of Array.isArray(envelope.strategyClaimsReceipts) ? envelope.strategyClaimsReceipts : []) {
+      const tasks = (Array.isArray(envelope.strategyClaimsTasks) ? envelope.strategyClaimsTasks : []).filter(task => task?.code === rawReceipt?.code);
+      if (tasks.length !== 1 || !directoryMap.has(rawReceipt?.code)) continue;
+      const task = strategyClaimPatches.normalizeTask(tasks[0], config, rawReceipt.code, currentTime);
+      const receipt = task && strategyClaimPatches.normalizeReceipt(rawReceipt, task, config, envelope.retrievedAt, currentTime, envelope.strategyClaimsPlannedAt);
+      if (!receipt) continue;
+      const eventKey = strategyClaimPatches.canonical([receipt.code, receipt.taskDigest, receipt.attemptedAt]);
+      const patches = (Array.isArray(envelope.strategyClaimsPatches) ? envelope.strategyClaimsPatches : [])
+        .filter(item => item?.code === receipt.code).map(item => strategyClaimPatches.normalizePatch(item, task, config,
+          envelope.retrievedAt, currentTime, envelope.strategyClaimsPlannedAt, receipt)).filter(Boolean);
+      const prior = strategyEvents.get(eventKey);
+      if (prior) {
+        if (strategyClaimPatches.canonical([prior.task, prior.receipt]) !== strategyClaimPatches.canonical([task, receipt])) prior.conflict = true;
+        prior.patches.push(...patches);
+      } else strategyEvents.set(eventKey, { task, receipt, patches, conflict: false });
+    }
+  }
   const sourceFunds = [...byCode.values()];
   if (onSourceFunds) onSourceFunds(sourceFunds);
   const funds = deduplicatePortfolios(sourceFunds, addError);
+  // Patch the final representative so a valid alias request cannot disappear
+  // when its share class is subsequently collapsed into the same portfolio.
+  for (const event of strategyEvents.values()) {
+    const { task, receipt } = event;
+    const result = { ...receipt, accepted: false, scanned: false, mergeErrorCode: null };
+    strategyResults.push(result);
+    if (event.conflict) { result.mergeErrorCode = 'STRATEGY_CLAIMS_RECEIPT_CONFLICT'; continue; }
+    const exact = funds.find(fund => fund.code === task.code);
+    const possible = exact ? [exact] : funds.filter(fund =>
+      strategyClaimPatches.taskFor(fund, config, currentTime, { code: task.code, eligibleOnly: false }));
+    const fund = possible.length === 1 ? possible[0] : null;
+    const retained = fund && strategyClaimPatches.taskFor(fund, config, currentTime, { code: task.code, eligibleOnly: false });
+    if (!retained || strategyClaimPatches.canonical(retained) !== strategyClaimPatches.canonical(task)) {
+      result.mergeErrorCode = 'STRATEGY_CLAIMS_BINDING_CHANGED'; continue;
+    }
+    const existing = strategyClaimsFor(fund.selectedReport, { code: task.code, now: currentTime, asOf: fund.asOf });
+    result.scanned = existing?.source.digest === task.analysisDigest;
+    if (receipt.outcome !== 'parsed') continue;
+    const patches = [...new Map(event.patches.map(patch => [strategyClaimPatches.canonical(patch), patch])).values()];
+    if (patches.length !== 1) { result.mergeErrorCode = 'STRATEGY_CLAIMS_PATCH_REJECTED'; continue; }
+    const candidate = clone(fund);
+    const changed = retainStrategyClaims(candidate.selectedReport, patches[0].report, { code: task.code, now: currentTime, asOf: candidate.asOf });
+    if (!changed) { result.accepted = result.scanned; continue; }
+    candidate.narrative = clone(candidate.selectedReport.narrative);
+    const rebuilt = sanitizeFund(candidate, { now: currentTime, config,
+      envelope: { asOf: fund.asOf, retrievedAt: fund.retrievedAt, priceUpdatedAt: fund.priceUpdatedAt } });
+    const admitted = rebuilt && strategyClaimsFor(rebuilt.selectedReport, { code: task.code, now: currentTime, asOf: rebuilt.asOf });
+    if (!admitted || admitted.source.digest !== task.analysisDigest) {
+      result.mergeErrorCode = 'STRATEGY_CLAIMS_PATCH_REJECTED'; continue;
+    }
+    funds[funds.indexOf(fund)] = rebuilt; result.accepted = true; result.scanned = true;
+    acceptedStrategyClaimsPatchCount++;
+  }
   const { mutatedFunds: reusedFunds, ...reuseCounts } = reusePrices ? reuseCompletePrices(funds,
     { phase: config, now: currentTime, recoverPrice, sourceFunds }) : {
       mutatedFunds: [], reusedPriceRowCount: 0, reusedPriceFundCount: 0, eligiblePriceKeyCount: 0,
       conflictingPriceKeyCount: 0, partialConflictRowCount: 0, conflictMarkedRowCount: 0, conflictMarkedFundCount: 0, conflictingPriceRowCount: 0 };
   const receipt = mergeReceipt(funds, requestedCodes, config, currentTime, attempts);
   receipt.pricePatches = priceResults;
+  receipt.strategyClaims = strategyResults;
   // No new observation means no fabricated new timestamp or overwritten old files.
   const needsRepartition = Object.values(previousCompanies).some(item => item.funds?.length > (pageLimits?.maxFunds || MAX_COMPANY_FUNDS)
     || Buffer.byteLength(JSON.stringify(item)) + 1 > (pageLimits?.maxBytes || MAX_COMPANY_BYTES));
-  if (!acceptedFreshFundCount && !acceptedPricePatchCount && !acceptedInceptionPatchCount && !reusedFunds.length && !migratedBootstrapFundCount && !needsRepartition && previousManifest) {
+  if (!acceptedFreshFundCount && !acceptedPricePatchCount && !acceptedInceptionPatchCount && !acceptedStrategyClaimsPatchCount && !reusedFunds.length && !migratedBootstrapFundCount && !needsRepartition && previousManifest) {
     return { changed: false, manifest: previousManifest, companySnapshots: {},
-      receipt, counts: { acceptedFreshFundCount: 0, acceptedPricePatchCount: 0, acceptedInceptionPatchCount: 0, ...reuseCounts,
+      receipt, counts: { acceptedFreshFundCount: 0, acceptedPricePatchCount: 0, acceptedInceptionPatchCount: 0, acceptedStrategyClaimsPatchCount: 0, ...reuseCounts,
         errorCount: errors.length }, errors: [...new Set(errors)] };
   }
   const buckets = new Map();
@@ -562,7 +619,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
     targetPeriodEnd: config.targetPeriodEnd || null, baselinePeriodEnd: config.baselinePeriodEnd || null,
     coverage, companyCoverage, companyFiles, funds: [], errors: [] };
   return { changed: true, manifest, companySnapshots, receipt,
-    counts: { acceptedFreshFundCount, acceptedPricePatchCount, acceptedInceptionPatchCount, ...reuseCounts, migratedBootstrapFundCount, companyCount: buckets.size,
+    counts: { acceptedFreshFundCount, acceptedPricePatchCount, acceptedInceptionPatchCount, acceptedStrategyClaimsPatchCount, ...reuseCounts, migratedBootstrapFundCount, companyCount: buckets.size,
       fundCount: funds.length, errorCount: errors.length },
     errors: [...new Set(errors)] };
 }

@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
-const { checkpoint: mergeCheckpoint } = require('../lib/merge-diagnostics');
+const { checkpoint: mergeCheckpoint, capture: captureMergeFailure } = require('../lib/merge-diagnostics');
 const { createPriceIndex, addPriceSources, applyPriceIndex } = require('../lib/reuse-prices');
 const CODE = /^\d{6}$/;
 const COMPANY_FILE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -84,17 +84,19 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
   const ingest = (envelope, kind) => {
     // Rejected envelopes still identify which requested codes need the final
     // retained observation receipt, exactly as the validating engine does.
-    if (kind === 'snapshot') for (const key of ['funds', 'batchResults', 'pricePatches']) {
+    if (kind === 'snapshot') for (const key of ['funds', 'batchResults', 'pricePatches', 'strategyClaimsReceipts', 'strategyClaimsPatches']) {
       for (const item of Array.isArray(envelope?.[key]) ? envelope[key] : []) if (CODE.test(item?.code || '')) requested.add(item.code);
     }
     if (!validEnvelope(envelope, current, config)) { addError(kind === 'snapshot' ? 'INVALID_PART' : 'INVALID_COMPANY_SNAPSHOT'); return; }
     const sequence = inputSequence++;
     const meta = { schemaVersion: envelope.schemaVersion, sourceMode: envelope.sourceMode, asOf: envelope.asOf,
       retrievedAt: envelope.retrievedAt, priceUpdatedAt: envelope.priceUpdatedAt,
+      strategyClaimsPlannedAt: envelope.strategyClaimsPlannedAt,
       targetPeriodEnd: envelope.targetPeriodEnd, baselinePeriodEnd: envelope.baselinePeriodEnd };
     const records = new Map();
     const forCode = code => {
-      if (!records.has(code)) records.set(code, { kind, sequence, envelope: { ...meta, funds: [], batchResults: [], pricePatches: [], inceptionPatches: [] } });
+      if (!records.has(code)) records.set(code, { kind, sequence, envelope: { ...meta, funds: [], batchResults: [], pricePatches: [], inceptionPatches: [],
+        strategyClaimsTasks: [], strategyClaimsReceipts: [], strategyClaimsPatches: [] } });
       return records.get(code).envelope;
     };
     for (const fund of envelope.funds) {
@@ -102,17 +104,17 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
       forCode(fund.code).funds.push(fund); recordLinks(fund);
       if (kind === 'snapshot') requested.add(fund.code);
     }
-    if (kind === 'snapshot') for (const key of ['batchResults', 'pricePatches', 'inceptionPatches']) {
+    if (kind === 'snapshot') for (const key of ['batchResults', 'pricePatches', 'inceptionPatches', 'strategyClaimsTasks', 'strategyClaimsReceipts', 'strategyClaimsPatches']) {
       for (const item of Array.isArray(envelope[key]) ? envelope[key] : []) {
         if (!item || !CODE.test(item.code)) continue;
         forCode(item.code)[key].push(item);
-        if (key !== 'inceptionPatches') requested.add(item.code);
+        if (!['inceptionPatches', 'strategyClaimsTasks'].includes(key)) requested.add(item.code);
       }
     }
     for (const [code, record] of records) append(code, record);
   };
   const newFiles = [];
-  let committed = false;
+  let committed = false, primaryFailure = null;
   try {
     mergeCheckpoint('inputs', 0);
     const references = Array.isArray(previousManifest?.companyFiles)
@@ -145,8 +147,8 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
     }
     const priceIndex = createPriceIndex(config, current);
     const funds = [], receipt = { schemaVersion: 1, phase: { targetPeriodEnd: config.targetPeriodEnd, baselinePeriodEnd: config.baselinePeriodEnd },
-      generatedAt: current.toISOString(), requestedCodes: [...requested].sort(), funds: [], pricePatches: [] };
-    const counts = { acceptedFreshFundCount: 0, acceptedPricePatchCount: 0, acceptedInceptionPatchCount: 0,
+      generatedAt: current.toISOString(), requestedCodes: [...requested].sort(), funds: [], pricePatches: [], strategyClaims: [] };
+    const counts = { acceptedFreshFundCount: 0, acceptedPricePatchCount: 0, acceptedInceptionPatchCount: 0, acceptedStrategyClaimsPatchCount: 0,
       migratedBootstrapFundCount: 0, reusedPriceRowCount: 0, reusedPriceFundCount: 0, partialConflictRowCount: 0,
       conflictMarkedRowCount: 0, conflictMarkedFundCount: 0, conflictingPriceRowCount: 0 };
     let completedComponents = 0;
@@ -176,15 +178,19 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
       const result = engine({ snapshots, previousCompanies, previousManifest: bootstrap, catalog: componentCatalog, config, now: current,
         receiptCodes: group.codes.filter(code => requested.has(code)), pageLimits, reusePrices: false,
         onSourceFunds: values => addPriceSources(priceIndex, values) });
-      for (const key of ['acceptedFreshFundCount', 'acceptedPricePatchCount', 'acceptedInceptionPatchCount', 'migratedBootstrapFundCount']) counts[key] += result.counts[key] || 0;
+      for (const key of ['acceptedFreshFundCount', 'acceptedPricePatchCount', 'acceptedInceptionPatchCount', 'acceptedStrategyClaimsPatchCount', 'migratedBootstrapFundCount']) counts[key] += result.counts[key] || 0;
       errorCount += result.counts.errorCount || 0;
       result.errors.forEach(code => errors.add(code));
       receipt.funds.push(...result.receipt.funds); receipt.pricePatches.push(...result.receipt.pricePatches);
+      receipt.strategyClaims.push(...result.receipt.strategyClaims);
       for (const envelope of Object.values(result.companySnapshots)) for (const fund of envelope.funds) {
         const filename = path.join(normalizedRoot, fund.code + '.json');
         fs.writeFileSync(filename, JSON.stringify(fund));
         funds.push({ code: fund.code, companyId: fund.companyId, file: filename });
       }
+      // A component has been fully validated and staged. Its private input
+      // spool is no longer needed; original inputs and published pages remain.
+      for (const code of group.codes) fs.rmSync(path.join(inputRoot, code + '.jsonl'), { force: true });
     }
     // Global index is sealed only after all independent source components were
     // examined; a late conflicting source blocks reuse in every component.
@@ -209,6 +215,9 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
     for (const entry of funds.sort((a, b) => a.companyId.localeCompare(b.companyId) || a.code.localeCompare(b.code))) {
       mergeCheckpoint('prices', completedPriceFunds++);
       const fund = readJson(entry.file);
+      // The bounded page below owns this parsed fund until it is staged.
+      // Release only its private normalized copy before writing output pages.
+      fs.unlinkSync(entry.file);
       const applied = applyPriceIndex(priceIndex, [fund], recoverPrice);
       for (const key of ['reusedPriceRowCount', 'reusedPriceFundCount', 'partialConflictRowCount', 'conflictMarkedRowCount', 'conflictMarkedFundCount', 'conflictingPriceRowCount']) counts[key] += applied[key];
       counts.eligiblePriceKeyCount = applied.eligiblePriceKeyCount; counts.conflictingPriceKeyCount = applied.conflictingPriceKeyCount;
@@ -270,7 +279,7 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
       else if (observations.has(old.code) && old.attempted === true) observations.get(old.code).attempted = true;
     }
     receipt.funds = [...observations.values()].sort((a, b) => a.code.localeCompare(b.code));
-    const changed = Boolean(!previousManifest || needsRepartition || ['acceptedFreshFundCount', 'acceptedPricePatchCount', 'acceptedInceptionPatchCount', 'migratedBootstrapFundCount', 'reusedPriceFundCount', 'conflictMarkedFundCount'].some(key => counts[key]));
+    const changed = Boolean(!previousManifest || needsRepartition || ['acceptedFreshFundCount', 'acceptedPricePatchCount', 'acceptedInceptionPatchCount', 'acceptedStrategyClaimsPatchCount', 'migratedBootstrapFundCount', 'reusedPriceFundCount', 'conflictMarkedFundCount'].some(key => counts[key]));
     counts.errorCount = errorCount;
     if (changed) Object.assign(counts, { companyCount: companies.size, fundCount: funds.length });
     else delete counts.migratedBootstrapFundCount;
@@ -304,9 +313,16 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
     }
     mergeCheckpoint('done', funds.length);
     return { changed, manifest: changed ? manifest : previousManifest, receipt, counts, errors: [...errors] };
+  } catch (error) {
+    // Keep the failure-time free-space reading, before cleanup releases the
+    // private spool. Post-cleanup space cannot diagnose a full scratch disk.
+    captureMergeFailure(error);
+    primaryFailure = error;
+    throw error;
   } finally {
     if (!committed) for (const file of newFiles) { try { fs.unlinkSync(file); } catch { /* Preserve the original manifest on failure. */ } }
-    fs.rmSync(workspace, { recursive: true, force: true });
+    try { fs.rmSync(workspace, { recursive: true, force: true }); }
+    catch (cleanupError) { if (!primaryFailure) throw cleanupError; }
   }
 }
 

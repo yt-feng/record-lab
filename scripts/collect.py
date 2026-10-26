@@ -408,23 +408,31 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
 
 def collect(config, as_of, checkpoint=None):
     items = config["funds"]
+    strategy_items = [item for item in items if 'strategyClaimsOnly' in item]
+    if strategy_items:
+        from collect_strategy_claims import collect as collect_strategy_claims, validate_items
+        validate_items(config)
+        if len(strategy_items) == len(items):
+            return collect_strategy_claims(config, as_of, checkpoint, provider_factory=PublicProvider)
     price_items = [item for item in items if 'priceOnly' in item]
     if price_items and len(price_items) == len(items):
         from collect_prices import collect as collect_prices
         return collect_prices(config, as_of, checkpoint, provider_factory=PublicProvider)
     from collect_prices import plans_for, bounded
     price_patches = plans_for(price_items, config) if price_items else []
-    source_items = [item for item in items if 'priceOnly' not in item]
+    source_items = [item for item in items if 'priceOnly' not in item and 'strategyClaimsOnly' not in item]
     patch_lock = threading.RLock()
     workers = int(bounded(config.get("maxWorkers", 2), 2, 2, 1))
     funds, errors = [], []
     locator_started = {}
+    strategy_receipts, strategy_patches, strategy_deferred = {}, {}, {}
     bars, requested_prices = {}, {}
     price_attempted = 0
     deadline = time.monotonic() + bounded(config.get("maxBatchSeconds", 1500), 1500, 1800)
     def snapshot_payload(stage):
         completed_codes = {fund['code'] for fund in funds}
-        observed_funds = [*funds, *(fund for code, fund in locator_started.items() if code not in completed_codes)]
+        observed_funds = [*funds, *(fund for code, fund in locator_started.items() if code not in completed_codes),
+                          *strategy_deferred.values()]
         comparable = sum(len(f["reports"]) >= 2 for f in funds)
         no_equities = sum(bool(f.get("noEquitiesEvidence", {}).get("confirmed")) for f in funds)
         prices_complete = sum(value.get("coverage", {}).get("completeness") == "complete" for value in bars.values())
@@ -432,6 +440,8 @@ def collect(config, as_of, checkpoint=None):
         payload = {"asOf": as_of, "targetPeriodEnd": config.get("targetPeriodEnd"), "baselinePeriodEnd": config.get("baselinePeriodEnd"),
                    "retrievedAt": dt.datetime.now(dt.timezone.utc).isoformat(), "funds": observed_funds, "barsByStock": bars, "errors": errors,
                    "pricePatches": price_patches,
+                   "strategyClaimsReceipts": list(strategy_receipts.values()),
+                   "strategyClaimsPatches": list(strategy_patches.values()),
                    "coverage": {"requested": len(items), "completedFundRequests": len(funds),
                                 "attemptedFundRequests": sum(f.get("collectionAttempt", {}).get("attempted") is not False for f in observed_funds),
                                 "deferredFundRequests": sum(f.get("collectionAttempt", {}).get("attempted") is False for f in funds),
@@ -440,6 +450,8 @@ def collect(config, as_of, checkpoint=None):
                                 "noEquities": no_equities, "priceSymbolsRequested": len(requested_prices),
                                 "priceSymbolsAttempted": price_attempted, "priceSymbolsFetched": len(bars),
                                 "priceSymbolsComplete": prices_complete,
+                                "strategyClaimsRequested": len(strategy_items), "strategyClaimsAttempted": len(strategy_receipts),
+                                "strategyClaimsParsed": len(strategy_patches),
                                 "collectionStage": stage, "status": "complete" if complete else "partial"}}
         if checkpoint:
             checkpoint(payload)
@@ -453,7 +465,20 @@ def collect(config, as_of, checkpoint=None):
                      'collectionAttempt', 'reportLocatorReceipt') if key in fund}
             locator_started[fund['code']] = json.loads(json.dumps({**value, 'reports': []}))
             snapshot('funds')
+    def strategy_checkpoint(code, receipt, patch, error):
+        with patch_lock:
+            if receipt is not None: strategy_receipts[code] = receipt
+            if patch is not None: strategy_patches[code] = patch
+            if error == 'STRATEGY_CLAIMS_BUDGET_REACHED' and receipt is None:
+                strategy_deferred[code] = {'code': code, 'reports': [], 'collectionAttempt': {'attempted': False,
+                    'status': 'deferred-budget', 'errorCode': 'BATCH_DEADLINE_REACHED'}}
+            if error: errors.append({'code': code, 'stage': 'strategy-claims', 'errorCode': error})
+            snapshot('strategy-claims')
     snapshot("funds")
+    if strategy_items:
+        from collect_strategy_claims import execute as execute_strategy_claims
+        strategy_deadline = min(deadline, time.monotonic() + bounded(config.get('maxStrategyClaimsSeconds', 300), 300, 600))
+        execute_strategy_claims(strategy_items, config, strategy_deadline, workers, strategy_checkpoint, PublicProvider)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(collect_fund, x, as_of, config.get("historyYears", 2), config.get("maxReportsPerFund", 4),
                                target_period=config.get("targetPeriodEnd"), baseline_period=config.get("baselinePeriodEnd"), deadline=deadline,

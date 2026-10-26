@@ -1,0 +1,68 @@
+name: Verify independent strategy backfill
+on:
+  workflow_dispatch:
+    inputs:
+      data_commit:
+        description: Exact immutable data commit to read
+        required: true
+        default: '63ab7e38ce388f246d80588146081991a88ff623'
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: verify-strategy-backfill
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check immutable data input
+        env:
+          DATA_COMMIT: ${{ inputs.data_commit }}
+        run: python -c 'import os,re; assert re.fullmatch("[a-f0-9]{40}", os.environ["DATA_COMMIT"])'
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /requirements.txt
+            /scripts/
+            /lib/
+            /web/*.js
+            /config/
+            /tests/*.py
+            /.github/workflows/verify-strategy-backfill.yml
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.data_commit }}
+          path: .cache/strategy-verification-data
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /web/data/periods/2026Q2/latest.json
+            /web/data/periods/2026Q3/latest.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Validate synthetic collector and backfill checks
+        run: |
+          python -m unittest discover -s tests -p 'test_collect_strategy_claims.py'
+          python -m unittest discover -s tests -p 'test_verify_strategy_backfill.py'
+      - name: Verify at most two original PDF requests without production writes
+        env:
+          DATA_COMMIT: ${{ inputs.data_commit }}
+        run: python scripts/verify_strategy_backfill.py --data-repo .cache/strategy-verification-data --data-commit "$DATA_COMMIT"
+      - name: Retain compact source and preservation checks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strategy-backfill-verification
+          path: .cache/strategy-backfill-verification/result.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7

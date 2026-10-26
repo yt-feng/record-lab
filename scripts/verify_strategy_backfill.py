@@ -1,0 +1,307 @@
+"""Actions-only, two-request backfill verification against immutable old data.
+
+Only compact checks are persisted. Original data, PDFs, extracted text, and
+the candidate patch remain read-only or in memory; no production write occurs.
+"""
+from __future__ import annotations
+import argparse
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import time
+from unittest.mock import patch
+
+from collect_strategy_claims import collect
+from providers import PublicProvider
+from publication_guard import inspect_content
+from source_dates import china_today
+from strategy_claim_patches import ERRORS as PATCH_ERRORS, binding_for
+from strategy_claims import _instant
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUT = ROOT / '.cache/strategy-backfill-verification/result.json'
+PERIODS = {'2026Q2': ('2026-06-30', '2026-03-31'), '2026Q3': ('2026-09-30', '2026-06-30')}
+MAX_PARTS = 12
+MAX_READ_BYTES = 96_000_000
+MAX_PART_BYTES = 8_000_000
+MAX_OUTPUT_BYTES = 32_000
+MAX_BRIDGE_BYTES = 9_000_000
+ERRORS = PATCH_ERRORS | {'ACTIONS_REQUIRED', 'INVALID_DATA_COMMIT', 'DATA_READ_FAILED', 'DATA_READ_BOUND',
+    'INVALID_DATA_MANIFEST', 'SAMPLE_NOT_FOUND_WITHIN_BOUND', 'BRIDGE_FAILED', 'VERIFICATION_FAILED',
+    'PUBLICATION_REJECTED', 'UNSUPPORTED_OUTPUT', 'DATA_CHANGED'}
+CHECKS = ('freshFundCountZero', 'singleReceipt', 'patchAdmitted', 'mergeAccepted', 'positionsUnchanged',
+          'navUnchanged', 'managersUnchanged', 'oldTimesUnchanged', 'reportSourcesUnchanged',
+          'newOwnClock', 'derivedOriginalClock', 'sameAnalysisDigest', 'sameSectionProof',
+          'completeFiniteScan', 'semanticLimited', 'onePortfolio', 'nonStrategyFieldsUnchanged')
+
+NODE_BRIDGE = r"""const fs=require('node:fs'),crypto=require('node:crypto');
+try {
+ const x=JSON.parse(fs.readFileSync(0,'utf8')), p=require('./lib/strategy-claim-patches');
+ if(x.mode==='select') {
+  let index=-1;
+  for(let i=0;i<x.funds.length;i++) {
+   const f=x.funds[i]; if(!['ok','no-equities'].includes(f.status)) continue;
+   if(p.taskFor(f,x.phase,x.now)) {index=i;break;}
+  }
+  process.stdout.write(JSON.stringify({index}));
+ } else {
+  const {buildSnapshot}=require('./scripts/build-data'),{mergeSnapshots}=require('./scripts/merge-parts');
+  const {strategyClaimsFor}=require('./lib/strategy-claims');
+  const canonical=p.canonical, same=(a,b)=>canonical(a)===canonical(b), clone=v=>JSON.parse(JSON.stringify(v));
+  const own=(o,keys)=>Object.fromEntries(keys.filter(k=>Object.hasOwn(o||{},k)).map(k=>[k,o[k]]));
+  const reports=f=>[f.selectedReport,f.previousReport,...(f.reports||[])].filter(Boolean);
+  const positions=f=>({rows:f.rows,reports:reports(f).map(r=>own(r,['periodEnd','sourceUrl','holdings']))});
+  const matched=(o,re)=>Object.fromEntries(Object.entries(o||{}).filter(([k])=>re.test(k)));
+  const nav=f=>({fund:matched(f,/nav|assets|scale/i),reports:reports(f).map(r=>matched(r,/nav|assets|scale/i))});
+  const managers=f=>({fund:matched(f,/manager/i),reports:reports(f).map(r=>matched(r,/manager/i))});
+  const sources=f=>reports(f).map(r=>own(r,['sourceUrl','publishedAt','periodEnd','kind','holdingsSourceUrl','reportPdfSourceUrl','portfolioIdentityEvidence']));
+  const mutable=new Set(['strategyClaims','strategyClaimsIdentityEvidence','strategyClaimsDerivedFromObservedAt',
+    'strategyEvidencePool','strategyEvidenceBudget','strategyClaimsStatus','strategyAnalysis','strategyThemes','strategyExcerpts','narrative']);
+  const protectedFields=value=>Array.isArray(value)?value.map(protectedFields):value&&typeof value==='object'?
+   Object.fromEntries(Object.entries(value).filter(([k])=>!mutable.has(k)).map(([k,v])=>[k,protectedFields(v)])):value;
+  function clocks(value,path='',out={}) {
+   if(Array.isArray(value)) value.forEach((v,i)=>clocks(v,path+'/'+i,out));
+   else if(value&&typeof value==='object') for(const [k,v] of Object.entries(value)) {
+    if(mutable.has(k))continue;
+    if((/(?:At|AsOf)$/.test(k)||k==='asOf')&&(v===null||typeof v==='string'))out[path+'/'+k]=v;
+    else clocks(v,path+'/'+k,out);
+   }
+   return out;
+  }
+  const before=clone(x.fund),company=before.companyId;
+  const catalog={fundCount:1,companyCount:1,companies:[{code:company,name:before.company,fundCount:1}],
+    funds:[{code:before.code,companyCode:company,companyName:before.company}]};
+  const part=buildSnapshot(x.raw,{config:x.config,now:x.now});
+  const previous={...x.envelope,funds:[clone(before)]};
+  const result=mergeSnapshots({snapshots:[part],previousCompanies:{sample:previous},previousManifest:x.manifest,
+    config:x.config,catalog,now:x.now,reusePrices:false});
+  const output=Object.values(result.companySnapshots).flatMap(s=>s.funds);
+  const after=result.changed?output.find(f=>f.code===before.code):before;
+  const a=after?.selectedReport,c=a&&strategyClaimsFor(a,{code:before.code,now:x.now,asOf:after.asOf});
+  const old=x.config.funds[0].strategyClaimsOnly.retainedStrategyObservedAt;
+  const receipt=part.strategyClaimsReceipts[0],r=result.receipt.strategyClaims.find(r=>r.code===before.code);
+  const parsed=p.instant(c?.source?.retrievedAt),attempted=p.instant(receipt?.attemptedAt),received=p.instant(x.raw.retrievedAt);
+  const checks={freshFundCountZero:part.coverage.batchFreshFundCount===0&&result.counts.acceptedFreshFundCount===0,
+   singleReceipt:part.strategyClaimsReceipts.length===1,patchAdmitted:part.strategyClaimsPatches.length===1,
+   mergeAccepted:r?.accepted===true&&r.scanned===true,
+   positionsUnchanged:!!after&&same(positions(before),positions(after)),navUnchanged:!!after&&same(nav(before),nav(after)),
+   managersUnchanged:!!after&&same(managers(before),managers(after)),oldTimesUnchanged:!!after&&same(clocks(before),clocks(after)),
+   reportSourcesUnchanged:!!after&&same(sources(before),sources(after)),
+   newOwnClock:!!c&&parsed!==null&&attempted!==null&&received!==null&&parsed>=attempted&&parsed<=received&&parsed>=p.instant(old)
+    &&c.source.retrievedAt===a.strategyEvidencePool?.source.retrievedAt&&c.source.retrievedAt===a.strategyClaimsIdentityEvidence?.retrievedAt,
+   derivedOriginalClock:a?.strategyEvidenceRetrievedAt===old&&a.strategyClaimsDerivedFromObservedAt===old,
+   sameAnalysisDigest:c?.source.digest===x.config.funds[0].strategyClaimsOnly.analysisDigest,
+   sameSectionProof:!!a&&same(before.selectedReport.strategySectionCoverage,a.strategySectionCoverage),
+   completeFiniteScan:c?.ruleScanComplete===true,semanticLimited:c?.semanticAnalysisComplete===false,
+   onePortfolio:!result.changed||output.length===1,
+   nonStrategyFieldsUnchanged:!!after&&same(protectedFields(before),protectedFields(after))};
+  process.stdout.write(JSON.stringify({checks,claimCount:c?.claims.length??0,evidenceCount:c?.evidence.length??0,
+   scannedClauseCount:c?.coverage.scannedClauseCount??0,classifiedClauseCount:c?.coverage.classifiedClauseCount??0,
+   unknownClauseCount:c?.coverage.unknownClauseCount??0,
+   quoteChars:a?.strategyEvidencePool?.usedQuoteChars??0,newStrategyObservedAt:c?.source.retrievedAt??null,
+   protectedBeforeHash:crypto.createHash('sha256').update(canonical(protectedFields(before))).digest('hex'),
+   protectedAfterHash:after?crypto.createHash('sha256').update(canonical(protectedFields(after))).digest('hex'):null}));
+ }
+}catch(_){process.stdout.write('{}');process.exitCode=1;}
+"""
+
+
+class VerificationError(ValueError):
+    def __init__(self, code):
+        self.code = code if code in ERRORS else 'VERIFICATION_FAILED'
+        super().__init__(self.code)
+
+
+def bridge(value):
+    encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
+    if len(encoded.encode()) > MAX_BRIDGE_BYTES: raise VerificationError('BRIDGE_FAILED')
+    try:
+        result = subprocess.run(['node', '-e', NODE_BRIDGE], input=encoded, text=True, cwd=ROOT,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=45)
+        if result.returncode or len(result.stdout.encode()) > 6000: raise VerificationError('BRIDGE_FAILED')
+        return json.loads(result.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        raise VerificationError('BRIDGE_FAILED') from None
+
+
+class GitDataReader:
+    """Only regular, size-bounded blobs under this exact immutable data commit."""
+    def __init__(self, root, commit):
+        if not re.fullmatch(r'[a-f0-9]{40}', commit or ''): raise VerificationError('INVALID_DATA_COMMIT')
+        self.root, self.commit, self.bytes_read, self.last_blob = Path(root), commit, 0, None
+        if self.command('rev-parse', 'HEAD').decode().strip() != commit:
+            raise VerificationError('INVALID_DATA_COMMIT')
+        if self.command('status', '--porcelain', '--untracked-files=no'):
+            raise VerificationError('DATA_CHANGED')
+    def command(self, *args):
+        try:
+            return subprocess.run(['git', '-C', str(self.root), *args], stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, timeout=45, check=True).stdout
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            raise VerificationError('DATA_READ_FAILED') from None
+    def read(self, path, maximum=MAX_PART_BYTES):
+        if not re.fullmatch(r'web/data/periods/2026Q[23]/(?:latest|companies/[A-Za-z0-9_-]{1,64})\.json', path):
+            raise VerificationError('DATA_READ_FAILED')
+        line = self.command('ls-tree', self.commit, '--', path).decode().strip()
+        match = re.fullmatch(r'100644 blob ([a-f0-9]{40})\t' + re.escape(path), line)
+        if not match: raise VerificationError('DATA_READ_FAILED')
+        oid = match.group(1)
+        size = int(self.command('cat-file', '-s', oid).strip())
+        if size > maximum or self.bytes_read + size > MAX_READ_BYTES: raise VerificationError('DATA_READ_BOUND')
+        raw = self.command('cat-file', 'blob', oid)
+        if len(raw) != size: raise VerificationError('DATA_READ_FAILED')
+        self.bytes_read += size; self.last_blob = oid
+        try: return json.loads(raw)
+        except (ValueError, UnicodeError): raise VerificationError('DATA_READ_FAILED') from None
+    def unchanged(self):
+        return (self.command('rev-parse', 'HEAD').decode().strip() == self.commit
+                and not self.command('status', '--porcelain', '--untracked-files=no'))
+
+
+def select_sample(reader, quarter, now):
+    end, baseline = PERIODS[quarter]
+    phase = {'targetPeriodEnd': end, 'baselinePeriodEnd': baseline}
+    prefix = 'web/data/periods/' + quarter + '/'
+    manifest = reader.read(prefix + 'latest.json')
+    if (not isinstance(manifest, dict) or manifest.get('sourceMode') != 'actions'
+            or manifest.get('targetPeriodEnd') != end or not isinstance(manifest.get('companyFiles'), list)):
+        raise VerificationError('INVALID_DATA_MANIFEST')
+    seen = set()
+    for row in manifest['companyFiles'][:MAX_PARTS]:
+        match = re.fullmatch(r'\./data/companies/([A-Za-z0-9_-]{1,64})\.json', str(row.get('path', ''))) if isinstance(row, dict) else None
+        if not match or match[1] in seen: raise VerificationError('INVALID_DATA_MANIFEST')
+        seen.add(match[1]); path = prefix + 'companies/' + match[1] + '.json'
+        envelope = reader.read(path)
+        if (not isinstance(envelope, dict) or envelope.get('sourceMode') != 'actions' or envelope.get('targetPeriodEnd') != end
+                or not isinstance(envelope.get('funds'), list) or len(envelope['funds']) > 100):
+            raise VerificationError('INVALID_DATA_MANIFEST')
+        selection = bridge({'mode': 'select', 'funds': envelope['funds'], 'phase': phase, 'now': now})
+        index = selection.get('index') if isinstance(selection, dict) else None
+        if not isinstance(selection, dict) or set(selection) != {'index'} or type(index) is not int or not -1 <= index < len(envelope['funds']):
+            raise VerificationError('BRIDGE_FAILED')
+        if index < 0: continue
+        fund = envelope['funds'][index]
+        task = binding_for(fund, phase, now)
+        if not task: raise VerificationError('BRIDGE_FAILED')
+        # Preserve the actual observation envelope, but carry only this one
+        # sample portfolio through the independent in-memory merge.
+        small = {key: value for key, value in envelope.items() if key not in ('funds', 'errors', 'coverage')}
+        # The bridge receives the sample separately and restores this list in
+        # memory, avoiding a second serialized copy of a large portfolio.
+        small['funds'] = []
+        return {'quarter': quarter, 'phase': phase, 'manifest': manifest, 'envelope': small,
+                'fund': fund, 'task': task, 'dataPath': path, 'dataBlobSha': reader.last_blob,
+                'partsRead': len(seen)}
+    raise VerificationError('SAMPLE_NOT_FOUND_WITHIN_BOUND')
+
+
+def compact_receipt(raw):
+    rows = raw.get('strategyClaimsReceipts', [])
+    return dict(rows[0]) if len(rows) == 1 else None
+
+
+def run_sample(sample, checkpoint=None, provider_factory=PublicProvider):
+    started = time.monotonic()
+    task, phase = sample['task'], sample['phase']
+    config = {**phase, 'funds': [{'code': task['code'], 'strategyClaimsOnly': task}], 'maxWorkers': 1,
+              'maxStrategyClaimsSeconds': 240, 'traversal': {'plannedAt': dt.datetime.now(dt.timezone.utc).isoformat(),
+                                                           'strategyClaimsCodes': [task['code']]}}
+    result = {'quarter': sample['quarter'], 'code': task['code'], 'status': 'partial', 'errorCode': None,
+              'sourceUrl': task['source']['sourceUrl'], 'sourceTextHash': task['source']['sourceTextHash'],
+              'sectionContentHash': task['source']['sectionContentHash'], 'pages': task['source']['pages'],
+              'analysisDigest': task['analysisDigest'], 'taskDigest': task['taskDigest'],
+              'retainedStrategyObservedAt': task['retainedStrategyObservedAt'],
+              'dataPath': sample['dataPath'], 'dataBlobSha': sample['dataBlobSha'],
+              'partsRead': sample['partsRead'], 'receipt': None, 'checks': {}, 'elapsedSeconds': 0}
+    def record(raw):
+        result['receipt'] = compact_receipt(raw)
+        result['elapsedSeconds'] = round(time.monotonic() - started, 3)
+        if checkpoint: checkpoint(result)
+    try:
+        # The verifier never reads parser credentials or invokes another paid
+        # service. The original PDF is parsed locally on this Actions runner.
+        with patch('report_extract.mineru_tokens_from_env', return_value=[]):
+            raw = collect(config, china_today(), record, provider_factory)
+        checked = bridge({'mode': 'merge', 'fund': sample['fund'], 'envelope': sample['envelope'],
+                          'manifest': sample['manifest'], 'config': config, 'raw': raw, 'now': raw['retrievedAt']})
+        if (not isinstance(checked, dict) or set(checked) != {'checks', 'claimCount', 'evidenceCount', 'quoteChars',
+                    'scannedClauseCount', 'classifiedClauseCount', 'unknownClauseCount', 'newStrategyObservedAt',
+                    'protectedBeforeHash', 'protectedAfterHash'} or set(checked.get('checks', {})) != set(CHECKS)
+                or any(type(value) is not bool for value in checked['checks'].values())
+                or any(type(checked.get(key)) is not int or not 0 <= checked[key] <= limit
+                       for key, limit in (('claimCount', 24), ('evidenceCount', 8), ('quoteChars', 1280),
+                                          ('scannedClauseCount', 1000000), ('classifiedClauseCount', 1000000),
+                                          ('unknownClauseCount', 1000000)))
+                or any(value is not None and (not isinstance(value, str) or not re.fullmatch(r'[a-f0-9]{64}', value))
+                       for value in (checked.get('protectedBeforeHash'), checked.get('protectedAfterHash')))
+                or checked.get('newStrategyObservedAt') is not None and not _instant(checked['newStrategyObservedAt'])):
+            raise VerificationError('BRIDGE_FAILED')
+        result.update(checked)
+        result['status'] = 'verified' if all(checked['checks'].values()) else 'partial'
+        if result['status'] != 'verified':
+            result['errorCode'] = (result['receipt'] or {}).get('errorCode') or 'VERIFICATION_FAILED'
+    except Exception as error:
+        result['errorCode'] = getattr(error, 'code', 'VERIFICATION_FAILED')
+        if result['errorCode'] not in ERRORS: result['errorCode'] = 'VERIFICATION_FAILED'
+    result['elapsedSeconds'] = round(time.monotonic() - started, 3)
+    if checkpoint: checkpoint(result)
+    return result
+
+
+def save_result(output, value):
+    data = json.dumps(value, ensure_ascii=False, allow_nan=False, indent=2).encode()
+    if len(data) > MAX_OUTPUT_BYTES or inspect_content(data): raise VerificationError('PUBLICATION_REJECTED')
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix('.tmp'); temporary.write_bytes(data); temporary.replace(output)
+
+
+def verify(reader, output=OUTPUT, provider_factory=PublicProvider):
+    value = {'schemaVersion': 1, 'status': 'partial', 'dataCommit': reader.commit,
+             'scope': 'one-existing-portfolio-per-quarter-within-bounded-search', 'maxOriginalPdfRequests': 2,
+             'maxPartsPerQuarter': MAX_PARTS, 'samples': [], 'productionDataModified': False,
+             'semanticAnalysisComplete': False, 'originalPdfRequestsStarted': 0}
+    save_result(output, value)
+    for quarter in PERIODS:
+        try:
+            sample = select_sample(reader, quarter, dt.datetime.now(dt.timezone.utc).isoformat())
+            index = len(value['samples']); value['samples'].append({})
+            def checkpoint(row):
+                value['samples'][index] = row
+                value['originalPdfRequestsStarted'] = sum(bool(row.get('receipt')) for row in value['samples'])
+                save_result(output, value)
+            run_sample(sample, checkpoint, provider_factory)
+        except VerificationError as error:
+            value['samples'].append({'quarter': quarter, 'status': 'partial', 'errorCode': error.code})
+        save_result(output, value)
+    if not reader.unchanged():
+        value['errorCode'] = 'DATA_CHANGED'; value['productionDataModified'] = True
+    value['originalPdfRequestsStarted'] = sum(bool(row.get('receipt')) for row in value['samples'])
+    value['status'] = 'verified' if (len(value['samples']) == 2 and all(row['status'] == 'verified' for row in value['samples'])
+                                    and not value['productionDataModified']) else 'partial'
+    save_result(output, value)
+    return value
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data-repo', required=True)
+    parser.add_argument('--data-commit', required=True)
+    args = parser.parse_args()
+    if os.environ.get('GITHUB_ACTIONS') != 'true': raise VerificationError('ACTIONS_REQUIRED')
+    value = verify(GitDataReader(args.data_repo, args.data_commit))
+    print(json.dumps({'status': value['status'], 'sampleCount': len(value['samples']),
+                      'originalPdfRequestsStarted': value['originalPdfRequestsStarted'], 'productionDataModified': value['productionDataModified']}))
+    return 0 if value['status'] == 'verified' else 2
+
+
+if __name__ == '__main__':
+    try: raise SystemExit(main())
+    except Exception as error:
+        code = getattr(error, 'code', 'VERIFICATION_FAILED')
+        code = code if code in ERRORS else 'VERIFICATION_FAILED'
+        failure = {'status': 'partial', 'errorCode': code}
+        if not OUTPUT.exists(): save_result(OUTPUT, failure)
+        print(json.dumps(failure)); raise SystemExit(2) from None

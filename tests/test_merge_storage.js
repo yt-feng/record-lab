@@ -8,6 +8,7 @@ const { buildSnapshot } = require('../scripts/build-data');
 const { mergeFiles, mergeSnapshots } = require('../scripts/merge-parts');
 const { bindingFor } = require('../lib/price-patches');
 const { expectedSessions } = require('../lib/price-coverage');
+const { diagnose } = require('../lib/merge-diagnostics');
 const now = '2026-10-26T12:00:00Z';
 const phase = { targetPeriodEnd: '2026-06-30', baselinePeriodEnd: '2026-03-31' };
 const catalog = { fundCount: 4, companyCount: 2,
@@ -206,6 +207,69 @@ test('company pages stay bounded and private input fields never enter public out
     assert.ok(Buffer.byteLength(text) <= 100000); assert.equal(text.includes('discard-this'), false);
     assert.equal(json(path.join(state.data, 'companies', path.basename(file.path))).funds.length, 1);
   }
+});
+
+test('consumed private spools are released before commit while original inputs and old pages remain', t => {
+  const state = setup(t), first = equivalent(state, [snapshot('000001')]);
+  const manifestBytes = fs.readFileSync(path.join(state.data, 'latest.json'));
+  const oldPages = first.manifest.companyFiles.map(file => path.join(state.data, 'companies', path.basename(file.path)));
+  input(state, [snapshot('000002'), snapshot('000003')]);
+  const originals = fs.readdirSync(state.parts).map(file => [file, fs.readFileSync(path.join(state.parts, file))]);
+  let checked = false;
+  run(state, { beforeCommit: ({ workspace }) => {
+    checked = true;
+    assert.deepEqual(fs.readdirSync(path.join(workspace, 'inputs')), []);
+    assert.deepEqual(fs.readdirSync(path.join(workspace, 'funds')), []);
+    assert.ok(fs.readdirSync(path.join(workspace, 'companies')).length > 0);
+    assert.deepEqual(fs.readFileSync(path.join(state.data, 'latest.json')), manifestBytes);
+    for (const file of oldPages) assert.equal(fs.existsSync(file), true);
+    for (const [file, bytes] of originals) assert.deepEqual(fs.readFileSync(path.join(state.parts, file)), bytes);
+  } });
+  assert.equal(checked, true);
+});
+
+test('write failure captures scratch space before cleanup and preserves the published manifest', t => {
+  const state = setup(t); equivalent(state, [snapshot('000001')]);
+  const old = fs.readFileSync(path.join(state.data, 'latest.json'));
+  input(state, [snapshot('000003')]);
+  const write = fs.writeFileSync, stat = fs.statfsSync;
+  const injected = new Error('private write failure');
+  Object.defineProperty(injected, 'code', { get: () => 'ENOSPC' });
+  let workspace;
+  try {
+    fs.statfsSync = () => ({ bavail: 0, bsize: 4096 });
+    fs.writeFileSync = (file, ...args) => {
+      if (String(file).includes('record-merge-stage-') && path.basename(path.dirname(file)) === 'companies') {
+        workspace = path.dirname(path.dirname(file)); throw injected;
+      }
+      return write(file, ...args);
+    };
+    assert.throws(() => run(state), error => error === injected);
+  } finally { fs.writeFileSync = write; fs.statfsSync = stat; }
+  assert.equal(diagnose(injected).scratchAvailableBytes, 0);
+  assert.equal(diagnose(injected).systemCode, 'ENOSPC');
+  assert.equal(fs.existsSync(workspace), false);
+  assert.deepEqual(fs.readFileSync(path.join(state.data, 'latest.json')), old);
+});
+
+test('cleanup failure cannot replace the primary staged-write failure', t => {
+  const state = setup(t); input(state, [snapshot('000001')]);
+  const write = fs.writeFileSync, remove = fs.rmSync;
+  const primary = Object.assign(new Error('private write failure'), { code: 'ENOSPC' });
+  const cleanup = Object.assign(new Error('private cleanup failure'), { code: 'EACCES' });
+  let workspace;
+  try {
+    fs.writeFileSync = (file, ...args) => {
+      if (String(file).includes('record-merge-stage-') && path.basename(path.dirname(file)) === 'companies') {
+        workspace = path.dirname(path.dirname(file)); throw primary;
+      }
+      return write(file, ...args);
+    };
+    fs.rmSync = (file, ...args) => { if (file === workspace) throw cleanup; return remove(file, ...args); };
+    assert.throws(() => run(state), error => error === primary);
+  } finally { fs.writeFileSync = write; fs.rmSync = remove; if (workspace) remove(workspace, { recursive: true, force: true }); }
+  assert.equal(diagnose(primary).systemCode, 'ENOSPC');
+  assert.equal(fs.existsSync(path.join(state.data, 'latest.json')), false);
 });
 
 test('bootstrap observations migrate by component with the same original times and receipt aliases', t => {
