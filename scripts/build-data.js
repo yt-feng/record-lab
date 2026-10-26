@@ -521,6 +521,9 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
       shareClassCodes: oldPortfolio ? oldPortfolio.shareClassCodes
         : (Array.isArray(item.shareClassCodes) ? item.shareClassCodes : []).filter(fundCode),
     };
+    Object.assign(metadata, require('../lib/historical-inception').inceptionState(
+      { ...metadata, inceptionProfileEvidence: item.inceptionProfileEvidence, inceptionConflict: item.inceptionConflict },
+      old, nowValue, raw.retrievedAt));
     const current = analyzeFund({ ...metadata,
       reports: [...reports.values()] }, analysisOptions);
     if (!current.selectedReport) {
@@ -576,8 +579,11 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
     batchResults.push({ code, status: finalFund.status === 'no-equities' ? 'no-equities' : finalFund.selectedReport.reportOnly ? 'failed' : 'complete',
       attempted: true, errorCode: finalFund.selectedReport.reportOnly ? 'HOLDINGS_UNRESOLVED' : null });
   }
+  const failedCodes = new Set(batchResults.filter(item => item.status === 'failed').map(item => item.code));
+  const inceptionPatches = raw.funds.filter(item => item && failedCodes.has(item.code)).map(item =>
+    require('../lib/historical-inception').inceptionPatch(item, config, nowValue, raw.retrievedAt)).filter(Boolean);
   // A receipt-only part is necessary to preserve explicitly unstarted products.
-  if (!freshFundCount && !deferredFundCount && !pricePatches.length) throw new SafeBuildError('NO_VALID_FRESH_FUNDS');
+  if (!freshFundCount && !deferredFundCount && !pricePatches.length && !inceptionPatches.length) throw new SafeBuildError('NO_VALID_FRESH_FUNDS');
   let retainedFundCount = 0;
   if (preserveOthers) {
     for (const [code, old] of cached) {
@@ -605,7 +611,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
   if (failedFundCount) limitations.push('部分基金沿用上次有效数据或暂缺，原始观测日期保留。');
   const uniqueErrors = [...new Map(errors.map(issue => [JSON.stringify(issue), issue])).values()];
   return {
-    schemaVersion: 1, asOf: raw.asOf, retrievedAt: raw.retrievedAt, sourceMode: 'actions', pricePatches,
+    schemaVersion: 1, asOf: raw.asOf, retrievedAt: raw.retrievedAt, sourceMode: 'actions', pricePatches, inceptionPatches,
     targetPeriodEnd: config.targetPeriodEnd || null, baselinePeriodEnd: config.baselinePeriodEnd || null,
     coverage: {
       targetPeriodEnd: config.targetPeriodEnd || null, baselinePeriodEnd: config.baselinePeriodEnd || null,

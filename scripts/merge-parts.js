@@ -78,6 +78,7 @@ function sanitizeFund(item, { now, config, envelope }) {
         endDate: manager && manager.endDate })),
     metadataSourceUrl: item.metadataSourceUrl, managerSourceUrl: item.managerSourceUrl,
     inceptionDate: item.inceptionDate, inceptionSourceUrl: item.inceptionSourceUrl, inceptionEvidence: item.inceptionEvidence,
+    inceptionProfileEvidence: item.inceptionProfileEvidence, inceptionConflict: item.inceptionConflict,
     managerScope: item.managerScope, managersAsOf: item.managersAsOf,
     shareClassCodes: (Array.isArray(item.shareClassCodes) ? item.shareClassCodes : []).filter(code => typeof code === 'string' && CODE.test(code)),
     sourcePortfolioCode: item.sourcePortfolioCode, portfolioSourceUrl: item.portfolioSourceUrl,
@@ -162,6 +163,7 @@ function retainReportEvidence(target, source) {
   if (!target?.selectedReport || !source?.selectedReport || target.selectedReport.periodEnd !== source.selectedReport.periodEnd) return false;
   let changed = false;
   const to = target.selectedReport, from = source.selectedReport;
+  changed = require('../lib/historical-inception').retainInception(target, source) || changed;
   changed = retainPortfolioIdentity(to, from) || changed;
   // Keep a different PDF's identity only in that report's own history. A
   // quarterly strategy supplement cannot become an interim identity source.
@@ -417,6 +419,22 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
       acceptedFreshFundCount += 1;
     }
   }
+  // A failed PDF attempt can still expose a real founding-date disagreement.
+  // Apply only that check to an existing exact-code/quarter observation.
+  let acceptedInceptionPatchCount = 0;
+  for (const envelope of snapshots) {
+    if (!validEnvelope(envelope, currentTime, config)) continue;
+    for (const raw of Array.isArray(envelope.inceptionPatches) ? envelope.inceptionPatches : []) {
+      const patch = require('../lib/historical-inception').normalizeInceptionPatch(raw, config, currentTime, envelope.retrievedAt);
+      const fund = patch && byCode.get(patch.code);
+      if (!fund || fund.selectedReport?.periodEnd !== patch.targetPeriodEnd) continue;
+      const changed = require('../lib/historical-inception').retainInception(fund, {
+        code: patch.code, inceptionDate: patch.historicalEvidence.date, inceptionSourceUrl: patch.historicalEvidence.sourceUrl,
+        inceptionEvidence: patch.historicalEvidence, inceptionProfileEvidence: patch.profileEvidence,
+      }, currentTime);
+      if (changed) acceptedInceptionPatchCount++;
+    }
+  }
   let acceptedPricePatchCount = 0;
   for (const envelope of snapshots) {
     if (!validEnvelope(envelope, currentTime, config)) continue;
@@ -455,9 +473,9 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
   // No new observation means no fabricated new timestamp or overwritten old files.
   const needsRepartition = Object.values(previousCompanies).some(item => item.funds?.length > (pageLimits?.maxFunds || MAX_COMPANY_FUNDS)
     || Buffer.byteLength(JSON.stringify(item)) + 1 > (pageLimits?.maxBytes || MAX_COMPANY_BYTES));
-  if (!acceptedFreshFundCount && !acceptedPricePatchCount && !reusedFunds.length && !migratedBootstrapFundCount && !needsRepartition && previousManifest) {
+  if (!acceptedFreshFundCount && !acceptedPricePatchCount && !acceptedInceptionPatchCount && !reusedFunds.length && !migratedBootstrapFundCount && !needsRepartition && previousManifest) {
     return { changed: false, manifest: previousManifest, companySnapshots: {},
-      receipt, counts: { acceptedFreshFundCount: 0, acceptedPricePatchCount: 0, ...reuseCounts,
+      receipt, counts: { acceptedFreshFundCount: 0, acceptedPricePatchCount: 0, acceptedInceptionPatchCount: 0, ...reuseCounts,
         errorCount: errors.length }, errors: [...new Set(errors)] };
   }
   const buckets = new Map();
@@ -514,7 +532,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
     targetPeriodEnd: config.targetPeriodEnd || null, baselinePeriodEnd: config.baselinePeriodEnd || null,
     coverage, companyCoverage, companyFiles, funds: [], errors: [] };
   return { changed: true, manifest, companySnapshots, receipt,
-    counts: { acceptedFreshFundCount, acceptedPricePatchCount, ...reuseCounts, migratedBootstrapFundCount, companyCount: buckets.size,
+    counts: { acceptedFreshFundCount, acceptedPricePatchCount, acceptedInceptionPatchCount, ...reuseCounts, migratedBootstrapFundCount, companyCount: buckets.size,
       fundCount: funds.length, errorCount: errors.length },
     errors: [...new Set(errors)] };
 }

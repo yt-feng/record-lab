@@ -1,0 +1,40 @@
+name: Diagnose five report manager tables
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: verify-report-managers
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /requirements.txt
+            /scripts/*.py
+            /tests/test_verify_managers.py
+            /tests/test_manager_pipeline.py
+            /.github/workflows/verify-managers.yml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Test manager diagnostics without network
+        run: python -m unittest discover -s tests -p 'test_verify_managers.py'
+      - name: Diagnose five fixed PDFs with bounded short excerpts
+        run: python scripts/verify-managers.py
+      - name: Retain guarded diagnostic summary only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-manager-diagnostics
+          path: .cache/manager-verification/result.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7

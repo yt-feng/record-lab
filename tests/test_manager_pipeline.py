@@ -54,6 +54,41 @@ class ManagerPipelineTests(unittest.TestCase):
         self.assertEqual(previous["managers"][0]["name"], "基准经理")
         self.assertEqual(fund["managers"][0]["name"], "当前经理")
 
+    def test_zero_quarter_rows_keep_diagnostic_proof_without_erasing_valid_interim_managers(self):
+        for prior_valid in (False, True):
+            with self.subTest(prior_valid=prior_valid):
+                class Source:
+                    def overview(self, code):
+                        return {"name": "合成基金", "company": "合成公司", "managers": []}
+                    def announcements(self, code, as_of):
+                        return [{"title": "合成报告", "sourceUrl": f"https://example.org/{kind}.pdf",
+                                 "periodEnd": "2026-06-30", "kind": kind, "publishedAt": published}
+                                for kind, published in [('semiannual', '2026-08-28'), ('quarterly', '2026-07-20')]]
+                    def holdings(self, code, year):
+                        return {'2026-06-30': [{'stockCode': '600001', 'stockName': '合成股票', 'market': 'CN',
+                            'currency': 'CNY', 'shares': 100, 'weightPct': 5, 'marketValueYuan': 500}]}
+                    def report_details(self, doc):
+                        text = TABLE if doc['kind'] == 'semiannual' and prior_valid else TABLE.replace('2025年1月1日', '任期未知')
+                        return _details_for_pages([text], doc['sourceUrl'], doc['periodEnd'], doc['kind'],
+                            lambda *args: {'navYuan': 10000, 'narrative': None}, published_at=doc['publishedAt'])
+                fund, _ = collect_fund({'code': '000001'}, '2026-10-26', provider=Source(),
+                                      target_period='2026-06-30', baseline_period='2026-03-31')
+                report = fund['reports'][0]
+                if prior_valid:
+                    self.assertEqual(report['managers'][0]['name'], '张明')
+                    self.assertEqual(report['managerTableCoverage']['kind'], 'semiannual')
+                    self.assertTrue(report['managerTableCoverage']['complete'])
+                else:
+                    self.assertFalse(report.get('managers'))
+                    self.assertEqual(report['managerTableCoverage']['sourceUrl'], 'https://example.org/quarterly.pdf')
+                    self.assertEqual(report['managerTableCoverage']['periodStart'], '2026-04-01')
+                    self.assertEqual(report['managerTableCoverage']['kind'], 'quarterly')
+                    self.assertEqual(report['managerTableCoverage']['parsedRows'], 0)
+                    self.assertGreater(report['managerTableCoverage']['excludedRows'], 0)
+                    self.assertFalse(report['managerTableCoverage']['complete'])
+                    self.assertTrue(report['managerEvidenceRetrievedAt'])
+                self.assertEqual(report['sourceUrl'], 'https://example.org/semiannual.pdf')
+
 
 if __name__ == "__main__":
     unittest.main()

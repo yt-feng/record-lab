@@ -290,7 +290,7 @@ def base_states(catalog, previous, phase, now, config=None):
                              "managerTotalAttempts": counter(prior_quality.get("managerTotalAttempts"), counter(prior_quality.get("managerAttempts"))),
                              "retry": retry_state(None, None, now)}
         states[code]["enrichment"] = normalize_enrichment(prior_enrichment, status, now)
-        states[code]["quality"] = normalize_quality(prior_quality, status, now)
+        states[code]["quality"] = normalize_quality(prior_quality, status, now, code=code)
         if status == "not-applicable":
             states[code]["notApplicableEvidence"] = clean_not_applicable(exemption, code, phase, now)
     apply_retry_policy(states, config, now)
@@ -454,7 +454,7 @@ def apply_coverage(state, coverage):
     current["errorCode"] = None if not missing else "PRICE_COVERAGE_INCOMPLETE"
 
 
-def normalize_quality(previous, status, now):
+def normalize_quality(previous, status, now, code=None):
     previous = previous if isinstance(previous, dict) else {}
     raw_fields = previous.get("fields") if isinstance(previous.get("fields"), dict) else {}
     if status == "not-applicable":
@@ -481,7 +481,8 @@ def normalize_quality(previous, status, now):
         if previous.get("priceUniverseEmpty") is True:
             fields["prices"] = "not-applicable"
     baseline_exemption = previous.get("baselineExemption")
-    baseline_exempt = valid_baseline_exemption(baseline_exemption, now)
+    baseline_exempt = (valid_baseline_exemption(baseline_exemption, now)
+                       and (code is None or baseline_exemption.get("fundCode") == code))
     for key in QUALITY_FIELDS:
         if fields[key] == "not-applicable" and not ((status == "no-equities" and key == "prices" and previous.get("priceUniverseEmpty") is True)
                                                     or key == "baseline" and baseline_exempt):
@@ -529,11 +530,30 @@ def valid_baseline_exemption(evidence, now):
     if not (bool(established and baseline and target) and baseline < established <= target <= now.date()
             and public_url(evidence.get('sourceUrl'))):
         return False
-    if urlparse(evidence['sourceUrl']).path.endswith(f"jbgk_{evidence['fundCode']}.html"):
+    from historical_inception import profile_source
+    if profile_source(evidence['sourceUrl'], evidence['fundCode']):
         return True
     from historical_inception import normalize_inception
     historical = normalize_inception(evidence.get('inceptionEvidence'), evidence['fundCode'], evidence['periodEnd'], now=now)
     return bool(historical and historical['date'] == evidence['date'] and historical['sourceUrl'] == evidence['sourceUrl'])
+
+
+def quality_for_code(observation, code, previous=None):
+    """Portfolio reports can be shared; a product's founding exemption cannot."""
+    result = {**observation, "fields": dict(observation.get("fields", {}))}
+    exemption = result.get("baselineExemption")
+    if isinstance(exemption, dict) and exemption.get("fundCode") != code:
+        result.pop("baselineExemption", None)
+        prior = previous if isinstance(previous, dict) else {}
+        prior_exemption = prior.get("baselineExemption")
+        if result["fields"].get("baseline") == "not-applicable":
+            old_status = (prior.get("fields") or {}).get("baseline")
+            result["fields"]["baseline"] = "complete" if old_status == "complete" else "missing"
+            if (old_status == "not-applicable" and isinstance(prior_exemption, dict)
+                    and prior_exemption.get("fundCode") == code):
+                result["fields"]["baseline"] = "not-applicable"
+                result["baselineExemption"] = prior_exemption
+    return result
 
 
 def quarter_start(period_end):
@@ -776,7 +796,8 @@ def hydrate_quality(states, retained, phase, now):
             # one proven owner and may not bridge unknown catalogue mappings.
             if code != fund["code"] and (not state["companyCode"] or state["companyCode"] != fund.get("companyId")):
                 continue
-            state["quality"] = normalize_quality({**state["quality"], **quality}, state["status"], now)
+            scoped = quality_for_code(quality, code, state["quality"])
+            state["quality"] = normalize_quality({**state["quality"], **scoped}, state["status"], now, code=code)
             if state["status"] in SUCCESS and valid_price_coverage(coverage):
                 apply_coverage(state, coverage)
 
@@ -1516,7 +1537,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                               "totalAttempts": state["totalAttempts"] + 1, "deferredUntil": None,
                               "attribution": "direct", "errorCode": None,
                               "notApplicableEvidence": clean_not_applicable(item["notApplicableEvidence"], item["code"], phase, attempted)})
-                state["quality"] = normalize_quality(None, status, current)
+                state["quality"] = normalize_quality(None, status, current, code=item["code"])
                 state["enrichment"] = normalize_enrichment(None, status, current)
                 continue
             if state["status"] == "not-applicable":
@@ -1556,7 +1577,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                 state["attempted"] = True
                 if valid_quality(item.get("reportQuality"), phase):
                     quality.update(merge_quality_observation(quality, item["reportQuality"]))
-                state["quality"] = normalize_quality(quality, state["status"], current)
+                state["quality"] = normalize_quality(quality, state["status"], current, code=item["code"])
                 if status in SUCCESS:
                     state['priceBindingNeedsReport'] = False
                     apply_coverage(state, item.get("priceCoverage"))
@@ -1589,14 +1610,14 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
             state.update({"lastAttemptAt": document["attemptedAt"], "attempted": True, "attribution": "direct",
                           "totalAttempts": state["totalAttempts"] + 1, "deferredUntil": None})
             if valid_quality(item.get("reportQuality"), phase):
-                state["quality"] = normalize_quality(merge_quality_observation(state["quality"], item["reportQuality"]), status, current)
+                state["quality"] = normalize_quality(merge_quality_observation(state["quality"], item["reportQuality"]), status, current, code=item["code"])
             if status == "failed":
                 state.update({"status": "failed", "attempts": min(2, state["attempts"] + 1),
                               "errorCode": item.get("errorCode") if item.get("errorCode") in ERROR_CODES else "FUND_FAILED"})
             else:
                 state.update({"status": status, "errorCode": None})
                 state["enrichment"] = normalize_enrichment(state["enrichment"], status, current)
-                state["quality"] = normalize_quality(state["quality"], status, current)
+                state["quality"] = normalize_quality(state["quality"], status, current, code=item["code"])
                 if status in SUCCESS:
                     apply_coverage(state, item.get("priceCoverage"))
                 accepted_success.add(item["code"])
@@ -1628,9 +1649,10 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
                 if code in states:
                     states[code]["representativeCode"] = representative
                     states[code]["enrichment"]["attempts"] = portfolio_attempts
-                    states[code]["quality"] = normalize_quality({**representative_quality, "attempts": quality_attempts,
+                    scoped_quality = quality_for_code(representative_quality, code, states[code]["quality"])
+                    states[code]["quality"] = normalize_quality({**scoped_quality, "attempts": quality_attempts,
                                                                  "managerAttempts": manager_attempts, "managerTotalAttempts": manager_total,
-                                                                 "strategyAttempts": strategy_attempts, "strategyTotalAttempts": strategy_total}, status, current)
+                                                                 "strategyAttempts": strategy_attempts, "strategyTotalAttempts": strategy_total}, status, current, code=code)
                 if code in states and states[code]["status"] not in SUCCESS:
                     states[code].update({"status": status, "lastAttemptAt": document["attemptedAt"], "errorCode": None,
                                          "attribution": "portfolio-evidence"})

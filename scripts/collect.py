@@ -114,13 +114,20 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         foundation = foundation if dt.date.fromisoformat(foundation).isoformat() == foundation and foundation <= as_of else None
     except (TypeError, ValueError):
         foundation = None
-    from historical_inception import normalize_inception
+    from historical_inception import normalize_inception, normalize_profile_inception, normalize_inception_conflict
     historical = normalize_inception(item.get('catalogInceptionEvidence'), code, target_period)
     foundation_source = fund['metadataSourceUrl']
+    profile = normalize_profile_inception({'schemaVersion': 1, 'fundCode': code, 'date': foundation,
+        'sourceUrl': foundation_source, 'retrievedAt': dt.datetime.now(dt.timezone.utc).isoformat()}, code)
+    if profile:
+        fund['inceptionProfileEvidence'] = profile
     if historical:
         if foundation and foundation != historical['date']:
             # Conflicting sources cannot exempt an unavailable comparison report.
             errors.append({'code': code, 'stage': 'inception', 'errorCode': 'INCEPTION_DATE_CONFLICT'})
+            fund['inceptionConflict'] = normalize_inception_conflict({'schemaVersion': 1, 'fundCode': code,
+                'periodEnd': target_period, 'status': 'conflicting-sources', 'historicalEvidence': historical,
+                'profileEvidence': profile}, code)
             foundation = None
         else:
             foundation, foundation_source = historical['date'], historical['sourceUrl']
@@ -303,6 +310,16 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
                         quarter_details.get("managerTableCoverage"), new_managers, period)
                     report["managerSourceUrl"] = quarterly["sourceUrl"]
                     report["managerEvidenceRetrievedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
+                elif not report.get("managers") and isinstance(quarter_details.get("managerTableCoverage"), dict):
+                    # Zero parsed appointments still constitute an extraction
+                    # observation. Keep the quarter's bounded-table diagnosis
+                    # instead of silently retaining only the interim attempt.
+                    # Never replace an already evidenced manager roster here.
+                    quarter_coverage = normalize_manager_table_coverage(
+                        quarter_details["managerTableCoverage"], [], period)
+                    if quarter_coverage:
+                        report["managerTableCoverage"] = quarter_coverage
+                        report["managerEvidenceRetrievedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
                 if report["narrative"]:
                     report["narrative"]["reportKind"] = "quarterly"
                 for key in extraction_keys:
