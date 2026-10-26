@@ -3,7 +3,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { analyzeFund, normalizeReport, validDate } = require('../lib/fund-analysis');
+const { analyzeFund, normalizeReport, normalizeLifecycleEvidence, validDate, validHoldingIdentity } = require('../lib/fund-analysis');
 
 const BUILD_CODES = new Set([
   'INVALID_INPUT', 'INVALID_AS_OF', 'FUTURE_AS_OF', 'INVALID_RETRIEVED_AT', 'INVALID_CONFIG',
@@ -13,6 +13,7 @@ const BUILD_CODES = new Set([
   'HOLDING_COVERAGE_REGRESSION', 'REPORT_COVERAGE_REGRESSION', 'INVALID_PRICE_SOURCE',
   'PRICE_IDENTITY_MISMATCH', 'NO_VALID_FRESH_FUNDS', 'COLLECTION_FAILED', 'BUILD_FAILED',
   'PRICE_CURRENCY_MISMATCH', 'PRICE_EXCHANGE_MISMATCH', 'PRICE_CORPORATE_ACTION_UNRESOLVED',
+  'PRICE_TIMEZONE_MISMATCH', 'PRICE_INSTRUMENT_MISMATCH',
   'ADJUSTED_PRICE_REJECTED', 'INVALID_PRICE_RANGE', 'PRICE_SOURCES_UNAVAILABLE',
   'BATCH_DEADLINE_REACHED', 'PRICE_BUDGET_REACHED',
   'INVALID_ARGUMENTS', 'INPUT_READ_FAILED', 'OUTPUT_WRITE_FAILED',
@@ -25,9 +26,12 @@ const BUILD_CODES = new Set([
   'TARGET_REPORT_MISSING',
   'TIMEOUT', 'NETWORK_ERROR', 'HTTP_ERROR', 'TARGET_REPORT_UNAVAILABLE', 'BATCH_REQUIRES_ACTIONS',
   'ANNOUNCEMENT_PAGE_LIMIT', 'ANNOUNCEMENT_PAGINATION_STALLED',
+  'LIFECYCLE_PARSE_FAILED', 'LIFECYCLE_ANNOUNCEMENT_FORMAT', 'LIFECYCLE_ARGUMENTS',
+  'LIFECYCLE_DEADLINE_REACHED', 'LIFECYCLE_PAGINATION_STALLED', 'LIFECYCLE_ANNOUNCEMENT_PAGE_LIMIT',
+  'LIFECYCLE_INVALID_PDF', 'LIFECYCLE_PDF_TOO_LARGE', 'LIFECYCLE_PDF_PAGE_LIMIT', 'LIFECYCLE_NOT_CONFIRMED',
 ]);
 const STAGES = new Set(['metadata', 'announcements', 'holdings', 'report', 'nav', 'narrative',
-  'join', 'prices', 'build', 'collection', 'budget', 'target-report', 'no-equities-report', 'quarterly-report']);
+  'join', 'prices', 'build', 'collection', 'budget', 'target-report', 'no-equities-report', 'quarterly-report', 'lifecycle']);
 const fundCode = value => typeof value === 'string' && /^\d{6}$/.test(value);
 const clone = value => JSON.parse(JSON.stringify(value));
 
@@ -78,6 +82,8 @@ function isValidNoEq(evidence, { asOf, code } = {}) {
     || evidence.periodEnd > evidence.publishedAt || evidence.publishedAt > asOf
     || !Number.isInteger(evidence.page) || evidence.page <= 0
     || typeof evidence.text !== 'string' || (evidence.fundCode !== undefined && evidence.fundCode !== code)) return false;
+  if (evidence.evidenceType === 'zero-stock-balance-sheet') return require('../web/zero-stock').validZeroStock(evidence);
+  if (evidence.evidenceType === 'explicit-no-stock-detail') return require('../web/zero-stock').validExplicitNoStock(evidence);
   const excerpt = evidence.text.slice(0, 600).replace(/\s+/g, '');
   if (/并非未|不是未|不能确认|尚未确认|无法确认/.test(excerpt)) return false;
   if (evidence.evidenceType === 'empty-stock-detail-section') {
@@ -98,6 +104,7 @@ function noEquitiesReport(evidence, code) {
   const normalizedEvidence = { confirmed: true, sourceUrl: evidence.sourceUrl,
     periodEnd: evidence.periodEnd, publishedAt: evidence.publishedAt, page: evidence.page,
     text: evidence.text.slice(0, 600), kind,
+    ...(['zero-stock-balance-sheet', 'explicit-no-stock-detail'].includes(evidence.evidenceType) ? { evidenceType: evidence.evidenceType } : {}),
     ...(evidence.evidenceType === 'empty-stock-detail-section' ? { evidenceType: evidence.evidenceType,
       assetAllocationText: evidence.assetAllocationText.slice(0, 600) } : {}),
     title: typeof evidence.title === 'string' ? evidence.title.slice(0, 200) : null };
@@ -108,13 +115,17 @@ function noEquitiesReport(evidence, code) {
 }
 
 function isValidNotApplicable(evidence, { asOf, code, periodEnd } = {}) {
+  if (evidence?.reason === 'TERMINATED_BEFORE_PERIOD') return Boolean(normalizeLifecycleEvidence(evidence,
+    { asOf, code, periodEnd: periodEnd || evidence.periodEnd }));
   return Boolean(evidence && evidence.reason === 'ESTABLISHED_AFTER_PERIOD' && evidence.fundCode === code
     && publicUrl(evidence.sourceUrl) && validDate(evidence.date) && validDate(evidence.periodEnd)
     && validDate(asOf) && evidence.date > evidence.periodEnd && evidence.date <= asOf
     && (!periodEnd || evidence.periodEnd === periodEnd));
 }
 
-function cleanNotApplicable(evidence) {
+function cleanNotApplicable(evidence, asOf) {
+  if (evidence.reason === 'TERMINATED_BEFORE_PERIOD') return normalizeLifecycleEvidence(evidence,
+    { asOf, code: evidence.fundCode, periodEnd: evidence.periodEnd });
   return { reason: 'ESTABLISHED_AFTER_PERIOD', fundCode: evidence.fundCode, date: evidence.date,
     periodEnd: evidence.periodEnd, sourceUrl: evidence.sourceUrl };
 }
@@ -144,9 +155,7 @@ function cleanReport(raw, code, asOf, addError) {
       addError(report.noEquitiesConfirmed ? 'INVALID_NO_EQUITIES_EVIDENCE' : 'EMPTY_HOLDINGS', code); return null;
     }
   } else if (report.noEquitiesConfirmed || report.reportOnly) { addError('CONTRADICTORY_NO_EQUITIES', code); return null; }
-  if (report.holdings.some(holding => !['CN', 'HK'].includes(holding.market)
-    || !/^\d{5,6}$/.test(holding.stockCode)
-    || holding.currency !== (holding.market === 'CN' ? 'CNY' : 'HKD'))) {
+  if (report.holdings.some(holding => !validHoldingIdentity(holding))) {
     addError('INVALID_REPORT', code); return null;
   }
   if (report.narrative.text && !publicUrl(report.narrative.sourceUrl)) {
@@ -165,7 +174,7 @@ function cleanReport(raw, code, asOf, addError) {
 function cleanBars(rawBars, addError) {
   const result = {};
   for (const [key, value] of Object.entries(rawBars && typeof rawBars === 'object' ? rawBars : {})) {
-    if (!/^(?:(?:CN|HK):)?\d{5,6}$/.test(key) || !value || !publicUrl(value.sourceUrl)) {
+    if (!/^(?:(?:(?:CN|HK):)?\d{5,6}|US:[A-Z][A-Z0-9]{0,9}(?:\.[A-Z0-9]{1,3})?)$/.test(key) || !value || !publicUrl(value.sourceUrl)) {
       addError('INVALID_PRICE_SOURCE', null, 'prices'); continue;
     }
     const [market, stock] = key.includes(':') ? key.split(':') : [null, key];
@@ -429,16 +438,19 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
         { asOf: raw.asOf, code, periodEnd: config.targetPeriodEnd }));
       if (exempt && !old?.selectedReport) {
         const entry = directoryFunds.get(code);
+        const founded = exempt.notApplicableEvidence.reason === 'ESTABLISHED_AFTER_PERIOD';
         const result = analyzeFund({ code, name: exempt.name, company: exempt.company, managers: [],
           companyId: exempt.companyId || exempt.companyCode || entry?.companyId || null,
-          metadataSourceUrl: exempt.notApplicableEvidence.sourceUrl,
-          inceptionDate: exempt.notApplicableEvidence.date, inceptionSourceUrl: exempt.notApplicableEvidence.sourceUrl,
+          metadataSourceUrl: exempt.metadataSourceUrl || exempt.notApplicableEvidence.sourceUrl,
+          inceptionDate: founded ? exempt.notApplicableEvidence.date : exempt.inceptionDate,
+          inceptionSourceUrl: founded ? exempt.notApplicableEvidence.sourceUrl : exempt.inceptionSourceUrl,
           shareClassCodes: [code], reports: [] }, analysisOptions);
-        result.notApplicableEvidence = cleanNotApplicable(exempt.notApplicableEvidence);
+        result.notApplicableEvidence = cleanNotApplicable(exempt.notApplicableEvidence, raw.asOf);
         result.retrievedAt = raw.retrievedAt;
         result.dataStatus = 'fresh';
         result.reports = [];
-        result.warnings = ['公开成立日期晚于本期末，该产品不适用本期报告。'];
+        result.warnings = [founded ? '公开成立日期晚于本期末，该产品不适用本期报告。'
+          : '公开公告确认基金合同已于本期末前终止；季度内仍可能运作并持仓，保留最后运作日，不记为期末零持股或研究已完成。'];
         funds.push(result); freshFundCount += 1;
         batchResults.push({ code, status: 'not-applicable', attempted: true, errorCode: null });
         continue;
@@ -578,6 +590,8 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
       batchRequestedFundCount: requested.length, batchFreshFundCount: freshFundCount,
       noEquitiesFundCount: publishedFunds.filter(fund => fund.status === 'no-equities').length,
       notApplicableFundCount: publishedFunds.filter(fund => fund.notApplicableEvidence).length,
+      establishedAfterPeriodFundCount: publishedFunds.filter(fund => fund.notApplicableEvidence?.reason === 'ESTABLISHED_AFTER_PERIOD').length,
+      terminatedBeforePeriodFundCount: publishedFunds.filter(fund => fund.notApplicableEvidence?.reason === 'TERMINATED_BEFORE_PERIOD').length,
       batchNoEquitiesFundCount,
       failedFundCount, deferredFundCount, retainedFundCount,
       shareClassDeduplicatedCount: funds.length - publishedFunds.length,

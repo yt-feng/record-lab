@@ -156,8 +156,8 @@ test('current profile managers are not silently attributed to the historical rep
   assert.deepEqual(portfolios(result.parts)[0].reportManagers, []);
   current.managerAttribution = 'report';
   const verified = fixture([current]);
-  assert.equal(verified.result.stocks[0].reportManagerCount, 1);
-  assert.equal(verified.result.stocks[0].currentProfileManagerCount, 0);
+  assert.equal(verified.result.stocks[0].reportManagerCount, 0);
+  assert.equal(verified.result.stocks[0].currentProfileManagerCount, 1);
 });
 
 test('observed quotes stay in native currency and only the exact quarter window is accepted', () => {
@@ -223,4 +223,31 @@ test('CLI requires Actions and failed input retains an existing analysis index',
     assert.throws(() => generate(root));
     assert.deepEqual(fs.readFileSync(path.join(root, 'analysis.json')), previous);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('terminated products remain audited records without manufactured positions, while unproven exemptions fail', () => {
+  const fund = makeFund('000001');
+  fund.selectedReport = null; fund.previousReport = null; fund.rows = [];
+  const quote = '本基金基金合同自动终止。';
+  fund.notApplicableEvidence = { reason: 'TERMINATED_BEFORE_PERIOD', fundCode: fund.code,
+    periodEnd: TARGET, date: '2026-05-06', dateBasis: 'lastOperationDate',
+    lastOperationDate: '2026-05-06', terminationDate: null, liquidationStartDate: null,
+    sourceUrl: 'https://example.org/termination.pdf', publishedAt: '2026-05-07',
+    eventType: 'termination', terminationConfirmed: true, identityFundCodes: [fund.code],
+    sourceTextHash: 'a'.repeat(64), parseMethod: 'pypdf', pageNumbersVerified: true,
+    totalPages: 1, page: 1, quote, scope: 'quarter-end-applicability-only',
+    evidence: [{ field: 'terminationConfirmed', page: 1, quote },
+      { field: 'lastOperationDate', page: 1, quote: '本基金最后运作日为2026年5月6日' },
+      { field: 'identityFundCodes', page: 1, quote: '基金份额代码：000001' }] };
+  const { result, parts } = fixture([fund]);
+  assert.equal(result.coverage.inputRecords, 1);
+  assert.equal(result.coverage.excludedNotApplicable, 1);
+  assert.equal(result.stocks.length, 0);
+  assert.equal(portfolios(parts).length, 0);
+  fund.notApplicableEvidence.terminationConfirmed = false;
+  assert.throws(() => fixture([fund]), /ANALYSIS_PERIOD_MISMATCH/);
+  fund.notApplicableEvidence.terminationConfirmed = true;
+  Object.assign(fund.notApplicableEvidence, { date: TARGET, lastOperationDate: TARGET, publishedAt: '2026-07-01' });
+  fund.notApplicableEvidence.evidence[1].quote = '本基金最后运作日为2026年6月30日';
+  assert.throws(() => fixture([fund]), /ANALYSIS_PERIOD_MISMATCH/);
 });

@@ -43,7 +43,9 @@ function generated(id) {
       managers:[{name:'当前经理'}],reports:[report,{...report,periodEnd:baseline,publishedAt:baseline,
         sourceUrl:`https://example.org/${id}-prior.pdf`,holdings:[{...current,shares:50}],strategyExcerpts:[]}]}]},
     {now:'2026-10-26T12:00:00Z',config:{funds:[{code:'000001'}],targetPeriodEnd:target,baselinePeriodEnd:baseline}});
-  snapshot.funds[0].reportManagers=[{name:'报告经理'}];snapshot.funds[0].managerAttribution='report';
+  snapshot.funds[0].reportManagers=[{name:'报告经理',startDate:'2025-01-01',endDate:null,role:'本基金基金经理',periodStart:start,periodEnd:target,
+    evidence:{sourceUrl:'https://example.org/manager-report.pdf',page:5,pages:[5],tablePage:5,section:'4.1',
+      text:'报告经理 本基金基金经理 2025年1月1日 -',method:'explicit-report-manager-table',periodEnd:target}}];snapshot.funds[0].managerAttribution='report';
   const file='./data/companies/co1.json',parts=new Map();
   const manifest={...snapshot,funds:[],companyFiles:[{path:file}],coverage:{fundCount:1,catalogFundCount:1}};
   const index=analyzeQuarter(manifest,()=>snapshot,{now:'2026-10-26T12:00:00Z',writePart:(file,part)=>parts.set(file,part)});
@@ -81,6 +83,7 @@ test('real generated stock index, contribution parts and evidence render report 
   await view.api.loadQuarter({id:'2026Q2'});await view.button().click();
   const result=view.nodes.get('analysis-detail').textContent;
   assert.match(result,/报告经理/);assert.doesNotMatch(result,/当前经理/);
+  assert.match(result,/经理表原文 · 第 5 页/);assert.match(result,/任职 2025-01-01/);
   assert.match(result,/持股数增加/);assert.match(result,/本期持股 100.*上期持股 50.*股数差 50/);
   assert.match(result,/2026Q2组合按估值调整行业配置/);assert.match(result,/第 7 页/);
   assert.equal(bundle.index.generation,[...bundle.parts.values()][0].generation);

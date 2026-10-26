@@ -220,7 +220,10 @@ test('report managers use explicit report names or date-overlapping documented t
   const result = analyzeFund(fund([report()], { managers }), options());
   assert.deepEqual(result.reportManagers.map(manager => manager.name), ['当期任职']);
   assert.equal(result.managerAttribution, 'tenure-overlap');
-  const explicit = analyzeFund(fund([report({ managers: [{ name: '报告披露' }] })], { managers }), options());
+  const explicit = analyzeFund(fund([report({ managers: [{ name: '报告披露', startDate: '2026-04-01', endDate: null,
+    role: '本基金基金经理', periodStart: '2026-04-01', periodEnd: '2026-06-30', evidence: {
+      sourceUrl: 'https://example.org/report.pdf', page: 5, pages: [5], tablePage: 5, section: '4.1',
+      text: '报告披露 本基金基金经理 2026年4月1日 -', method: 'explicit-report-manager-table', periodEnd: '2026-06-30' } }] })], { managers }), options());
   assert.deepEqual(explicit.reportManagers.map(manager => manager.name), ['报告披露']);
   assert.equal(explicit.managerAttribution, 'report');
   assert.equal(explicit.managerSourceUrl, 'https://example.org/report.pdf');

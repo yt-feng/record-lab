@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 spec = importlib.util.spec_from_file_location("traversal", Path(__file__).parents[1] / "scripts/traversal.py")
 traversal = importlib.util.module_from_spec(spec)
@@ -37,6 +40,32 @@ def event(code="000001", status="complete", at="2026-09-29T11:00:00Z", company="
 
 
 class TraversalTests(unittest.TestCase):
+    def test_terminated_fund_retains_full_proof_and_separate_counts_on_replay(self):
+        proof = json.loads((Path(__file__).parent / 'fixtures/lifecycle.json').read_text())
+        config = {**CONFIG, 'requireReportQuality': True, 'funds': [{'code': '000001', 'companyCode': 'co1'}]}
+        snapshot = {'schemaVersion': 1, 'sourceMode': 'actions', 'batchResults': [{'code': '000001', 'status': 'not-applicable'}],
+                    'funds': [{'code': '000001', 'status': 'unavailable', 'dataStatus': 'fresh', 'retrievedAt': '2026-09-29T10:00:00Z',
+                               'selectedReport': None, 'rows': [], 'notApplicableEvidence': proof}]}
+        status = traversal.build_status(config, snapshot, NOW)
+        self.assertTrue(traversal.valid_status(status, config, NOW))
+        progress = traversal.merge_progress(catalog(), None, config, [status], NOW)
+        self.assertEqual(progress['notApplicableFunds'], 1)
+        self.assertEqual(progress['terminatedBeforePeriodFunds'], 1)
+        self.assertEqual(progress['establishedAfterPeriodFunds'], 0)
+        self.assertEqual(progress['companies'][0]['terminatedBeforePeriod'], 1)
+        self.assertEqual(progress['processedFunds'], 0)
+        self.assertEqual(progress['research']['completeFunds'], 0)
+        self.assertEqual(progress['research']['applicableFunds'], 2)
+        self.assertEqual(progress['totalFunds'], 3)
+        replay = traversal.merge_progress(catalog(), progress, config, [], NOW)
+        self.assertEqual(replay['funds'][0]['notApplicableEvidence'], proof)
+        self.assertEqual(replay['completionAudit']['sourceCoverage']['terminatedBeforePeriodFunds'], 1)
+        q3 = {**config, 'targetPeriodEnd': '2026-09-30', 'baselinePeriodEnd': '2026-06-30'}
+        self.assertFalse(traversal.valid_not_applicable(proof, '000001', traversal.phase_for(q3), traversal.utc_now(NOW)))
+        invalid = json.loads(json.dumps(snapshot))
+        invalid['funds'][0]['notApplicableEvidence']['sourceTextHash'] = None
+        self.assertEqual(traversal.build_status(config, invalid, NOW)['funds'][0]['status'], 'failed')
+
     def coverage(self, available=0):
         stocks = [{"stockCode": "600001", "market": "CN"}, {"stockCode": "600002", "market": "CN"}]
         return {"holdingCount": 2, "priceAvailable": available, "missingStocks": stocks[available:],
@@ -45,6 +74,11 @@ class TraversalTests(unittest.TestCase):
     def retained_fund(self):
         return {"code": "000001", "companyId": "co1", "status": "ok", "dataStatus": "fresh",
                 "retrievedAt": "2026-09-29T10:00:00Z", "shareClassCodes": ["000001"],
+                "managerAttribution": "report", "managerSourceUrl": "https://example.org/manager-report.pdf",
+                "reportManagers": [{"name": "张甲", "role": "基金经理", "startDate": "2020-01-01", "endDate": None,
+                    "periodStart": "2026-04-01", "periodEnd": "2026-06-30", "evidence": {
+                        "sourceUrl": "https://example.org/manager-report.pdf", "page": 3, "pages": [3], "tablePage": 3,
+                        "section": "4.1.2", "text": "张甲 基金经理 2020年1月1日 -", "method": "explicit-report-manager-table", "periodEnd": "2026-06-30"}}],
                 "selectedReport": {**evidence(), "fundCode": "000001", "navYuan": 1000,
                     "parseMethod": "pypdf", "sourceTextHash": "a" * 64,
                     "pageStats": {"pageCount": 10, "totalPages": 10, "processedPages": 10,
@@ -68,7 +102,7 @@ class TraversalTests(unittest.TestCase):
         fund["rows"][0]["priceRange"]["priceBasis"] = "adjusted"
         fields = traversal.report_quality(fund, PHASE, traversal.utc_now(NOW))["fields"]
         self.assertEqual(fields, {"holdings": "complete", "pdf": "truncated", "strategy": "wrong-period", "nav": "missing",
-                                  "baseline": "missing", "prices": "missing"})
+                                  "baseline": "missing", "prices": "missing", "managers": "complete"})
 
     def test_legacy_pdf_stats_do_not_prove_complete_extraction(self):
         fund = self.retained_fund()
@@ -111,6 +145,7 @@ class TraversalTests(unittest.TestCase):
         for minute in (10, 20, 30):
             retry = event(status="failed", at=f"2026-09-29T11:{minute:02}:00Z")
             retry["funds"][0]["qualityAttempt"] = True
+            retry["funds"][0]["managerAttempt"] = False
             progress = traversal.merge_progress(catalog(), progress, config, [retry], now=NOW)
             replay = traversal.merge_progress(catalog(), progress, config, [retry], now=NOW)
             self.assertEqual(progress["funds"][0]["quality"]["attempts"], replay["funds"][0]["quality"]["attempts"])

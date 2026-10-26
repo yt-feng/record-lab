@@ -18,7 +18,7 @@ Actions writes `analysis.json`, bounded `analysis/details-*.json` partitions, an
 
 When an individual company directory refresh fails, its previously verified ownership remains explicitly cached with the original verification date. The fresh master-directory date does not imply that cached company ownership was rechecked; historical product codes remain available and unmapped products can still be collected by code.
 
-Holdings collection and research completeness are separate counts. Research coverage checks the disclosed holdings table, PDF text, quarter-specific strategy, NAV, the exact comparison quarter, and price coverage. Missing fields remain visible and enter a bounded repair queue. Exhausted retries mean an incomplete result, even if the workflow itself succeeds. All product codes are attempted, including products whose company mapping is not yet resolved.
+Holdings collection and research completeness are separate counts. Seven-field research coverage checks the disclosed holdings table, PDF text, quarter-specific strategy, NAV, the exact comparison quarter, price coverage, and report-manager table evidence. The earlier six-field count remains separately available for comparison. Current profile names and inferred tenure overlap do not satisfy the report-manager requirement; older completed records enter an independent manager backfill budget. Missing fields remain visible and enter a bounded repair queue. Exhausted retries mean an incomplete result, even if the workflow itself succeeds. All product codes are attempted, including products whose company mapping is not yet resolved.
 
 Each collection wave can schedule 16 batches of 75 products per quarter, with at most 16 batch jobs running concurrently and two collection workers per job. New products, report repairs, source retries, and price repairs receive separate capacity so missing-source work cannot indefinitely block PDF and strategy completion. Where every queue has work, ten slots allocate six new products, two report repairs, one source retry, and one price repair; unused slots move to other queues. Per-product attempt limits still apply. This is task capacity, not a promise that every request will succeed or every report has been published.
 
@@ -26,7 +26,9 @@ A product that did not start before a batch's time budget ended is deferred, pre
 
 The configured Q3 follow-up window ends on **30 November 2026**. This is an operational collection window, not a statutory report-disclosure deadline. Reaching it does not convert missing data into a complete result.
 
-Products with an explicitly sourced inception date after the target quarter are shown separately as not applicable. They do not count as holdings, no-equity observations, or completed research; the research denominator excludes only these proven exemptions.
+Products with an explicitly sourced inception date after the target quarter, or an unconditionally confirmed termination before it, are shown separately as not applicable to the quarter-end snapshot. Termination requires dated original-PDF identity and event evidence; missing reports, possible termination and distributor-service changes are insufficient. All codes remain in the catalog. These exemptions do not count as holdings, no-equity observations, or completed research, and do not erase activity earlier in the quarter.
+
+QDII tables use bounded PDF cell geometry when ordinary text order cannot preserve rows. Complete proofs require closed section boundaries, all rank groups and security rows, verified units, and no excluded cells; multiple securities can share one issuer rank. US price observations retain USD while disclosed position values remain CNY. A dated balance-sheet row explicitly reporting zero current and prior stock-investment amounts is labeled as zero book value, rather than a claim about trades during the quarter.
 
 ## Development
 

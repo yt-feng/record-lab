@@ -329,6 +329,9 @@ def _details_for_pages(pages: list[str], source_url: str, period_end: str, kind:
     parsed = dict(parse_pages(pages, source_url, period_end, kind))
     if enrich_pages:
         parsed.update(dict(enrich_pages(pages)))
+    from report_managers import parse_report_managers
+    parsed["reportManagers"] = parse_report_managers(pages,
+        {"sourceUrl": source_url, "periodEnd": period_end, "kind": kind}, page_numbers=page_numbers)
     # The common parser uses block ordinals. Map them to verified PDF pages,
     # including explicit unknowns for unpaginated MinerU markdown.
     if page_numbers is not None:

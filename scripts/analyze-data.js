@@ -7,6 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { compareHolding, estimatePosition, normalizeHolding, validDate } = require('../lib/fund-analysis');
 const { publicUrl, isValidNotApplicable } = require('./build-data');
+const { normalizeManagers, verifiedReportManagers, overlaps: managerOverlaps } = require('../lib/report-managers');
 
 const CODE = /^\d{6}$/;
 const COMPANY_PATH = /^\.\/data\/companies\/[A-Za-z0-9_-]{1,64}\.json$/;
@@ -65,17 +66,15 @@ function strategyFor(fund, phase) {
 }
 
 function managersFor(fund, phase) {
-  const clean = list => (Array.isArray(list) ? list : []).filter(item => item && text(item.name))
-    .slice(0, 50).map(item => ({ name: text(item.name, 100),
-      startDate: validDate(item.startDate) ? item.startDate : null, endDate: validDate(item.endDate) ? item.endDate : null }));
-  const managers = clean(fund.managers);
-  let reportManagers = clean(fund.reportManagers), attribution = fund.managerAttribution;
-  if (attribution === 'tenure-overlap') reportManagers = reportManagers.filter(item => item.startDate
-    && item.startDate <= phase.target && (!item.endDate || item.endDate >= phase.start));
-  else if (attribution !== 'report') reportManagers = [];
-  if (!reportManagers.length) attribution = 'current-profile';
+  const managers = normalizeManagers(fund.managers);
+  const verified = verifiedReportManagers(fund.reportManagers, phase.start, phase.target);
+  let reportManagers = verified.length ? verified : normalizeManagers(fund.managerAttribution === 'tenure-overlap'
+    ? fund.reportManagers : fund.managers).filter(item => managerOverlaps(item, phase.start, phase.target));
+  const attribution = verified.length ? 'report' : reportManagers.length ? 'tenure-overlap' : 'current-profile';
   return { managers, reportManagers, managerAttribution: attribution,
-    managerSourceUrl: publicUrl(fund.managerSourceUrl) ? fund.managerSourceUrl : null,
+    managerEvidenceStatus: verified.length ? 'available' : 'missing',
+    managerSourceUrl: verified.length ? verified[0].evidence.sourceUrl : publicUrl(fund.managerSourceUrl) ? fund.managerSourceUrl : null,
+    managerEvidenceRetrievedAt: stamp(fund.managerEvidenceRetrievedAt) ? fund.managerEvidenceRetrievedAt : null,
     managersAsOf: validDate(fund.managersAsOf) ? fund.managersAsOf : null };
 }
 
@@ -160,7 +159,7 @@ function emptyStock(row, phase) {
     priceRange: { status: 'missing', low: null, high: null, currency: row.currency, rangeStart: phase.start,
       rangeEnd: phase.target, observedCount: 0, completeness: 'not-verified', isCost: false,
       actualCostKnown: false, sourceUrls: [], sourceCount: 0, sourceUrlsTruncated: false, conflictingObservations: false },
-    details: [], _contributions: [], _reportManagers: new Set(), _currentManagers: new Set(),
+    details: [], _contributions: [], _reportManagers: new Set(), _currentManagers: new Set(), _tenureManagers: new Set(),
     _priceSources: new Set(), _prices: new Set() };
 }
 
@@ -251,7 +250,8 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
       const seenStocks = new Set(); let hasCurrent = false;
       for (const row of Array.isArray(fund.rows) ? fund.rows : []) {
         if (!row || !((row.market === 'CN' && CODE.test(row.stockCode) && row.currency === 'CNY')
-          || (row.market === 'HK' && /^\d{5}$/.test(row.stockCode) && row.currency === 'HKD'))) { invalidRows++; continue; }
+          || (row.market === 'HK' && /^\d{5}$/.test(row.stockCode) && row.currency === 'HKD')
+          || (row.market === 'US' && /^[A-Z][A-Z0-9]{0,9}(?:\.[A-Z0-9]{1,3})?$/.test(row.stockCode) && row.currency === 'USD'))) { invalidRows++; continue; }
         const key = `${row.market}:${row.stockCode}`;
         if (seenStocks.has(key)) { invalidRows++; continue; }
         seenStocks.add(key);
@@ -266,7 +266,8 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
         if (current) {
           hasCurrent = true; stock.currentPortfolioCount++;
           stock.identityUnresolvedCount += Number(!identity.aggregationEligible);
-          for (const manager of managers.reportManagers) stock._reportManagers.add(`${identity.companyId}:${manager.name}`);
+          for (const manager of managers.reportManagers) (managers.managerAttribution === 'report'
+            ? stock._reportManagers : stock._tenureManagers).add(`${identity.companyId}:${manager.name}`);
           if (!managers.reportManagers.length) for (const manager of managers.managers) stock._currentManagers.add(`${identity.companyId}:${manager.name}`);
           if (identity.aggregationEligible) {
             stock.aggregationEligiblePortfolioCount++;
@@ -313,6 +314,7 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
     (file, items) => { for (const item of items) if (!stocks.get(item.key).details.includes(file)) stocks.get(item.key).details.push(file); });
   for (const stock of ordered) {
     stock.reportManagerCount = stock._reportManagers.size;
+    stock.tenureOverlapManagerCount = stock._tenureManagers.size;
     stock.currentProfileManagerCount = stock._currentManagers.size;
     stock.priceRange.sourceUrls = [...stock._priceSources].sort().slice(0, 8);
     stock.priceRange.sourceCount = stock._priceSources.size;
@@ -327,7 +329,9 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
     stockCount: ordered.length, contributionCount: ordered.reduce((sum, stock) => sum + Object.values(stock.changes).reduce((a, b) => a + b, 0), 0),
     identityUnresolvedRecords: unknownIdentityRecords, identityUnresolvedHoldingRecords: unknownIdentityHoldingRecords,
     identityConflictGroups: conflicts, invalidRows, strategyRecords, observedPriceRows: priceRows,
-    reportManagerRecords: portfolios.filter(item => item.reportManagers.length > 0).length,
+    reportManagerRecords: portfolios.filter(item => item.managerAttribution === 'report' && item.reportManagers.length > 0).length,
+    tenureOverlapManagerRecords: portfolios.filter(item => item.managerAttribution === 'tenure-overlap').length,
+    managerEvidenceMissingRecords: portfolios.filter(item => item.managerEvidenceStatus !== 'available').length,
     currentProfileOnlyManagerRecords: portfolios.filter(item => !item.reportManagers.length && item.managers.length > 0).length,
     sourceCatalogShareCodes: manifest.coverage?.catalogFundCount ?? null,
     sourceProcessedShareCodes: progress?.processedFunds ?? null, sourceResearchCompleteShareCodes: research?.completeFunds ?? null,
@@ -335,12 +339,13 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
     sourceCompletionStatus: progress?.completionStatus || 'unknown',
     valueAggregationScope: 'source-verified-portfolios-only', holdingsScope: 'disclosed-holdings-only',
     recordCountScope: 'proven-portfolios-and-unresolved-fund-records', strategyScope: 'report-level-original-excerpts',
-    changeCountsScope: 'record-level-disclosure-changes-not-trades', actualCostsKnown: false };
+    changeCountsScope: 'record-level-disclosure-changes-not-trades',
+    managerEvidenceScope: 'validated-report-table-extracts-not-verified-entire-table', actualCostsKnown: false };
   if (progress?.completionStatus === 'complete' && Number.isInteger(research?.completeFunds)
     && Number.isInteger(research?.applicableFunds) && research.completeFunds === research.applicableFunds
-    && !unknownIdentityHoldingRecords && !conflicts && !invalidRows && !reportOnlyRecords
+    && !unknownIdentityHoldingRecords && !conflicts && !invalidRows && !reportOnlyRecords && !coverage.managerEvidenceMissingRecords
     && inputRecords === manifest.coverage?.fundCount) { coverage.status = 'complete'; coverage.complete = true; }
-  const output = { schemaVersion: 1, kind: 'quarter-analysis', targetPeriodEnd: phase.target, baselinePeriodEnd: phase.baseline,
+  const output = { schemaVersion: 1, analysisVersion: 2, kind: 'quarter-analysis', targetPeriodEnd: phase.target, baselinePeriodEnd: phase.baseline,
     asOf: manifest.asOf, retrievedAt: manifest.retrievedAt, generatedAt: phase.generation, generation: phase.generation, coverage,
     stocks: ordered, portfolioFiles,
     themes: [...themes.values()].map(item => ({ ...item, recordCount: item.portfolioIds.length,

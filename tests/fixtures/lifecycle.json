@@ -1,0 +1,54 @@
+{
+  "reason": "TERMINATED_BEFORE_PERIOD",
+  "fundCode": "000001",
+  "periodEnd": "2026-06-30",
+  "date": "2026-05-07",
+  "dateBasis": "lastOperationDate",
+  "sourceUrl": "https://example.org/fund-exit.pdf",
+  "publishedAt": "2026-05-08",
+  "eventType": "termination",
+  "terminationConfirmed": true,
+  "identityFundCodes": [
+    "000001",
+    "000002"
+  ],
+  "lastOperationDate": "2026-05-07",
+  "terminationDate": null,
+  "liquidationStartDate": "2026-05-08",
+  "finalLiquidationEnd": null,
+  "finalLiquidationEndBasis": null,
+  "page": 1,
+  "quote": "2026年5月7日触发约定情形，本基金基金合同自动终止。",
+  "evidence": [
+    {
+      "field": "terminationConfirmed",
+      "page": 1,
+      "quote": "2026年5月7日触发约定情形，本基金基金合同自动终止。"
+    },
+    {
+      "field": "lastOperationDate",
+      "page": 1,
+      "quote": "本基金的最后运作日为2026年5月7日"
+    },
+    {
+      "field": "liquidationStartDate",
+      "page": 1,
+      "quote": "自2026年5月8日起，本基金进入基金财产清算程序"
+    },
+    {
+      "field": "identityFundCodes",
+      "page": 1,
+      "quote": "基金份额代码：000001"
+    },
+    {
+      "field": "identityFundCodes",
+      "page": 1,
+      "quote": "基金份额代码：000002"
+    }
+  ],
+  "sourceTextHash": "b9e5cd2b1e80b6384d8138fae9ddc9c7a1e7c99accd7a7cee1aa0098ff56cbae",
+  "parseMethod": "pypdf",
+  "pageNumbersVerified": true,
+  "totalPages": 1,
+  "scope": "quarter-end-applicability-only"
+}

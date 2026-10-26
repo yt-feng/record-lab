@@ -84,12 +84,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          sparse-checkout-cone-mode: false
           sparse-checkout: |
-            scripts
-            lib
-            config
-            tests
-            .github
+            /*
+            !/*/
+            /scripts/
+            /lib/
+            /config/
+            /tests/
+            /.github/
+            /web/*.js
       - uses: actions/setup-node@v4
         with:
           node-version: '22'

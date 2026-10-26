@@ -31,7 +31,7 @@ def quarter_config(base, quarter, as_of):
         raise ValueError('INVALID_AS_OF')
     return {**base, 'funds': [], 'quarter': quarter, 'asOf': as_of,
             'targetPeriodEnd': target, 'baselinePeriodEnd': baseline,
-            'collectorVersion': 4, 'requireReportQuality': True,
+            'collectorVersion': 5, 'requireReportQuality': True,
             'retryPolicy': {'dailyUntil': '2026-11-30' if quarter == '2026Q3' else None,
                             'intervalDays': 7, 'maxScheduledCycles': 4},
             'scope': f'{quarter} 全目录产品与报告逐项补齐'}

@@ -11,6 +11,7 @@ import re
 import time
 
 from providers import DataError, PublicProvider, HOLDINGS_TOPLINE
+from lifecycle import normalize_lifecycle_evidence, should_check_lifecycle
 
 
 def safe_error(code, stage, error):
@@ -25,7 +26,8 @@ def pdf_holdings_evidence(details, document, holdings):
     meta = details.get("pdfHoldingsMetadata")
     if not isinstance(meta, dict) or not holdings:
         return None
-    stats = details.get("pageStats") or {}
+    extraction = details.get("pdfHoldingsExtraction") or details
+    stats = extraction.get("pageStats") or {}
     count = lambda value: isinstance(value, int) and not isinstance(value, bool) and value >= 0
     total, processed = stats.get("totalPages"), stats.get("processedPages")
     start, end = meta.get("startPage"), meta.get("endPage")
@@ -34,25 +36,28 @@ def pdf_holdings_evidence(details, document, holdings):
                       and re.fullmatch(r"\d+(?:\.\d+){1,2}", section)
                       and re.fullmatch(r"\d+(?:\.\d+){1,2}", following)
                       and tuple(map(int, following.split('.'))) > tuple(map(int, section.split('.'))))
+    rank_count = meta.get("rankGroups") if meta.get("rankMode") == "pdf-cells" else len(holdings)
     complete = bool(meta.get("complete") is True and meta.get("sectionBounded") is True
                     and sections_valid and meta.get("contiguousRanks") is True and meta.get("unitsVerified") is True
                     and meta.get("coverage") in {"full", "top10"}
                     and count(meta.get("rowsSeen")) and meta["rowsSeen"] == len(holdings)
                     and count(meta.get("parsedRows")) and meta["parsedRows"] == len(holdings)
                     and type(meta.get("excludedRows")) is int and meta["excludedRows"] == 0
-                    and (meta["coverage"] != "top10" or len(holdings) <= 10)
+                    and (meta["coverage"] != "top10" or count(rank_count) and 1 <= rank_count <= 10)
                     and count(total) and total > 0 and count(processed) and processed == total
                     and count(stats.get("pageCount")) and stats["pageCount"] == total
                     and stats.get("truncated") is False and stats.get("pageNumbersVerified") is True
                     and count(start) and count(end) and 1 <= start <= end <= total
-                    and details.get("parseMethod") in {"pypdf", "pypdf-fallback"}
-                    and re.fullmatch(r"[a-f0-9]{64}", str(details.get("sourceTextHash", ""))))
+                    and extraction.get("parseMethod") in {"pypdf", "pypdf-fallback"}
+                    and re.fullmatch(r"[a-f0-9]{64}", str(extraction.get("sourceTextHash", ""))))
     return {**{key: meta.get(key) for key in ("coverage", "sectionNumber", "nextSectionNumber", "sectionBounded",
                                             "startPage", "endPage", "rowsSeen", "parsedRows", "excludedRows",
                                             "contiguousRanks", "unitsVerified")},
+            **({key: meta.get(key) for key in ("rankMode", "rankGroups", "mergedSecurityRows", "continuedRows", "marketValueCurrency")}
+               if meta.get("rankMode") == "pdf-cells" else {}),
             "complete": complete, "sourceUrl": document["sourceUrl"], "periodEnd": document["periodEnd"],
             "kind": document["kind"], "publishedAt": document["publishedAt"],
-            "sourceTextHash": details.get("sourceTextHash"), "parseMethod": details.get("parseMethod"),
+            "sourceTextHash": extraction.get("sourceTextHash"), "parseMethod": extraction.get("parseMethod"),
             "totalPages": total, "processedPages": processed,
             "documentTruncated": stats.get("truncated"), "pageNumbersVerified": stats.get("pageNumbersVerified")}
 
@@ -79,6 +84,23 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
     # A later deadline cannot erase an actual source attempt or its failure.
     fund["collectionAttempt"] = {"attempted": True}
     source = provider or PublicProvider()
+    def check_missing_target_lifecycle():
+        if not should_check_lifecycle(target_period, as_of) or not callable(getattr(source, "lifecycle_evidence", None)) or expired():
+            return False
+        try:
+            outcome = source.lifecycle_evidence(code, target_period, as_of, deadline=deadline)
+            if not isinstance(outcome, dict):
+                raise DataError("LIFECYCLE_PARSE_FAILED")
+            for diagnostic in outcome.get("diagnostics", []):
+                if isinstance(diagnostic, dict) and re.fullmatch(r"[A-Z_]+", str(diagnostic.get("errorCode", ""))):
+                    errors.append({"code": code, "stage": "lifecycle", "errorCode": diagnostic["errorCode"]})
+            evidence = normalize_lifecycle_evidence(outcome.get("notApplicableEvidence"), code, target_period, as_of)
+            if evidence:
+                fund["notApplicableEvidence"] = evidence
+                return True
+        except Exception as error:
+            errors.append(safe_error(code, "lifecycle", error))
+        return False
     overview = {}
     try:
         overview = source.overview(code)
@@ -103,12 +125,16 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         if not reports:
             raise DataError("NO_REPORTS")
     except Exception as error:
+        if isinstance(error, DataError) and error.code == "NO_REPORTS" and check_missing_target_lifecycle():
+            return fund, errors
         errors.append(safe_error(code, "announcements", error))
         return fund, errors
     allowed_periods = {p for p in (target_period, baseline_period) if p}
     if allowed_periods:
         reports = [r for r in reports if r["periodEnd"] in allowed_periods]
     if not any(not target_period or r["periodEnd"] == target_period for r in reports):
+        if check_missing_target_lifecycle():
+            return fund, errors
         errors.append({"code": code, "stage": "target-report", "errorCode": "TARGET_REPORT_UNAVAILABLE"})
         return fund, errors
     snapshots = {}
@@ -134,6 +160,10 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
 
     def attach_details(report, details, document):
         report.update({key: details.get(key) for key in ("navYuan", "narrative")})
+        if details.get("reportManagers"):
+            report["managers"] = details["reportManagers"]
+            report["managerSourceUrl"] = document["sourceUrl"]
+            report["managerEvidenceRetrievedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
         for key in extraction_keys:
             if key in details:
                 report[key] = details[key]
@@ -182,7 +212,7 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
             proven_complete = bool(stock_proof and stock_proof["complete"])
             # Prefer a larger disclosed PDF table when all old securities remain
             # represented; otherwise retain the structured table and its source.
-            if pdf_holdings and (not holdings or {h["stockCode"] for h in holdings}.issubset({h["stockCode"] for h in pdf_holdings})
+            if pdf_holdings and (not holdings or {(h["market"], h["stockCode"]) for h in holdings}.issubset({(h["market"], h["stockCode"]) for h in pdf_holdings})
                                  and (len(pdf_holdings) > len(holdings) or proven_complete and
                                       (report["holdingsPossiblyTruncated"] or report["holdingsIncomplete"]
                                        or report["coverage"] != stock_proof["coverage"]))):
@@ -190,7 +220,8 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
                 excluded = getattr(pdf_holdings, "excluded_rows", 0)
                 excluded = 0 if proven_complete else max(excluded, report["holdingsExcludedRowCount"])
                 report.update({"holdings": holdings, "coverage": stock_proof["coverage"] if proven_complete else "unknown",
-                               "holdingsSourceUrl": selected["sourceUrl"], "holdingsRetrieval": "pdf-stock-table-text",
+                               "holdingsSourceUrl": selected["sourceUrl"],
+                               "holdingsRetrieval": "pdf-stock-table-cells" if stock_proof and stock_proof.get("rankMode") == "pdf-cells" else "pdf-stock-table-text",
                                "holdingsPossiblyTruncated": not proven_complete,
                                "holdingsIncomplete": excluded > 0, "holdingsExcludedRowCount": excluded,
                                "holdingsIncompleteReason": "UNSUPPORTED_OR_INVALID_SECURITY_ROWS" if excluded else None})
@@ -222,6 +253,10 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
                 if not identity_matches(quarter_details):
                     raise DataError("REPORT_IDENTITY_MISMATCH")
                 report["narrative"] = quarter_details.get("narrative")
+                if quarter_details.get("reportManagers"):
+                    report["managers"] = quarter_details["reportManagers"]
+                    report["managerSourceUrl"] = quarterly["sourceUrl"]
+                    report["managerEvidenceRetrievedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
                 if report["narrative"]:
                     report["narrative"]["reportKind"] = "quarterly"
                 for key in extraction_keys:

@@ -1,0 +1,11 @@
+{
+  "confirmed": true,
+  "evidenceType": "zero-stock-balance-sheet",
+  "sourceUrl": "https://example.org/report.pdf",
+  "periodEnd": "2026-06-30",
+  "publishedAt": "2026-08-31",
+  "kind": "semiannual",
+  "title": "合成基金中期报告",
+  "page": 14,
+  "text": "6.1 资产负债表\n会计主体：合成基金\n报告截止日：2026年6月30日\n单位：人民币元\n资产 附注号 本期末\n2026年6月30日\n上年度末\n2025年12月31日\n货币资金 6.4.7.1 10,000.00 20,000.00\n交易性金融资产 6.4.7.2 30,000.00 40,000.00\n其中：股票投资 - -"
+}

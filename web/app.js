@@ -1,9 +1,10 @@
 (function (root, factory) {
   'use strict';
-  const api = factory();
+  const api = factory(typeof module === 'object' && module.exports ? require('./lifecycle') : root.RecordLabLifecycle,
+    typeof module === 'object' && module.exports ? require('./zero-stock') : root.RecordLabZeroStock);
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root && root.document) api.mount(root.document, root);
-})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (lifecycle, zeroStock) {
   'use strict';
 
   const CHANGE_GROUPS = {
@@ -121,8 +122,17 @@
     if (!research || research.enabled !== true) return null;
     const notApplicableFunds = countValue(progress.notApplicableFunds) ? progress.notApplicableFunds : 0;
     return { ...research, totalFunds: progress.totalFunds, applicableFunds: progress.totalFunds - notApplicableFunds,
-      notApplicableFunds, completionStatus: progress.completionStatus || 'incomplete-running',
+      notApplicableFunds, ...notApplicableBreakdown(progress), completionStatus: progress.completionStatus || 'incomplete-running',
       nextRetryAt: progress.nextRetryAt || null, continueRun: progress.continueRun };
+  }
+  function notApplicableBreakdown(progress) {
+    const rows = progress?.funds || [];
+    const count = reason => rows.filter(row => row.status === 'not-applicable' && row.notApplicableEvidence?.reason === reason).length;
+    const establishedAfterPeriodFunds = countValue(progress?.establishedAfterPeriodFunds) ? progress.establishedAfterPeriodFunds : count('ESTABLISHED_AFTER_PERIOD');
+    const terminatedBeforePeriodFunds = countValue(progress?.terminatedBeforePeriodFunds) ? progress.terminatedBeforePeriodFunds : count('TERMINATED_BEFORE_PERIOD');
+    const total = progress?.notApplicableFunds ?? rows.filter(row => row.status === 'not-applicable').length;
+    return { establishedAfterPeriodFunds, terminatedBeforePeriodFunds,
+      otherNotApplicableFunds: Math.max(0, total - establishedAfterPeriodFunds - terminatedBeforePeriodFunds) };
   }
   function formatRetryAt(value) {
     if (!validTimestamp(value)) return '时间待核验';
@@ -152,12 +162,15 @@
     } catch (_) { return null; }
   }
   function validEmptyStockEvidence(evidence, report, asOf) {
-    if (!isRecord(evidence) || evidence.evidenceType !== 'empty-stock-detail-section' || !isRecord(report) ||
-      evidence.confirmed !== true || !['quarterly', 'semiannual'].includes(evidence.kind) || evidence.kind !== report.kind ||
-      typeof evidence.text !== 'string' || evidence.text.length > 600 || typeof evidence.assetAllocationText !== 'string' || evidence.assetAllocationText.length > 600 ||
+    if (!isRecord(evidence) || !['empty-stock-detail-section', 'zero-stock-balance-sheet', 'explicit-no-stock-detail'].includes(evidence.evidenceType) || !isRecord(report) ||
+      evidence.confirmed !== true || !['quarterly', 'semiannual', 'annual'].includes(evidence.kind) || evidence.kind !== report.kind ||
+      typeof evidence.text !== 'string' || evidence.text.length > 600 ||
       !Number.isInteger(evidence.page) || evidence.page < 1 || !safeHttpUrl(evidence.sourceUrl) ||
       evidence.sourceUrl !== report.sourceUrl || evidence.periodEnd !== report.periodEnd || evidence.publishedAt !== report.publishedAt ||
       !dateOnly(evidence.periodEnd) || !dateOnly(evidence.publishedAt) || !dateOnly(asOf) || evidence.periodEnd > evidence.publishedAt || evidence.publishedAt > asOf) return false;
+    if (evidence.evidenceType === 'zero-stock-balance-sheet') return zeroStock?.validZeroStock(evidence) === true;
+    if (evidence.evidenceType === 'explicit-no-stock-detail') return zeroStock?.validExplicitNoStock(evidence) === true;
+    if (typeof evidence.assetAllocationText !== 'string' || evidence.assetAllocationText.length > 600) return false;
     const excerpt = evidence.text.replace(/\s+/g, '');
     const zero = '(?:[-—－–]|0(?:\\.0+)?)';
     const allocation = evidence.assetAllocationText.trim().split(/\r?\n/).map(line => line.trim()).filter(Boolean);
@@ -202,7 +215,7 @@
       if (fund.status === 'no-equities') {
         const evidence = fund.noEquitiesEvidence || fund.selectedReport?.noEquitiesEvidence;
         if (!isRecord(evidence) || evidence.confirmed !== true || !safeHttpUrl(evidence.sourceUrl) || evidence.periodEnd !== fund.selectedReport.periodEnd || fund.rows.length) fail();
-        if (evidence.evidenceType === 'empty-stock-detail-section') {
+        if (['empty-stock-detail-section', 'zero-stock-balance-sheet', 'explicit-no-stock-detail'].includes(evidence.evidenceType)) {
           if (!validEmptyStockEvidence(evidence, fund.selectedReport, data.asOf)) fail();
         } else {
           const text = typeof evidence.text === 'string' ? evidence.text.replace(/\s+/g, '') : '';
@@ -212,9 +225,11 @@
       }
       if (fund.notApplicableEvidence != null) {
         const evidence = fund.notApplicableEvidence;
-        if (!isRecord(evidence) || fund.status !== 'unavailable' || fund.selectedReport !== null || fund.rows.length ||
-          evidence.reason !== 'ESTABLISHED_AFTER_PERIOD' || !dateOnly(evidence.date) || !dateOnly(evidence.periodEnd) ||
-          evidence.date <= evidence.periodEnd || evidence.fundCode !== fund.code || !safeHttpUrl(evidence.sourceUrl)) fail();
+        const closed = evidence?.reason === 'TERMINATED_BEFORE_PERIOD' && lifecycle?.normalizeLifecycleEvidence(evidence,
+          { code: fund.code, periodEnd: data.targetPeriodEnd || data.coverage.targetPeriodEnd || evidence.periodEnd, asOf: fund.asOf || data.asOf });
+        const founded = evidence?.reason === 'ESTABLISHED_AFTER_PERIOD' && dateOnly(evidence.date) && dateOnly(evidence.periodEnd)
+          && evidence.date > evidence.periodEnd && evidence.date <= data.asOf && evidence.fundCode === fund.code && safeHttpUrl(evidence.sourceUrl);
+        if (!isRecord(evidence) || fund.status !== 'unavailable' || fund.selectedReport !== null || fund.rows.length || (!closed && !founded)) fail();
       }
       if (fund.previousReport && (!isRecord(fund.previousReport) || !dateOnly(fund.previousReport.periodEnd))) fail();
       if (fund.narrative && (!isRecord(fund.narrative) || !nullableText(fund.narrative.text))) fail();
@@ -269,6 +284,8 @@
       ['totalCompanies', 'totalFunds', 'processedFunds', 'completedCompanies', 'pendingFunds'].some(key => !countValue(data[key]))) fail();
     if (data.completedCompanies > data.totalCompanies || data.processedFunds > data.totalFunds || data.pendingFunds > data.totalFunds) fail();
     if (data.notApplicableFunds != null && (!countValue(data.notApplicableFunds) || data.notApplicableFunds + data.processedFunds > data.totalFunds)) fail();
+    for (const key of ['establishedAfterPeriodFunds', 'terminatedBeforePeriodFunds']) if (data[key] != null && (!countValue(data[key]) || data[key] > (data.notApplicableFunds || 0))) fail();
+    if ((data.establishedAfterPeriodFunds || 0) + (data.terminatedBeforePeriodFunds || 0) > (data.notApplicableFunds || 0)) fail();
     if (data.deferredFunds != null && (!countValue(data.deferredFunds) || data.deferredFunds > data.totalFunds)) fail();
     for (const key of ['nextRetryAt', 'directoryNextRetryAt']) if (data[key] != null && !validTimestamp(data[key])) fail();
     if (data.research != null) {
@@ -284,6 +301,8 @@
       if (!isRecord(company) || typeof company.code !== 'string' || typeof company.name !== 'string' ||
         !(company.totalFunds === null || countValue(company.totalFunds)) || ['processedFunds', 'withHoldings', 'withoutEquities', 'failed', 'pending'].some(key => !countValue(company[key])) || companies.has(company.code)) fail();
       if (company.notApplicable != null && !countValue(company.notApplicable)) fail();
+      for (const key of ['establishedAfterPeriod', 'terminatedBeforePeriod']) if (company[key] != null && (!countValue(company[key]) || company[key] > (company.notApplicable || 0))) fail();
+      if ((company.establishedAfterPeriod || 0) + (company.terminatedBeforePeriod || 0) > (company.notApplicable || 0)) fail();
       if (company.deferredFunds != null && !countValue(company.deferredFunds)) fail();
       companies.add(company.code);
     }
@@ -324,10 +343,15 @@
     return (catalog?.companies || progress?.companies || []).filter(company =>
       tokens.every(token => `${company.code} ${company.name}`.toLocaleLowerCase().includes(token))).map(company => {
       const entry = progressMap.get(company.code);
+      const exemptions = notApplicableBreakdown({ notApplicableFunds: entry?.notApplicable,
+        establishedAfterPeriodFunds: entry?.establishedAfterPeriod, terminatedBeforePeriodFunds: entry?.terminatedBeforePeriod,
+        funds: (progress?.funds || []).filter(fund => fund.companyCode === company.code) });
       return { ...company, totalFunds: company.fundCount ?? company.totalFunds ?? null,
         processedFunds: entry?.processedFunds ?? null, withHoldings: entry?.withHoldings ?? null,
         withoutEquities: entry?.withoutEquities ?? null, failed: entry?.failed ?? null, pending: entry?.pending ?? null,
         notApplicable: entry?.notApplicable ?? null,
+        establishedAfterPeriod: entry ? exemptions.establishedAfterPeriodFunds : null,
+        terminatedBeforePeriod: entry ? exemptions.terminatedBeforePeriodFunds : null,
         deferredFunds: entry?.deferredFunds ?? null,
         lastAttemptAt: entry?.lastAttemptAt || null };
     });
@@ -580,19 +604,24 @@
       $('catalog-badge').textContent = (incomplete ? `目录核验未齐${state.catalog ? ` · 已发现 ${state.catalog.companies.length} 家` : ''}` : `${state.catalog.companies.length} 家目录公司`) + staleLabel;
       $('catalog-badge').className = `badge ${incomplete ? 'warning' : 'success'}`;
       $('progress-count').textContent = state.progress ? `${incomplete ? '当前已发现目录' : ''}已取得记录 ${formatNumber(state.progress.processedFunds, 0)} / ${formatNumber(state.progress.totalFunds, 0)} 只基金份额` : '处理进度待生成';
-      $('progress-detail').textContent = state.progress ? `${formatNumber(state.progress.failedFunds ?? 0, 0)} 只抓取后仍未取得 · ${formatNumber(state.progress.pendingFunds, 0)} 只待处理 · ${formatNumber(state.progress.deferredFunds ?? 0, 0)} 只本批未轮到 · ${formatNumber(state.progress.notApplicableFunds ?? 0, 0)} 只期后成立` : '已有记录与字段完整是两项独立计数。';
+      const exemptions = notApplicableBreakdown(state.progress);
+      const exemptionText = `${formatNumber(exemptions.establishedAfterPeriodFunds, 0)} 只季末后成立 · ${formatNumber(exemptions.terminatedBeforePeriodFunds, 0)} 只季末前已终止${exemptions.otherNotApplicableFunds ? ` · ${formatNumber(exemptions.otherNotApplicableFunds, 0)} 只其他不适用` : ''}`;
+      $('progress-detail').textContent = state.progress ? `${formatNumber(state.progress.failedFunds ?? 0, 0)} 只抓取后仍未取得 · ${formatNumber(state.progress.pendingFunds, 0)} 只待处理 · ${formatNumber(state.progress.deferredFunds ?? 0, 0)} 只本批未轮到 · ${exemptionText}` : '已有记录与字段完整是两项独立计数。';
       $('progress-percent').textContent = overview.percent === null ? '—' : `${formatNumber(overview.percent, 1)}%`;
       $('coverage-progress').value = overview.percent || 0;
       const research = researchOverview(state.progress);
       const quality = $('research-status'); quality.replaceChildren();
       if (research) {
         const retry = retryState(state.progress);
-        quality.append(el('strong', '', `研究字段齐全 ${formatNumber(research.completeFunds, 0)} / ${formatNumber(research.applicableFunds, 0)} 只适用份额 · ${retry.label}`));
+        const managerAudited = countValue(research.fieldCoverage.managers);
+        quality.append(el('strong', '', `${managerAudited ? '七项研究字段齐全' : '原六项研究字段齐全'} ${formatNumber(research.completeFunds, 0)} / ${formatNumber(research.applicableFunds, 0)} 只适用份额 · ${retry.label}`));
+        if (countValue(research.sixFieldsCompleteFunds)) quality.append(el('p', '', `原六项齐全 ${formatNumber(research.sixFieldsCompleteFunds, 0)}；七项口径另要求报告中的经理任职证据。`));
+        if (!managerAudited) quality.append(el('p', '', '报告经理证据尚未纳入这一版完整度，仍待回补核验。'));
         quality.append(el('span', '', `待补 ${formatNumber(research.pendingFunds, 0)} · 本轮重试已用完 ${formatNumber(research.exhaustedFunds, 0)}`));
         if (retry.detail) quality.append(el('p', '', retry.detail));
         if (state.progress?.deferredFunds) quality.append(el('p', '', `本批未轮到 ${formatNumber(state.progress.deferredFunds, 0)} 只：保留原状态与尝试次数，不记为一次新的抓取失败；该数可能与原有待处理或失败状态重叠。`));
-        if (research.notApplicableFunds) quality.append(el('span', '', `另有 ${formatNumber(research.notApplicableFunds, 0)} 只由公开成立日期确认期后成立，不计入持仓与研究完成数。`));
-        const labels = { holdings: '持仓披露表', pdf: 'PDF', strategy: '季报策略', nav: '净资产', baseline: '上期基准', prices: '行情' };
+        if (research.notApplicableFunds) quality.append(el('span', '', `另有 ${exemptionText}，按对应公开证据单列，不计为无股票持仓或研究已完成。`));
+        const labels = { holdings: '持仓披露表', pdf: 'PDF', strategy: '季报策略', nav: '净资产', baseline: '上期基准', prices: '行情', managers: '报告经理' };
         quality.append(el('p', '', Object.entries(labels).map(([key, label]) => `${label} ${formatNumber(research.fieldCoverage[key], 0)}`).join(' · ')));
       } else {
         quality.append(el('p', '', '研究完整度尚未核验；取得持仓或无股票证据不代表 PDF、策略、规模和比较基准都已齐全。'));
@@ -613,7 +642,7 @@
         return;
       }
       const table = el('table', 'company-table'); const thead = el('thead'); const head = el('tr');
-      ['基金公司', '目录份额', '已取得记录', '有股票持仓', '无股票持仓', '期后成立', '抓取后仍未取得', '待处理', '本批未轮到', '来源'].forEach(label => {
+      ['基金公司', '目录份额', '已取得记录', '有股票持仓', '无股票持仓', '季末后成立', '季末前已终止', '抓取后仍未取得', '待处理', '本批未轮到', '来源'].forEach(label => {
         const th = el('th', '', label); th.scope = 'col'; head.append(th);
       });
       thead.append(head); const tbody = el('tbody');
@@ -629,7 +658,7 @@
         if (company.lastAttemptAt) identity.append(el('small', '', `最近处理 ${company.lastAttemptAt}`));
         else identity.append(el('small', '', '尚无处理时点记录'));
         tr.append(identity);
-        for (const key of ['totalFunds', 'processedFunds', 'withHoldings', 'withoutEquities', 'notApplicable', 'failed', 'pending', 'deferredFunds']) {
+        for (const key of ['totalFunds', 'processedFunds', 'withHoldings', 'withoutEquities', 'establishedAfterPeriod', 'terminatedBeforePeriod', 'failed', 'pending', 'deferredFunds']) {
           tr.append(el('td', key === 'failed' ? 'count-failed' : key === 'pending' ? 'count-pending' : '', company[key] === null ? '—' : formatNumber(company[key], 0)));
         }
         const source = el('td'); if (!addLink(source, '目录 ↗', company.sourceUrl)) source.textContent = '—'; tr.append(source); tbody.append(tr);
@@ -718,8 +747,12 @@
       const summary = el('summary');
       const heading = el('div');
       const title = el('div', 'fund-summary-title'); title.append(el('h3', '', fund.name || '名称未提供'), el('span', 'fund-code', fund.code));
-      if (fund.status === 'unavailable') title.append(el('span', 'badge warning', fund.notApplicableEvidence ? '不适用：期后成立' : fund.selectedReport ? '持仓解析待补' : '报告暂缺'));
-      if (fund.status === 'no-equities') title.append(el('span', 'badge success', '报告确认期末未持股'));
+      if (fund.status === 'unavailable') title.append(el('span', 'badge warning', fund.notApplicableEvidence
+        ? (fund.notApplicableEvidence.reason === 'TERMINATED_BEFORE_PERIOD' ? '不适用：季末前已终止' : '不适用：季末后成立')
+        : fund.selectedReport ? '持仓解析待补' : '报告暂缺'));
+      if (fund.status === 'no-equities') title.append(el('span', 'badge success',
+        (fund.noEquitiesEvidence || fund.selectedReport?.noEquitiesEvidence)?.evidenceType === 'zero-stock-balance-sheet'
+          ? '期末股票账面金额为零' : '报告确认期末未持股'));
       if (fund.dataStatus === 'cached') title.append(el('span', 'badge warning', '保留的有效记录'));
       heading.append(title);
       const description = el('div', 'fund-summary-description');
@@ -751,7 +784,7 @@
       body.append(metadata);
       const quality = fundQuality(state.progress, fund);
       if (quality?.fields) {
-        const labels = { holdings: '持仓披露表', pdf: 'PDF', strategy: '季报策略', nav: '净资产', baseline: '上期基准', prices: '行情' };
+        const labels = { holdings: '持仓披露表', pdf: 'PDF', strategy: '季报策略', nav: '净资产', baseline: '上期基准', prices: '行情', managers: '报告经理' };
         const statuses = { complete: '齐全', missing: '缺失', partial: '部分', truncated: '截断', 'wrong-period': '期间不符', 'not-applicable': '不适用' };
         const qualityRow = el('div', 'fund-metadata research-fields');
         for (const [key, label] of Object.entries(labels)) addMetadata(qualityRow, label, statuses[quality.fields[key]] || '待核验');
@@ -764,11 +797,24 @@
       if (fund.notApplicableEvidence) {
         const evidence = fund.notApplicableEvidence;
         const note = el('div', 'narrative');
-        note.append(el('p', 'narrative-text', `公开成立日期为 ${evidence.date}，晚于本季度期末 ${evidence.periodEnd}，本季度不适用。不将其记为无股票持仓或已完成研究。`));
-        addLink(note, '成立日期来源 ↗', evidence.sourceUrl); body.append(note);
+        if (evidence.reason === 'TERMINATED_BEFORE_PERIOD') {
+          note.append(el('p', 'narrative-text', `公告确认基金合同终止，${evidence.dateBasis === 'lastOperationDate' ? '最后运作日' : '明确终止日'}为 ${evidence.date}，早于目标季末 ${evidence.periodEnd}。基金仍保留在目录中；季度内可能曾持仓，不将其记为零持股或研究已完成。`));
+          addMetadata(note, '公告日', evidence.publishedAt);
+          addMetadata(note, '最后运作日', evidence.lastOperationDate);
+          addMetadata(note, '清算开始日', evidence.liquidationStartDate);
+          addMetadata(note, '清算报告期结束日', evidence.finalLiquidationEnd);
+          for (const citation of evidence.evidence.filter(item => item.field !== 'identityFundCodes')) {
+            note.append(el('p', 'narrative-text', citation.quote), el('p', 'narrative-meta', `原 PDF 第 ${citation.page} 页`));
+          }
+          addLink(note, '终止／清算公告 ↗', `${evidence.sourceUrl}#page=${evidence.page}`);
+        } else {
+          note.append(el('p', 'narrative-text', `公开成立日期为 ${evidence.date}，晚于本季度期末 ${evidence.periodEnd}，本季度不适用。不将其记为无股票持仓或已完成研究。`));
+          addLink(note, '成立日期来源 ↗', evidence.sourceUrl);
+        }
+        body.append(note);
       } else if (fund.status === 'no-equities') {
         const evidence = fund.noEquitiesEvidence || fund.selectedReport?.noEquitiesEvidence;
-        const note = emptyState('报告确认本期期末未持有股票', evidence?.text || '按报告证据记录本期期末无股票持仓，不按基金类型推断。', true);
+        const note = emptyState(evidence?.evidenceType === 'zero-stock-balance-sheet' ? '报告期末股票投资账面金额为零' : '报告确认本期期末未持有股票', evidence?.text || '按报告证据记录本期期末无股票持仓，不按基金类型推断。', true);
         if (evidence?.evidenceType === 'empty-stock-detail-section') {
           note.append(el('p', 'narrative-meta', `同一物理页第 ${evidence.page} 页 · 股票明细原文与资产组合表共同核验`),
             el('p', 'narrative-text', evidence.assetAllocationText));
@@ -1019,6 +1065,6 @@
     initializePeriods();
   }
 
-  return { validateDataset, validateCatalog, validateProgress, validatePeriods, selectQuarter, periodDataPath, validatePeriodDataset, responseText, researchOverview, retryState, formatRetryAt, fundQuality, catalogComplete, catalogFreshness, companyDirectoryLabel, safeCompanyPath, companyPages, companyRecordSummaries, catalogIndex, companyCoverage, coverageOverview, safeHttpUrl, validEmptyStockEvidence, managerNames, managerAttributionLabel, reportPeriod, changeGroup, latestFunds, filterFunds,
+  return { validateDataset, validateCatalog, validateProgress, validatePeriods, selectQuarter, periodDataPath, validatePeriodDataset, responseText, researchOverview, notApplicableBreakdown, retryState, formatRetryAt, fundQuality, catalogComplete, catalogFreshness, companyDirectoryLabel, safeCompanyPath, companyPages, companyRecordSummaries, catalogIndex, companyCoverage, coverageOverview, safeHttpUrl, validEmptyStockEvidence, managerNames, managerAttributionLabel, reportPeriod, changeGroup, latestFunds, filterFunds,
     formatNumber, formatMoney, signed, holdingValue, priceDescription, csvCell, exportCsv, observationState, mount };
 });

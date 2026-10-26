@@ -155,8 +155,13 @@
           detail.append(element('p', `披露市值 ${money(item.disclosedValueYuan)} · 规模乘比重 ${money(item.navWeightEstimateYuan)} · ${item.aggregationEligible ? '身份可归并' : '身份待核验，金额未合计'}`));
           const number = value => finite(value) ? new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 4 }).format(value) : '未披露';
           detail.append(element('p', `本期持股 ${number(item.current?.shares)} · 上期持股 ${number(item.previous?.shares)} · 股数差 ${number(item.sharesDelta)} · 本期净资产占比 ${finite(item.current?.weightPct) ? number(item.current.weightPct) + '%' : '未披露'}`));
-          const attribution = { report: '报告署名', 'tenure-overlap': '任职期与报告期重叠', 'current-profile': '当前公开资料，非报告期确认' }[portfolio.managerAttribution] || '待核验';
+          const attribution = { report: '报告经理表已核验', 'tenure-overlap': '任期重叠，报告经理表尚未核验', 'current-profile': '当前公开资料，非报告期确认' }[portfolio.managerAttribution] || '待核验';
           detail.append(element('p', `报告期 ${report.periodEnd || '待核验'} · 净资产 ${money(report.navYuan)} · 经理归属：${attribution}`, 'narrative-meta'));
+          for (const manager of managerList) {
+            if (!manager || typeof manager === 'string' || portfolio.managerAttribution !== 'report' || !manager.evidence) continue;
+            detail.append(element('p', `${manager.name} · 任职 ${manager.startDate || '待核验'} 至 ${manager.endDate || '报告期末仍任职'}`, 'narrative-meta'));
+            detail.append(link(`经理表原文 · 第 ${manager.evidence.page} 页 ↗`, manager.evidence.sourceUrl));
+          }
           detail.append(link('持仓报告 ↗', report.sourceUrl));
           const excerpts = portfolio.strategy?.excerpts || [];
           for (const quote of excerpts) {
@@ -179,7 +184,7 @@
         const value = validate(await read('analysis.json', controller.signal, selected), selected);
         if (current !== request) return;
         data = value;
-        $('analysis-status').textContent = `${selected} · ${data.stocks.length.toLocaleString()} 只证券已建立分析索引 · 观察截至 ${data.asOf || data.retrievedAt || '见来源'}。当前为已采集样本，完整度以本季度覆盖清单为准。金额以人民币计，价格保留原币种。`;
+        $('analysis-status').textContent = `${selected} · ${data.stocks.length.toLocaleString()} 只证券已建立分析索引 · 观察截至 ${data.asOf || data.retrievedAt || '见来源'}。报告经理表已取得 ${data.coverage.reportManagerRecords || 0} 条组合记录，待补 ${data.coverage.managerEvidenceMissingRecords || 0} 条。当前为已采集样本，完整度以本季度覆盖清单为准。金额以人民币计，价格保留原币种。`;
         const themes = $('analysis-themes'); themes.replaceChildren(element('h3', '基金报告中的策略主题'));
         themes.append(element('p', '主题按本季度报告原文规则归类；计数为有对应表述的组合，不能解释为全行业结论或单只股票交易动机。', 'filter-tip'));
         const list = element('div', undefined, 'analysis-theme-list');

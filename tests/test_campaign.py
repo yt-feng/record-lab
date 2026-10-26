@@ -26,6 +26,9 @@ class CampaignTests(unittest.TestCase):
             root = Path(temp)
             for directory in ('scripts', 'lib', 'config'):
                 shutil.copytree(source / directory, root / directory, ignore=shutil.ignore_patterns('__pycache__'))
+            (root / 'web').mkdir()
+            for module in ('lifecycle.js', 'zero-stock.js'):
+                shutil.copy2(source / 'web' / module, root / 'web' / module)
             atomic_json(root / 'web/data/catalog.json', {'schemaVersion': 1, 'asOf': '2026-10-26',
                 'coverage': {'directoryComplete': True, 'companyCount': 1, 'fundCount': 1200},
                 'companies': [{'code': 'co1', 'name': '合成机构', 'fundCount': 1200, 'directoryStatus': 'complete'}],
@@ -87,6 +90,9 @@ class CampaignTests(unittest.TestCase):
             root = Path(temp)
             for directory in ('scripts', 'lib', 'config'):
                 shutil.copytree(source / directory, root / directory, ignore=shutil.ignore_patterns('__pycache__'))
+            (root / 'web').mkdir()
+            for module in ('lifecycle.js', 'zero-stock.js'):
+                shutil.copy2(source / 'web' / module, root / 'web' / module)
             catalog = {'schemaVersion': 1, 'asOf': '2026-10-26', 'retrievedAt': '2026-10-26T00:00:00Z',
                 'coverage': {'directoryComplete': True, 'companyCount': 1, 'fundCount': 2},
                 'companies': [{'code': 'co1', 'name': '合成公司', 'fundCount': 2, 'directoryStatus': 'complete'}],
@@ -116,7 +122,7 @@ class CampaignTests(unittest.TestCase):
                     batch = read_json('.cache/plan/' + item['config'])
                     self.assertEqual(batch['traversal']['batchId'], item['id'])
                     self.assertTrue(batch['requireReportQuality'])
-                    self.assertEqual(batch['collectorVersion'], 4)
+                self.assertEqual(batch['collectorVersion'], 5)
                 # One new product is explicitly post-Q3; all other batch work
                 # is absent, as if a runner stopped before writing its artifact.
                 import datetime as dt
@@ -158,7 +164,7 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual((q3['targetPeriodEnd'], q3['baselinePeriodEnd']), ('2026-09-30', '2026-06-30'))
         self.assertEqual(q3['asOf'], '2026-10-26')
         self.assertTrue(q2['requireReportQuality'])
-        self.assertEqual(q2['collectorVersion'], 4)
+        self.assertEqual(q2['collectorVersion'], 5)
         self.assertIsNone(q2['retryPolicy']['dailyUntil'])
         self.assertEqual(q3['retryPolicy']['dailyUntil'], '2026-11-30')
         self.assertEqual(q3['retryPolicy']['maxScheduledCycles'], 4)
@@ -229,6 +235,8 @@ class CampaignTests(unittest.TestCase):
                 self.assertEqual(site.ensure_analyses(root), 1)
                 self.assertEqual(run.call_args.args[0][-1], str(period / 'analysis.json'))
                 (period / 'analysis.json').write_text(json.dumps({**latest, 'kind': 'quarter-analysis'}))
+                run.reset_mock(); self.assertEqual(site.ensure_analyses(root), 1); run.assert_called_once()
+                (period / 'analysis.json').write_text(json.dumps({**latest, 'kind': 'quarter-analysis', 'analysisVersion': 2}))
                 run.reset_mock(); self.assertEqual(site.ensure_analyses(root), 0); run.assert_not_called()
 
     def test_staging_rejects_missing_part_and_excessive_bytes(self):

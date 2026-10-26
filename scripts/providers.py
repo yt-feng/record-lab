@@ -455,7 +455,8 @@ def parse_no_equities(pages, report):
                     "sourceUrl": report["sourceUrl"], "periodEnd": report["periodEnd"],
                     "publishedAt": report["publishedAt"], "kind": report["kind"], "title": report["title"],
                     "page": page_num, "text": detail.group(1).strip(), "assetAllocationText": rows[0].strip()}
-    return None
+    from zero_stock import parse_zero_stock, parse_explicit_no_stock
+    return parse_explicit_no_stock(pages, report) or parse_zero_stock(pages, report)
 
 
 def parse_pdf_holdings(pages):
@@ -474,7 +475,9 @@ def parse_pdf_holdings(pages):
     def page_at(offset):
         return sum(start <= offset for start in offsets)
     section = None
-    metadata = {}
+    compact_text = re.sub(r"\s+", "", normalized)
+    metadata = {"foreignTableCandidate": True} if all(label in compact_text for label in
+                ("所在证券市场", "所属国家", "证券代码")) else {}
     for heading in re.finditer(r"按公允价值占基金资产净值比例大小\s*(?:排序|排名)的\s*(所有|前十名|前十|前五名)?\s*股票投资明细", normalized):
         candidate = normalized[heading.end():]
         prefix = re.search(r"(\d+(?:\.\d+){1,2})\s*(?:报告期末|期末)?\s*$", normalized[max(0, heading.start() - 100):heading.start()])
@@ -488,7 +491,7 @@ def parse_pdf_holdings(pages):
             candidate = candidate[:end.start()]
         if all(word in candidate[:1200] for word in ("股票代码", "股票名称", "数量", "公允价值")):
             section = candidate
-            metadata = {"coverage": "full" if heading[1] == "所有" else "top10" if heading[1] in ("前十名", "前十") else "unknown",
+            metadata = {**metadata, "coverage": "full" if heading[1] == "所有" else "top10" if heading[1] in ("前十名", "前十") else "unknown",
                         "sectionNumber": prefix[1] if prefix else None,
                         "nextSectionNumber": end[1] if end else None,
                         "sectionBounded": bool(prefix and end),
@@ -496,7 +499,7 @@ def parse_pdf_holdings(pages):
                         "endPage": page_at(heading.end() + end.start(1)) if end else None}
             break
     if section is None:
-        return HoldingRows([])
+        return HoldingRows([], metadata=metadata)
     if re.search(r"数量\s*[（(]\s*万股|公允价值\s*[（(]\s*万元", section[:1200]):
         return HoldingRows([])
     header = re.sub(r"\s+", "", section[:1200])
@@ -623,6 +626,10 @@ class PublicProvider:
                 break
         return sorted(reports.values(), key=lambda r: (r["periodEnd"], r["publishedAt"]), reverse=True)
 
+    def lifecycle_evidence(self, code, target_period, as_of, deadline=None):
+        from lifecycle import lookup_lifecycle
+        return lookup_lifecycle(self, code, target_period, as_of, deadline=deadline)
+
     def report_details(self, report, max_pages=300):
         from report_extract import extract_report
 
@@ -641,6 +648,22 @@ class PublicProvider:
         except Exception as error:
             code = getattr(error, "code", "PDF_PARSE_FAILED")
             raise DataError(code if re.fullmatch(r"[A-Z0-9_]+", str(code)) else "PDF_PARSE_FAILED") from None
+        if result.get("pdfHoldingsMetadata", {}).get("foreignTableCandidate"):
+            # The same original bytes provide independent stock-table evidence,
+            # even when strategy text was extracted through MinerU.
+            from foreign_holdings import parse_foreign_equity_pdf
+            try:
+                foreign = parse_foreign_equity_pdf(data, max_pages=max_pages)
+                rows, metadata = foreign["holdings"], foreign["metadata"]
+                old_keys = {(row["market"], row["stockCode"]) for row in result.get("pdfHoldings", [])}
+                new_keys = {(row["market"], row["stockCode"]) for row in rows}
+                if rows and old_keys.issubset(new_keys):
+                    result.update({"pdfHoldings": HoldingRows(rows, metadata.get("excludedRows", 0), metadata),
+                                   "pdfHoldingsMetadata": metadata, "pdfHoldingsExtraction": foreign["extraction"]})
+                else:
+                    result["pdfHoldingsMetadata"]["complete"] = False
+            except Exception:
+                result["pdfHoldingsMetadata"]["complete"] = False
         # Preserve the historical field while attaching page-cited MinerU/pypdf
         # metadata. MinerU markdown is consumed in memory and is never published.
         result.update({"reportPdfSourceUrl": report["sourceUrl"], "reportPdfPeriodEnd": report["periodEnd"],
@@ -650,6 +673,9 @@ class PublicProvider:
     def price_bars(self, code, market, start, end):
         if iso_date(start) != start or iso_date(end) != end or start > end:
             raise DataError("INVALID_PRICE_RANGE")
+        if market == "US":
+            from foreign_prices import us_price_bars
+            return us_price_bars(self, code, start, end)
         code, secid, yahoo_symbol, tencent_symbol, currency, venue = stock_identifiers(code, market)
         params = {"secid": secid, "klt": 101, "fqt": 0, "beg": start.replace("-", ""), "end": end.replace("-", ""),
                   "fields1": "f1,f2,f3,f4,f5,f6", "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"}

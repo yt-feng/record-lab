@@ -6,6 +6,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { buildSnapshot, catalogDetails, deduplicatePortfolios, publicUrl } = require('./build-data');
 const { validDate } = require('../lib/fund-analysis');
+const { verifiedReportManagers } = require('../lib/report-managers');
 
 const CODE = /^\d{6}$/;
 const COMPANY = /^[A-Za-z0-9_-]{1,40}$/;
@@ -144,6 +145,18 @@ function retainReportEvidence(target, source) {
   if (!target?.selectedReport || !source?.selectedReport || target.selectedReport.periodEnd !== source.selectedReport.periodEnd) return false;
   let changed = false;
   const to = target.selectedReport, from = source.selectedReport;
+  const month = Number(to.periodEnd.slice(5, 7));
+  const quarterStart = `${to.periodEnd.slice(0, 4)}-${String(Math.floor((month - 1) / 3) * 3 + 1).padStart(2, '0')}-01`;
+  const oldManagers = verifiedReportManagers(target.reportManagers?.length ? target.reportManagers : to.managers, quarterStart, to.periodEnd);
+  const newManagers = verifiedReportManagers(source.reportManagers?.length ? source.reportManagers : from.managers, quarterStart, to.periodEnd);
+  if (newManagers.length && (!oldManagers.length || newManagers.length > oldManagers.length
+    && newManagers[0].evidence.sourceUrl === oldManagers[0].evidence.sourceUrl)) {
+    to.managers = clone(newManagers); to.managerSourceUrl = newManagers[0].evidence.sourceUrl;
+    target.reportManagers = clone(newManagers); target.managerAttribution = 'report';
+    target.managerSourceUrl = newManagers[0].evidence.sourceUrl; changed = true;
+    to.managerEvidenceRetrievedAt = from.managerEvidenceRetrievedAt || source.retrievedAt;
+    target.managerEvidenceRetrievedAt = to.managerEvidenceRetrievedAt;
+  }
   if (Date.parse(source.retrievedAt) > Date.parse(target.retrievedAt) && from.holdingsIncomplete === true) {
     to.holdingsIncomplete = true;
     to.holdingsExcludedRowCount = Math.max(to.holdingsExcludedRowCount || 0, from.holdingsExcludedRowCount || 0);
@@ -184,6 +197,8 @@ function coverageFor(funds, directory, config, expectedCount = directory.fundCou
     narrativeCount: funds.filter(fund => fund.narrative?.text).length,
     noEquitiesFundCount: funds.filter(fund => fund.status === 'no-equities').length,
     notApplicableFundCount: funds.filter(fund => fund.notApplicableEvidence).length,
+    establishedAfterPeriodFundCount: funds.filter(fund => fund.notApplicableEvidence?.reason === 'ESTABLISHED_AFTER_PERIOD').length,
+    terminatedBeforePeriodFundCount: funds.filter(fund => fund.notApplicableEvidence?.reason === 'TERMINATED_BEFORE_PERIOD').length,
     reportOnlyFundCount: funds.filter(fund => fund.selectedReport?.reportOnly).length,
     catalogStatus: directory.known ? 'available' : 'unavailable',
     limitations: ['目录总数不代表已完成采集。', '只有报告明确确认未持有股票才记为无股票持仓。',
