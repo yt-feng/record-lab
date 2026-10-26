@@ -514,6 +514,7 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
       metadataSourceUrl: publicUrl(item.metadataSourceUrl) ? item.metadataSourceUrl : null,
       inceptionDate: validDate(item.inceptionDate) && item.inceptionDate <= raw.asOf ? item.inceptionDate : null,
       inceptionSourceUrl: publicUrl(item.inceptionSourceUrl) ? item.inceptionSourceUrl : null,
+      inceptionEvidence: require('../lib/historical-inception').normalizeInception(item.inceptionEvidence, item),
       managerSourceUrl: publicUrl(item.managerSourceUrl) ? item.managerSourceUrl : null,
       managersAsOf: validDate(item.managersAsOf) && item.managersAsOf <= raw.asOf ? item.managersAsOf : null,
       managerScope: item.managerScope === 'current-profile' ? item.managerScope : null,

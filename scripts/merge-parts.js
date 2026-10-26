@@ -77,7 +77,7 @@ function sanitizeFund(item, { now, config, envelope }) {
       .map(manager => ({ name: label(manager && manager.name, 100), startDate: manager && manager.startDate,
         endDate: manager && manager.endDate })),
     metadataSourceUrl: item.metadataSourceUrl, managerSourceUrl: item.managerSourceUrl,
-    inceptionDate: item.inceptionDate, inceptionSourceUrl: item.inceptionSourceUrl,
+    inceptionDate: item.inceptionDate, inceptionSourceUrl: item.inceptionSourceUrl, inceptionEvidence: item.inceptionEvidence,
     managerScope: item.managerScope, managersAsOf: item.managersAsOf,
     shareClassCodes: (Array.isArray(item.shareClassCodes) ? item.shareClassCodes : []).filter(code => typeof code === 'string' && CODE.test(code)),
     sourcePortfolioCode: item.sourcePortfolioCode, portfolioSourceUrl: item.portfolioSourceUrl,

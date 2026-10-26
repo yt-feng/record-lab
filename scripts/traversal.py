@@ -116,6 +116,7 @@ def phase_for(config):
 
 
 def catalog_records(catalog):
+    from historical_inception import catalog_inception
     if not isinstance(catalog, dict) or catalog.get("schemaVersion", 1) != 1 or not isinstance(catalog.get("funds"), list):
         raise TraversalError("INVALID_CATALOG")
     companies = {}
@@ -137,6 +138,9 @@ def catalog_records(catalog):
         record = {"code": code, "name": str(item.get("name") or code)[:200],
                   "companyCode": company, "companyName": companies[company]["name"] if company else None,
                   "type": str(item.get("type") or "未分类")[:100]}
+        inception = catalog_inception(item, catalog)
+        if inception:
+            record['catalogInceptionEvidence'] = inception
         if code in funds and funds[code]["companyCode"] != company:
             record["companyCode"] = None
             record["companyName"] = None
@@ -500,6 +504,8 @@ def normalize_quality(previous, status, now):
                   or "strategy" in missing and strategy_attempts < STRATEGY_MAX_ATTEMPTS) else "exhausted"}
     if baseline_exempt and fields["baseline"] == "not-applicable":
         result["baselineExemption"] = {key: baseline_exemption[key] for key in ("reason", "date", "sourceUrl", "fundCode", "baselinePeriodEnd", "periodEnd")}
+        if baseline_exemption.get('inceptionEvidence'):
+            result['baselineExemption']['inceptionEvidence'] = baseline_exemption['inceptionEvidence']
     return result
 
 
@@ -507,9 +513,14 @@ def valid_baseline_exemption(evidence, now):
     if not isinstance(evidence, dict) or evidence.get("reason") != "ESTABLISHED_AFTER_BASELINE" or not is_code(evidence.get("fundCode")):
         return False
     established, baseline, target = (date(evidence.get(key)) for key in ("date", "baselinePeriodEnd", "periodEnd"))
-    return (bool(established and baseline and target) and baseline < established <= target <= now.date()
-            and public_url(evidence.get("sourceUrl"))
-            and urlparse(evidence["sourceUrl"]).path.endswith(f"jbgk_{evidence['fundCode']}.html"))
+    if not (bool(established and baseline and target) and baseline < established <= target <= now.date()
+            and public_url(evidence.get('sourceUrl'))):
+        return False
+    if urlparse(evidence['sourceUrl']).path.endswith(f"jbgk_{evidence['fundCode']}.html"):
+        return True
+    from historical_inception import normalize_inception
+    historical = normalize_inception(evidence.get('inceptionEvidence'), evidence['fundCode'], evidence['periodEnd'], now=now)
+    return bool(historical and historical['date'] == evidence['date'] and historical['sourceUrl'] == evidence['sourceUrl'])
 
 
 def quarter_start(period_end):
@@ -656,6 +667,8 @@ def report_quality(fund, phase, now):
     baseline_exemption = {"reason": "ESTABLISHED_AFTER_BASELINE", "date": fund.get("inceptionDate"),
                           "sourceUrl": fund.get("inceptionSourceUrl"), "fundCode": fund["code"],
                           "baselinePeriodEnd": phase["baselinePeriodEnd"], "periodEnd": phase["targetPeriodEnd"]}
+    if fund.get('inceptionEvidence'):
+        baseline_exemption['inceptionEvidence'] = fund['inceptionEvidence']
     baseline = fund.get("previousReport")
     if (isinstance(baseline, dict) and baseline.get("periodEnd") == phase["baselinePeriodEnd"]
             and public_url(baseline.get("sourceUrl")) and date(baseline.get("publishedAt"))

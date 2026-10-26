@@ -110,10 +110,25 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
     except Exception as error:
         errors.append(safe_error(code, "metadata", error))
     foundation = overview.get("foundationDate")
-    if isinstance(foundation, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", foundation) and foundation <= as_of:
+    try:
+        foundation = foundation if dt.date.fromisoformat(foundation).isoformat() == foundation and foundation <= as_of else None
+    except (TypeError, ValueError):
+        foundation = None
+    from historical_inception import normalize_inception
+    historical = normalize_inception(item.get('catalogInceptionEvidence'), code, target_period)
+    foundation_source = fund['metadataSourceUrl']
+    if historical:
+        if foundation and foundation != historical['date']:
+            # Conflicting sources cannot exempt an unavailable comparison report.
+            errors.append({'code': code, 'stage': 'inception', 'errorCode': 'INCEPTION_DATE_CONFLICT'})
+            foundation = None
+        else:
+            foundation, foundation_source = historical['date'], historical['sourceUrl']
+            fund['inceptionEvidence'] = historical
+    if foundation:
         fund["inceptionDate"] = foundation
-        fund["inceptionSourceUrl"] = fund["metadataSourceUrl"]
-    if target_period and isinstance(foundation, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", foundation) and foundation > target_period and foundation <= as_of:
+        fund["inceptionSourceUrl"] = foundation_source
+    if target_period and foundation and foundation > target_period:
         fund["notApplicableEvidence"] = {"reason": "ESTABLISHED_AFTER_PERIOD", "date": foundation,
                                          "sourceUrl": fund["metadataSourceUrl"], "periodEnd": target_period,
                                          "fundCode": code}
