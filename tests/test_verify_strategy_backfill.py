@@ -241,6 +241,24 @@ process.stdout.write(JSON.stringify({envelope:result.companySnapshots.co1,manife
                     verifier.select_sample(reader, '2026Q2', dt.datetime.now(dt.timezone.utc).isoformat())
                 self.assertEqual(calls, [])
 
+    def test_explicit_nonstring_company_identifiers_are_not_treated_as_missing(self):
+        for target, field in (('funds', 'companyId'), ('companies', 'id')):
+            for invalid in (False, 0, [], {}, 1):
+                with self.subTest(target=target, invalid=type(invalid).__name__):
+                    reader, _ = setup_reader()
+                    catalog = reader.data['web/data/periods/2026Q2/catalog.json']
+                    catalog[target][0][field] = invalid
+                    with patch.object(verifier, 'PublicProvider', side_effect=AssertionError('no provider')):
+                        with self.assertRaisesRegex(verifier.VerificationError, 'CATALOG_CONTEXT_INVALID'):
+                            verifier.select_sample(reader, '2026Q2', dt.datetime.now(dt.timezone.utc).isoformat())
+        for nullable in (None, ''):
+            reader, _ = setup_reader()
+            catalog = reader.data['web/data/periods/2026Q2/catalog.json']
+            catalog['funds'][0]['companyId'] = nullable
+            catalog['companies'][0]['id'] = nullable
+            sample = verifier.select_sample(reader, '2026Q2', dt.datetime.now(dt.timezone.utc).isoformat())
+            self.assertTrue(all(sample['catalogContext']['checks'].values()))
+
     def test_real_two_quarter_collect_build_merge_preserves_original_values_and_clocks(self):
         reader, templates = setup_reader(); before = copy.deepcopy(reader.data); calls = []
         with tempfile.TemporaryDirectory() as directory:

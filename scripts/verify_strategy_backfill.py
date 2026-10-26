@@ -239,7 +239,8 @@ def catalog_context(reader, quarter, fund):
         raise VerificationError('CATALOG_CONTEXT_INVALID')
     owners = set()
     for row in rows:
-        values = [row.get(key) for key in ('companyId', 'companyCode') if row.get(key)]
+        values = [row[key] for key in ('companyId', 'companyCode')
+                  if key in row and row[key] is not None and not (isinstance(row[key], str) and row[key] == '')]
         if (not values or any(not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', value)
                               or value == 'unknown' for value in values) or len(set(values)) != 1):
             raise VerificationError('CATALOG_CONTEXT_INVALID')
@@ -250,7 +251,8 @@ def catalog_context(reader, quarter, fund):
     companies = []
     for row in source['companies']:
         if not isinstance(row, dict): continue
-        identifiers = [row[key] for key in ('id', 'companyId', 'companyCode', 'code') if row.get(key)]
+        identifiers = [row[key] for key in ('id', 'companyId', 'companyCode', 'code')
+                       if key in row and row[key] is not None and not (isinstance(row[key], str) and row[key] == '')]
         if owner in identifiers:
             if any(value != owner for value in identifiers): raise VerificationError('CATALOG_CONTEXT_INVALID')
             companies.append({key: row[key] for key in ('id', 'companyId', 'companyCode', 'code', 'name', 'companyName', 'company') if key in row})
