@@ -10,11 +10,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 from unittest.mock import patch
 
 import requests
 
-from deepseek_strategy import MODEL, http_transport, run_packet
+from deepseek_strategy import MAX_RESPONSE_BYTES, MODEL, http_transport, run_packet
 from portfolio_identity import normalize_portfolio_identity
 from providers import parse_pdf_pages
 from publication_guard import inspect_content
@@ -34,9 +35,55 @@ RESULT_FIELDS = {'schemaVersion', 'kind', 'sample', 'generatedAt', 'requestedMod
     'semanticAnalysisComplete', 'productionAdmission', 'quotePoolIntegration'}
 INFERENCE_FIELDS = {'schemaVersion', 'provider', 'requestedModel', 'promptVersion', 'endpoint', 'status',
     'attempted', 'requestCount', 'errorCode', 'receipt', 'usage', 'responseModel', 'responseDigest',
-    'analysis', 'semanticAnalysisComplete', 'productionReady'}
+    'analysis', 'semanticAnalysisComplete', 'productionReady', 'formatDiagnostics'}
 PRIVATE_FIELDS = {'body', 'content', 'section_text', 'sentences', 'messages', 'reasoning_content',
     'raw', 'rawText', 'fullText', 'markdown', 'authorization', 'api_key', 'credential', 'sectionsText'}
+FORMAT_FIELDS = {'schemaVersion', 'digestEncoding', 'originalBytes', 'originalCharacters', 'originalDigest',
+    'leadingToken', 'fence', 'normalization', 'normalizedBytes', 'normalizedCharacters', 'normalizedDigest',
+    'jsonStatus', 'jsonError'}
+
+
+def valid_format_diagnostics(value):
+    """Only finite structure metadata may cross the private response boundary."""
+    if value is None:
+        return True
+    if (type(value) is not dict or set(value) != FORMAT_FIELDS
+            or type(value['schemaVersion']) is not int or value['schemaVersion'] != 1
+            or value['digestEncoding'] != 'utf8-surrogatepass'
+            or value['leadingToken'] not in ('empty', 'object', 'array', 'string', 'number',
+                                           'true', 'false', 'null', 'code-fence', 'other')
+            or value['fence'] not in ('none', 'complete-json', 'complete-other', 'incomplete', 'multiple', 'mixed-content')
+            or value['normalization'] not in ('none', 'removed-single-json-fence')
+            or value['jsonStatus'] not in ('valid', 'invalid')):
+        return False
+    for key in ('originalBytes', 'originalCharacters', 'normalizedBytes', 'normalizedCharacters'):
+        if type(value[key]) is not int or not 0 <= value[key] <= MAX_RESPONSE_BYTES:
+            return False
+    for key in ('originalDigest', 'normalizedDigest'):
+        if not isinstance(value[key], str) or not re.fullmatch(r'[a-f0-9]{64}', value[key]):
+            return False
+    if (value['originalCharacters'] > value['originalBytes']
+            or value['normalizedCharacters'] > value['normalizedBytes']):
+        return False
+    if value['normalization'] == 'none':
+        if any(value['original' + suffix] != value['normalized' + suffix]
+               for suffix in ('Bytes', 'Characters', 'Digest')):
+            return False
+    elif (value['fence'] != 'complete-json' or value['leadingToken'] != 'code-fence'
+          or value['normalizedBytes'] >= value['originalBytes']
+          or value['normalizedCharacters'] >= value['originalCharacters']):
+        return False
+    error = value['jsonError']
+    if value['jsonStatus'] == 'valid':
+        return error is None
+    if (type(error) is not dict or set(error) != {'category', 'line', 'column', 'position'}
+            or error['category'] not in ('syntax', 'duplicate-key', 'nonfinite', 'unicode', 'depth', 'size', 'type')):
+        return False
+    if error['category'] == 'syntax':
+        return (all(type(error[key]) is int and 1 <= error[key] <= MAX_RESPONSE_BYTES
+                    for key in ('line', 'column'))
+                and type(error['position']) is int and 0 <= error['position'] <= value['normalizedCharacters'])
+    return all(error[key] is None for key in ('line', 'column', 'position'))
 
 
 def now():
@@ -77,7 +124,11 @@ def write_result(result, output=OUTPUT):
             or result['productionReady'] is not False or result['productionDataModified'] is not False
             or result['semanticAnalysisComplete'] is not False or not compact(result)
             or result['inference'] is not None and (not isinstance(result['inference'], dict)
-                or set(result['inference']) != INFERENCE_FIELDS)):
+                or set(result['inference']) != INFERENCE_FIELDS
+                or not valid_format_diagnostics(result['inference']['formatDiagnostics'])
+                or result['inference']['status'] == 'validated' and
+                    (result['inference']['formatDiagnostics'] is None
+                     or result['inference']['formatDiagnostics']['jsonStatus'] != 'valid'))):
         raise ValueError('PUBLICATION_REJECTED')
     encoded = json.dumps(result, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
     if len(encoded) > MAX_ARTIFACT_BYTES or inspect_content(encoded, max_bytes=MAX_ARTIFACT_BYTES):

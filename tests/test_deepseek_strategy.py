@@ -1,5 +1,6 @@
 """Synthetic packets and transports only; no credentials or network required."""
 import copy
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -87,6 +88,12 @@ class DeepSeekStrategyTests(unittest.TestCase):
                                             transport=lambda _, body: altered(kind, body))
                 self.assertNotEqual(result['status'], 'validated')
                 self.assertFalse(result['semanticAnalysisComplete'])
+                if kind == 'empty':
+                    self.assertEqual(result['formatDiagnostics']['leadingToken'], 'empty')
+                    self.assertEqual(result['formatDiagnostics']['originalBytes'], 0)
+                if kind == 'length':
+                    self.assertIsNotNone(result['formatDiagnostics'])
+                    self.assertEqual(result['errorCode'], 'PROVIDER_OUTPUT_INCOMPLETE')
 
     def test_request_limit_and_digest_do_not_depend_on_source_observed_refresh(self):
         first = packet(); later = packet(report={**first['source'], 'strategyEvidenceRetrievedAt': '2026-10-26T11:01:00Z'})
@@ -154,6 +161,119 @@ class DeepSeekStrategyTests(unittest.TestCase):
                 self.assertEqual(result['errorCode'], 'PROVIDER_MODEL_UNEXPECTED')
                 self.assertIsNone(result['responseModel']); self.assertIsNone(result['analysis'])
                 self.assertEqual(result['requestCount'], 1)
+
+    def test_prompt_has_literal_json_example_with_actual_ids_not_default_unknown(self):
+        value = packet(); body = adapter.request_body(value)
+        system = body['messages'][0]['content']
+        self.assertIn('Do not copy unknown as a default', system)
+        self.assertIn('Do not use Markdown or code fences', system)
+        example = json.loads(system.rsplit('\n', 1)[1])
+        self.assertEqual(example['inputDigest'], value['inputDigest'])
+        self.assertEqual(example['sentences'][0]['sentence_id'], value.model_input()['sentences'][0]['sentence_id'])
+        self.assertNotIn('本基金看好科技行业', system)
+
+    def test_exact_single_json_fence_is_only_removed_wrapper_and_keeps_raw_digest(self):
+        for opening, newline in [('json', '\n'), ('JSON', '\r\n')]:
+            received = []
+            def transport(_, body):
+                outer = json.loads(envelope(body)['body'])
+                content = outer['choices'][0]['message']['content']
+                wrapped = ' \n```' + opening + newline + content + newline + '```\n '
+                outer['choices'][0]['message']['content'] = wrapped
+                raw = json.dumps(outer, ensure_ascii=False)
+                received.append((content, wrapped, raw))
+                return {'httpStatus': 200, 'body': raw}
+            value = packet()
+            result = adapter.run_packet(value, 'synthetic', checkpoint=lambda _: None, transport=transport)
+            self.assertEqual(result['status'], 'validated')
+            self.assertEqual(result['analysis']['source'], value['source'])
+            diagnostic = result['formatDiagnostics']
+            self.assertEqual(diagnostic['fence'], 'complete-json')
+            self.assertEqual(diagnostic['normalization'], 'removed-single-json-fence')
+            self.assertEqual(diagnostic['jsonStatus'], 'valid'); self.assertIsNone(diagnostic['jsonError'])
+            content, wrapped, raw = received[0]
+            self.assertEqual(diagnostic['originalDigest'], hashlib.sha256(wrapped.encode()).hexdigest())
+            # CR before the closing delimiter is legal original JSON whitespace,
+            # and may remain in the literal substring; nothing inside is fixed.
+            normalized, _ = adapter.content_format(wrapped)
+            self.assertEqual(normalized.strip(), content)
+            self.assertEqual(diagnostic['normalizedDigest'], hashlib.sha256(normalized.encode()).hexdigest())
+            self.assertEqual(result['responseDigest'], hashlib.sha256(raw.encode()).hexdigest())
+            self.assertEqual(result['requestCount'], 1)
+
+    def test_bad_wrappers_never_extract_braces_or_hide_trailing_text(self):
+        cases = [('```json\n{}', 'incomplete'), ('```python\n{}\n```', 'complete-other'),
+                 ('```\n{}\n```', 'complete-other'), ('```json\n{}\n```\nextra', 'mixed-content'),
+                 ('intro\n```json\n{}\n```', 'mixed-content'), ('prefix {} suffix', 'none'),
+                 ('```json\n{}\n```\n```json\n{}\n```', 'multiple')]
+        for content, fence in cases:
+            with self.subTest(fence=fence, content=content[:12]):
+                normalized, diagnostic = adapter.content_format(content)
+                self.assertEqual(normalized, content)
+                self.assertEqual(diagnostic['fence'], fence)
+                self.assertEqual(diagnostic['normalization'], 'none')
+                self.assertEqual(diagnostic['jsonStatus'], 'invalid')
+                self.assertEqual(diagnostic['originalDigest'], diagnostic['normalizedDigest'])
+
+    def test_diagnostics_are_fixed_structure_with_exact_json_offsets_and_no_body(self):
+        content = '{\n "private report fragment": invalid\n}'
+        normalized, diagnostic = adapter.content_format(content)
+        self.assertEqual(normalized, content)
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as error:
+            expected = {'category': 'syntax', 'line': error.lineno, 'column': error.colno, 'position': error.pos}
+        self.assertEqual(diagnostic['jsonError'], expected)
+        self.assertEqual(diagnostic['originalCharacters'], len(content))
+        self.assertEqual(diagnostic['originalBytes'], len(content.encode()))
+        self.assertNotIn('private report fragment', json.dumps(diagnostic))
+        self.assertEqual(set(diagnostic), {'schemaVersion', 'digestEncoding', 'originalBytes', 'originalCharacters',
+            'originalDigest', 'leadingToken', 'fence', 'normalization', 'normalizedBytes', 'normalizedCharacters',
+            'normalizedDigest', 'jsonStatus', 'jsonError'})
+
+    def test_fenced_duplicate_keys_nonfinite_and_syntax_errors_remain_rejected(self):
+        cases = [('{"x":1,"x":2}', 'duplicate-key'), ('{"x":NaN}', 'nonfinite'),
+                 ('{"x":Infinity}', 'nonfinite'), ('{"x":1e999}', 'nonfinite'),
+                 ('{"x":1,}', 'syntax'), ('{"x":1} trailing', 'syntax')]
+        for content, category in cases:
+            for wrap in (False, True):
+                with self.subTest(category=category, wrap=wrap):
+                    original = '```json\n' + content + '\n```' if wrap else content
+                    normalized, diagnostic = adapter.content_format(original)
+                    self.assertEqual(normalized, content)
+                    self.assertEqual(diagnostic['jsonError']['category'], category)
+                    self.assertEqual(diagnostic['jsonStatus'], 'invalid')
+                    outer = {'model': adapter.MODEL, 'choices': [{'finish_reason': 'stop',
+                        'message': {'role': 'assistant', 'content': original}}]}
+                    result = adapter.run_packet(packet(), 'synthetic', checkpoint=lambda _: None,
+                        transport=lambda *_: {'httpStatus': 200, 'body': json.dumps(outer)})
+                    self.assertEqual(result['status'], 'rejected')
+                    self.assertEqual(result['requestCount'], 1)
+
+    def test_unicode_depth_size_and_non_json_token_diagnostics_stay_bounded(self):
+        cases = [('\ud800', 'unicode'), ('{"x":"\\ud800"}', 'unicode'),
+                 (' ' * 400001, 'size')]
+        for content, category in cases:
+            _, diagnostic = adapter.content_format(content)
+            self.assertEqual(diagnostic['jsonError'], {'category': category, 'line': None, 'column': None, 'position': None})
+            self.assertEqual(len(diagnostic['originalDigest']), 64)
+        # Decoder nesting limits vary by Python version. Preserve the typed
+        # failure without depending on a particular interpreter's depth cap.
+        with patch.object(adapter, '_json', side_effect=RecursionError()):
+            diagnostic = adapter.content_format('[]')[1]
+            self.assertEqual(diagnostic['jsonError']['category'], 'depth')
+        for content, token in [('', 'empty'), ('{}', 'object'), ('[]', 'array'), ('"word"', 'string'),
+                               ('0', 'number'), ('true', 'true'), ('false', 'false'), ('null', 'null'), ('word', 'other')]:
+            self.assertEqual(adapter.content_format(content)[1]['leadingToken'], token)
+
+    def test_no_wrapper_normalization_preserves_whitespace_and_unicode_codepoints(self):
+        content = '  {"value":"中文😀"} \n'
+        normalized, diagnostic = adapter.content_format(content)
+        self.assertEqual(normalized, content)
+        self.assertEqual(diagnostic['normalization'], 'none')
+        self.assertEqual(diagnostic['originalCharacters'], len(content))
+        self.assertGreater(diagnostic['originalBytes'], diagnostic['originalCharacters'])
+        self.assertEqual(diagnostic['originalDigest'], diagnostic['normalizedDigest'])
 
 
 if __name__ == '__main__':

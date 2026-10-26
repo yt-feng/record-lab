@@ -12,6 +12,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 import verify_deepseek_strategy as verify
+from deepseek_strategy import content_format
 from report_extract import _details_for_pages
 from test_deepseek_strategy import envelope
 
@@ -120,6 +121,106 @@ class VerifyDeepSeekTests(unittest.TestCase):
                 changed = copy.deepcopy(good); mutate(changed)
                 with self.assertRaisesRegex(ValueError, 'PUBLICATION_REJECTED'): verify.write_result(changed, output)
                 self.assertFalse(output.exists())
+
+    def test_plain_and_whole_json_fence_keep_source_receipt_and_finite_diagnostics(self):
+        results = []
+        for fenced in (False, True):
+            events, calls = [], []
+            def transport(_, body):
+                calls.append(True)
+                self.assertEqual(events[-1]['modelReceipt']['outcome'], 'started')
+                value = envelope(body)
+                if fenced:
+                    outer = json.loads(value['body'])
+                    content = outer['choices'][0]['message']['content']
+                    outer['choices'][0]['message']['content'] = '```json\n' + content + '\n```'
+                    value['body'] = json.dumps(outer, ensure_ascii=False)
+                return value
+            result = verify.verify('synthetic', fetch_pdf=lambda: b'%PDF synthetic', extractor=extractor,
+                transport=transport, checkpoint=lambda value: events.append(copy.deepcopy(value)))
+            self.assertEqual(result['status'], 'candidate-validated'); self.assertEqual(len(calls), 1)
+            diagnostic = result['inference']['formatDiagnostics']
+            self.assertTrue(verify.valid_format_diagnostics(diagnostic))
+            self.assertEqual(diagnostic['normalization'], 'removed-single-json-fence' if fenced else 'none')
+            self.assertEqual(diagnostic['jsonStatus'], 'valid'); self.assertIsNone(diagnostic['jsonError'])
+            self.assertEqual(result['source']['retrievedAt'], result['pdfReceipt']['fetchedAt'])
+            self.assertEqual(result['inference']['analysis']['source'], result['source'])
+            self.assertEqual(result['modelReceipt'], result['inference']['receipt'])
+            self.assertEqual(result['modelRequests'], 1); self.assertFalse(result['productionReady'])
+            self.assertFalse(result['semanticAnalysisComplete'])
+            with tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'result.json'; verify.write_result(result, output)
+                saved = json.loads(output.read_bytes())
+                self.assertEqual(saved['inference']['formatDiagnostics'], diagnostic)
+                self.assertNotIn('```', output.read_text()); self.assertNotIn('synthetic', output.read_text())
+            results.append(result)
+        self.assertEqual(results[0]['inputDigest'], results[1]['inputDigest'])
+        self.assertEqual(results[0]['modelReceipt']['requestDigest'], results[1]['modelReceipt']['requestDigest'])
+
+    def test_format_diagnostics_reject_arbitrary_text_fields_and_nonfinite_shapes(self):
+        good = self.run_sample(); original = good['inference']['formatDiagnostics']
+        malformed = []
+        for key, value in [('schemaVersion', True), ('digestEncoding', 'private error body'),
+                           ('originalBytes', False), ('originalCharacters', 1.0), ('normalizedBytes', 600001),
+                           ('normalizedCharacters', -1), ('originalDigest', 'private provider body'),
+                           ('normalizedDigest', 'F' * 64), ('leadingToken', 'object with private text'),
+                           ('fence', 'unexpected'), ('normalization', 'fixed-json'), ('jsonStatus', 'complete')]:
+            changed = copy.deepcopy(original); changed[key] = value; malformed.append(changed)
+        changed = copy.deepcopy(original); changed['originalDigest'] = '0' * 64; malformed.append(changed)
+        changed = copy.deepcopy(original); changed['normalization'] = 'removed-single-json-fence'; malformed.append(changed)
+        for key in ('body', 'privateDiagnostic', 'reasoning_content'):
+            changed = copy.deepcopy(original); changed[key] = 'PRIVATE_FORMAT_SENTINEL'; malformed.append(changed)
+        invalid = content_format('{ "x": }')[1]
+        self.assertTrue(verify.valid_format_diagnostics(invalid))
+        for mutate in (lambda row: row['jsonError'].update(message='PRIVATE_ERROR_SENTINEL'),
+                       lambda row: row['jsonError'].update(category='arbitrary response text'),
+                       lambda row: row['jsonError'].update(line=True),
+                       lambda row: row['jsonError'].update(column=0),
+                       lambda row: row['jsonError'].update(position=600001),
+                       lambda row: row.update(jsonError=None)):
+            changed = copy.deepcopy(invalid); mutate(changed); malformed.append(changed)
+        nonfinite = content_format('{"x": NaN}')[1]
+        self.assertTrue(verify.valid_format_diagnostics(nonfinite))
+        changed = copy.deepcopy(nonfinite); changed['jsonError']['line'] = 1; malformed.append(changed)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'result.json'
+            for diagnostic in malformed:
+                with self.subTest(diagnostic=diagnostic):
+                    self.assertFalse(verify.valid_format_diagnostics(diagnostic))
+                    changed = copy.deepcopy(good); changed['inference']['formatDiagnostics'] = diagnostic
+                    with self.assertRaisesRegex(ValueError, 'PUBLICATION_REJECTED'): verify.write_result(changed, output)
+                    self.assertFalse(output.exists())
+
+    def test_invalid_json_only_saves_error_category_and_coordinates_not_body(self):
+        private = 'PRIVATE_PROVIDER_ERROR_SENTINEL'
+        def transport(_, body):
+            value = envelope(body); outer = json.loads(value['body'])
+            outer['choices'][0]['message']['content'] = '{"private": "' + private + '",}'
+            value['body'] = json.dumps(outer); return value
+        result = verify.verify('synthetic', fetch_pdf=lambda: b'%PDF synthetic', extractor=extractor, transport=transport)
+        self.assertEqual(result['status'], 'rejected'); self.assertEqual(result['modelRequests'], 1)
+        self.assertFalse(result['executionSuccess']); self.assertEqual(result['modelReceipt']['outcome'], 'rejected')
+        diagnostic = result['inference']['formatDiagnostics']
+        self.assertEqual(diagnostic['jsonStatus'], 'invalid'); self.assertEqual(diagnostic['jsonError']['category'], 'syntax')
+        self.assertTrue(verify.valid_format_diagnostics(diagnostic))
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'result.json'; verify.write_result(result, output)
+            self.assertNotIn(private, output.read_text()); self.assertNotIn('private', json.dumps(diagnostic))
+        self.assertFalse(result['semanticAnalysisComplete']); self.assertFalse(result['productionDataModified'])
+
+    def test_transport_error_body_is_ignored_and_unknown_receipt_remains_spent(self):
+        calls = []
+        def transport(*_):
+            calls.append(True)
+            return {'errorCode': 'PROVIDER_TIMEOUT', 'body': 'PRIVATE_TRANSPORT_BODY_SENTINEL',
+                    'formatDiagnostics': {'private': 'PRIVATE_FORMAT_SENTINEL'}}
+        result = verify.verify('synthetic', fetch_pdf=lambda: b'%PDF synthetic', extractor=extractor, transport=transport)
+        self.assertEqual(len(calls), 1); self.assertEqual(result['status'], 'unknown')
+        self.assertEqual(result['modelRequests'], 1); self.assertEqual(result['modelReceipt']['outcome'], 'unknown')
+        self.assertIsNone(result['inference']['formatDiagnostics'])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'result.json'; verify.write_result(result, output)
+            self.assertNotIn('PRIVATE_', output.read_text())
 
 
 if __name__ == '__main__':
