@@ -17,17 +17,19 @@ jobs:
           sparse-checkout-cone-mode: false
           sparse-checkout: |
             /scripts/verify_universe.py
+            /scripts/historical_universe.py
             /scripts/publication_guard.py
             /scripts/publication_cache.py
             /tests/test_verify_universe.py
+            /tests/test_historical_universe.py
             /.github/workflows/verify-universe.yml
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Test bounded XLSX inspection without network
-        run: python -m unittest discover -s tests -p 'test_verify_universe.py'
-      - name: Inspect the fixed official June index
-        run: python scripts/verify_universe.py
+        run: python -m unittest discover -s tests -p 'test_*universe.py'
+      - name: Parse the pinned official June product index
+        run: python scripts/historical_universe.py
       - name: Retain compact guarded verification only
         if: always()
         uses: actions/upload-artifact@v4
