@@ -11,8 +11,9 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    # Allow a measured full-history cold seed when no valid proof exists.
-    timeout-minutes: 12
+    # A cold proof must scan every historical blob; 12 minutes covered only
+    # 55 of 132 commits in the measured run. Leave time to save the proof.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
