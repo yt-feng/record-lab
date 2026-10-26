@@ -693,6 +693,12 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
     selected = []
     enrich_codes = set(enrichment_eligible(states))
     quality_codes = set(quality_eligible(states)) if quality_enabled(config) else set()
+    # A report with only missing quotes belongs to the price repair lane. Keep
+    # its known missing securities as explicit targets rather than recollecting
+    # every security under the broader report repair budget.
+    quality_codes -= {code for code in quality_codes & enrich_codes
+                      if states[code]["quality"]["missingFields"] == ["prices"]
+                      and states[code]["enrichment"]["missingStocks"]}
     source_codes = eligible(states)
     if quality_enabled(config):
         selected = fair_research_selection(states, source_codes, quality_codes, enrich_codes, shards * batch_size)

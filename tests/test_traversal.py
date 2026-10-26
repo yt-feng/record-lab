@@ -386,6 +386,30 @@ class TraversalTests(unittest.TestCase):
         self.assertEqual(set(all_selected), set(states))
         self.assertEqual(len(all_selected), len(states))
 
+    def test_retained_price_only_gap_uses_targeted_price_lane_not_report_lane(self):
+        config = {**CONFIG, "collectorVersion": 3, "requireReportQuality": True}
+        price_only = self.retained_fund()
+        price_only["rows"][0]["priceRange"] = {"status": "missing"}
+        report_gap = json.loads(json.dumps(price_only))
+        report_gap.update({"code": "000002", "shareClassCodes": ["000002"]})
+        report_gap["selectedReport"]["fundCode"] = "000002"
+        report_gap["selectedReport"]["pageStats"]["textStatus"] = "unknown"
+        previous = {"schemaVersion": 1, "phase": PHASE, "collectorVersion": 3, "funds": [
+            {"code": code, "companyCode": "co1", "status": "complete", "attempts": 1,
+             "lastAttemptAt": "2026-09-29T11:00:00Z"} for code in ("000001", "000002")]}
+        plan = traversal.plan_batches(catalog(), previous, config, shards=1, batch_size=3,
+                                      now=NOW, retained=[price_only, report_gap])
+        batch = plan["batches"]["batch-0.json"]
+        items = {item["code"]: item for item in batch["funds"]}
+        self.assertEqual(batch["traversal"]["enrichmentCodes"], ["000001"])
+        self.assertEqual(batch["traversal"]["qualityCodes"], ["000002"])
+        self.assertEqual(items["000001"]["priceTargets"], [{"stockCode": "600001", "market": "CN"}])
+        self.assertNotIn("priceTargets", items["000002"])
+        self.assertEqual(plan["meta"]["freshCount"], 1)
+        self.assertEqual(plan["meta"]["qualityCount"], 1)
+        self.assertEqual(plan["meta"]["enrichmentCount"], 1)
+        self.assertEqual(len(items), 3)
+
     def test_round_robin_starts_with_less_visited_institution(self):
         states = {"000001": {"companyCode": "co1", "totalAttempts": 2, "lastAttemptAt": NOW,
                     "quality": {"totalAttempts": 0}, "enrichment": {"totalAttempts": 0}},
