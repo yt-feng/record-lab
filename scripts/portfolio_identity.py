@@ -139,10 +139,23 @@ def parse_portfolio_identity(pages, report, *, page_numbers=None, retrieved_at=N
     if not title: return reject('PERIOD_TITLE_PAGE_UNKNOWN')
     headings = list(HEADINGS.finditer(text))
     starts = [item for item in headings if re.sub(r'\s+', '', item['text']) in {'§2基金产品概况', '2.1基金基本情况'}]
-    # A normal report has one product identity section. Duplicated real tables
-    # require review instead of pairing one product's main code with another.
-    if len(starts) != 1: return reject('IDENTITY_SECTION_START_COUNT')
-    start = starts[0]; is_quarter = re.sub(r'\s+', '', start['text']) == '§2基金产品概况'
+    # A quarterly product overview may contain an immediately nested 2.1
+    # heading. This pair describes one section, not two independent tables.
+    # Only whitespace/table separators may intervene; repeated tables, a TOC
+    # followed by a real section, or identity data before the child stay rejected.
+    if len(starts) == 2:
+        parent, child = starts
+        if (report.get('kind') != 'quarterly'
+                or re.sub(r'\s+', '', parent['text']) != '§2基金产品概况'
+                or re.sub(r'\s+', '', child['text']) != '2.1基金基本情况'
+                or text[parent.end():child.start()].strip(' \t\r\n|')):
+            return reject('IDENTITY_SECTION_START_COUNT')
+        start = parent
+    elif len(starts) == 1:
+        start = starts[0]
+    else:
+        return reject('IDENTITY_SECTION_START_COUNT')
+    is_quarter = re.sub(r'\s+', '', start['text']) == '§2基金产品概况'
     closing = next((item for item in headings if item.start() > start.end()
                     and re.sub(r'\s+', '', item['text']).startswith('§3' if is_quarter else '2.2')), None)
     if not closing: return reject('IDENTITY_SECTION_END_NOT_FOUND')

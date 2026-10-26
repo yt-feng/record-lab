@@ -23,7 +23,8 @@ class SyntheticPdfProvider(verify.FixedPdfProvider):
         self.pdf_requests += 1
         self.pdf_bytes = 200
         self.pdf_sha256 = hashlib.sha256(b'synthetic-fixture').hexdigest()
-        pages = [self.sample['title'], '§2 基金产品概况\n基金主代码 ' + self.sample['codes'][0] + '\n',
+        child_heading = '2.1 基金基本情况\n' if self.sample['targetPeriod'] == '2026Q3' else ''
+        pages = [self.sample['title'], '§2 基金产品概况\n' + child_heading + '基金主代码 ' + self.sample['codes'][0] + '\n',
                  '§3 主要财务指标和基金净值表现\n' + '这是合成测试文本。' * 30]
         identity = parse_portfolio_identity(pages, report,
             retrieved_at=dt.datetime.now(dt.timezone.utc).isoformat(), pdf_sha256=self.pdf_sha256)

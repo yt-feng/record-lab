@@ -30,6 +30,47 @@ def proof(pages=None, report=None, **kwargs):
 
 
 class PortfolioIdentityTests(unittest.TestCase):
+    def test_quarterly_adjacent_parent_child_titles_share_one_bounded_identity_section(self):
+        # The 159366 cloud diagnostic showed these exact two adjacent headings.
+        pages = [PAGES[0], PAGES[1].replace('§2 基金产品概况\n', '§2 基金产品概况\n2.1 基金基本情况\n'), PAGES[2]]
+        value = proof(pages)
+        self.assertEqual(value['identitySection']['heading'], '§2 基金产品概况')
+        self.assertEqual(value['identitySection']['endHeading'], '§3 主要财务指标和基金净值表现')
+        self.assertEqual(value['identitySection']['pages'], [2, 3])
+        self.assertEqual(value['sourcePortfolioCode'], '000001')
+        self.assertEqual(value['shareClassCodes'], ['000001', '000002'])
+        self.assertEqual(value['rows'][0]['pages'], [2])
+        self.assertEqual(value['pdfSha256'], hashlib.sha256(PDF).hexdigest())
+        # A later 2.2 subsection does not truncate the quarterly parent section.
+        value = proof([pages[0], pages[1] + '2.2 基金其他说明\n本节无额外代码。\n', pages[2]])
+        self.assertEqual(value['identitySection']['endHeading'], '§3 主要财务指标和基金净值表现')
+
+    def test_nested_titles_do_not_admit_toc_disjoint_duplicate_or_conflicting_tables(self):
+        nested = PAGES[1].replace('§2 基金产品概况\n', '§2 基金产品概况\n2.1 基金基本情况\n')
+        cases = [
+            [PAGES[0], '§2 基金产品概况\n2.1 基金基本情况\n目录\n', nested, PAGES[2]],
+            [PAGES[0], nested + '2.1 基金基本情况\n基金主代码 000001\n', PAGES[2]],
+            [PAGES[0], PAGES[1], PAGES[2], '2.1 基金基本情况\n基金主代码 000003\n2.2 基金产品说明'],
+            [PAGES[0], nested.replace('2.1 基金基本情况', '基金主代码 000003\n2.1 基金基本情况'), PAGES[2]],
+            [PAGES[0], nested + '基金主代码 000003\n', PAGES[2]],
+            [PAGES[0], nested.replace('000001 000002', '000002 000003'), PAGES[2]],
+            [PAGES[0].replace('第2', '第3'), nested, PAGES[2]],
+            [PAGES[0], nested, PAGES[2], nested, PAGES[2]],
+        ]
+        for pages in cases:
+            with self.subTest(pages=pages): self.assertIsNone(proof(pages))
+        for numbers in ([1, None, 3], [1, 2, 4]):
+            self.assertIsNone(proof([PAGES[0], nested, PAGES[2]], page_numbers=numbers))
+
+    def test_interim_uses_its_own_2_1_to_2_2_section_and_cannot_borrow_quarterly_parent(self):
+        report = {**REPORT, 'kind': 'semiannual'}
+        pages = [PAGES[0].replace('第2季度', '中期'), PAGES[1].replace('§2 基金产品概况', '2.1 基金基本情况'),
+                 '2.2 基金产品说明']
+        value = proof(pages, report)
+        self.assertEqual(value['identitySection']['heading'], '2.1 基金基本情况')
+        self.assertEqual(value['identitySection']['endHeading'], '2.2 基金产品说明')
+        self.assertIsNone(proof([pages[0], '§2 基金产品概况\n' + pages[1], pages[2]], report))
+
     def test_optional_branch_diagnostics_do_not_change_identity_acceptance(self):
         diagnostics = {}
         self.assertEqual(proof(diagnostics=diagnostics), proof())
