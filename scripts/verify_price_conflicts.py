@@ -2,17 +2,22 @@
 from __future__ import annotations
 import argparse
 import datetime as dt
+import errno
 import hashlib
+import http.client
 import json
 import math
 import os
 from pathlib import Path
 import re
+import socket
+import ssl
 import subprocess
 import time
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
+from urllib3 import exceptions as urllib3_errors
 from providers import (DataError, stock_identifiers, parse_eastmoney_prices,
                        parse_yahoo_prices, parse_tencent_prices)
 from foreign_prices import us_identifiers, parse_us_yahoo_prices
@@ -21,10 +26,49 @@ from publication_guard import inspect_content
 
 MAX_OUTPUT = 65536
 MAX_RESPONSE = 2_000_000
+NETWORK_CLASS_BY_CODE = {
+    'REQUERY_HTTP_REJECTED': frozenset({'HTTP_4XX', 'HTTP_429', 'HTTP_5XX', 'OTHER'}),
+    'REQUERY_TIMEOUT': frozenset({'TIMEOUT'}),
+    'REQUERY_NETWORK_ERROR': frozenset({'TIMEOUT', 'TLS', 'CONNECTION_RESET', 'DISCONNECTED', 'DNS', 'OTHER'}),
+}
+
+
+def valid_network_error_class(code, category):
+    return isinstance(code, str) and isinstance(category, str) and category in NETWORK_CLASS_BY_CODE.get(code, ())
 
 
 class DiagnosticError(Exception):
-    pass
+    def __init__(self, code, *, network_error_class=None):
+        super().__init__(code)
+        if network_error_class is not None and not valid_network_error_class(code, network_error_class):
+            raise ValueError('INVALID_NETWORK_ERROR_CLASS')
+        self.network_error_class = network_error_class
+
+
+def network_error_class(error):
+    """Bounded typed exception traversal. Never inspect exception messages."""
+    pending, seen = [error], set()
+    dns_types = (socket.gaierror,) + tuple(value for value in [getattr(urllib3_errors, 'NameResolutionError', None)] if isinstance(value, type))
+    for _ in range(32):
+        if not pending: break
+        current = pending.pop(0)
+        if id(current) in seen: continue
+        seen.add(id(current))
+        if isinstance(current, (tuple, list)):
+            pending.extend(current[:8]); pending = pending[:32]; continue
+        if not isinstance(current, BaseException): continue
+        if isinstance(current, (requests.exceptions.Timeout, TimeoutError, urllib3_errors.TimeoutError)): return 'TIMEOUT'
+        if isinstance(current, (requests.exceptions.SSLError, ssl.SSLError, urllib3_errors.SSLError)): return 'TLS'
+        if isinstance(current, (http.client.RemoteDisconnected, http.client.IncompleteRead)): return 'DISCONNECTED'
+        if isinstance(current, dns_types): return 'DNS'
+        if isinstance(current, ConnectionResetError) or isinstance(current, OSError) and current.errno == errno.ECONNRESET:
+            return 'CONNECTION_RESET'
+        if isinstance(current, (BrokenPipeError, ConnectionAbortedError)) or isinstance(current, OSError) and current.errno in (errno.EPIPE, errno.ECONNABORTED):
+            return 'DISCONNECTED'
+        pending.extend(value for value in (current.__cause__, current.__context__, vars(current).get('reason'), current.args)
+                       if isinstance(value, (BaseException, tuple, list)))
+        pending = pending[:32]
+    return 'OTHER'
 
 
 def request_for(row, group, now):
@@ -86,7 +130,9 @@ class ActionsTransport:
             with requests.get(url, timeout=(4, 6), allow_redirects=False, stream=True,
                               headers={'User-Agent': 'Mozilla/5.0'}) as response:
                 if response.status_code != 200:
-                    raise DiagnosticError('REQUERY_HTTP_REJECTED')
+                    status = response.status_code
+                    category = 'HTTP_429' if status == 429 else 'HTTP_4XX' if 400 <= status < 500 else 'HTTP_5XX' if 500 <= status < 600 else 'OTHER'
+                    raise DiagnosticError('REQUERY_HTTP_REJECTED', network_error_class=category)
                 chunks, size = [], 0
                 for chunk in response.iter_content(65536):
                     size += len(chunk)
@@ -95,9 +141,9 @@ class ActionsTransport:
                     chunks.append(chunk)
                 raw = b''.join(chunks)
         except requests.exceptions.Timeout:
-            raise DiagnosticError('REQUERY_TIMEOUT') from None
-        except requests.exceptions.RequestException:
-            raise DiagnosticError('REQUERY_NETWORK_ERROR') from None
+            raise DiagnosticError('REQUERY_TIMEOUT', network_error_class='TIMEOUT') from None
+        except requests.exceptions.RequestException as error:
+            raise DiagnosticError('REQUERY_NETWORK_ERROR', network_error_class=network_error_class(error)) from None
         return raw
 
 
@@ -163,9 +209,11 @@ def requery(result, *, fetch=None, now=None):
                     output['storedRangeExactlyReproduced'] = output['low'] == group['low'] and output['high'] == group['high']
                     daily.append((output, {value['date']: value for value in values}))
                 except (DiagnosticError, DataError) as error:
-                    output['errorCode'] = str(error)
+                    output.update(status='unavailable', errorCode=str(error))
+                    category = getattr(error, 'network_error_class', None)
+                    if valid_network_error_class(output['errorCode'], category): output['networkErrorClass'] = category
                 except Exception:
-                    output['errorCode'] = 'REQUERY_PARSE_FAILED'
+                    output.update(status='unavailable', errorCode='REQUERY_PARSE_FAILED')
             row['requotes'] = outputs
             row['requeryComparison'] = {'status': 'insufficient-verified-responses', 'resolution': 'unresolved'}
             if len(daily) == 2:

@@ -1,10 +1,14 @@
 """Bounded synthetic price responses only; tests never contact quote providers."""
 import copy
 import datetime as dt
+import errno
+import http.client
 import json
 import os
 from pathlib import Path
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -46,6 +50,61 @@ def payload(provider, low=1, high=2, partial=False):
 
 
 class PriceConflictVerificationTests(unittest.TestCase):
+    def test_http_failures_emit_only_fixed_class_without_reading_response_details(self):
+        class Response:
+            def __init__(self, status): self.status_code = status
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            @property
+            def headers(self): raise AssertionError('must not read headers')
+            @property
+            def text(self): raise AssertionError('must not read response body')
+            def iter_content(self, *args): raise AssertionError('must not read response body')
+        for status, category in ((400, 'HTTP_4XX'), (403, 'HTTP_4XX'), (429, 'HTTP_429'), (500, 'HTTP_5XX'), (503, 'HTTP_5XX'), (302, 'OTHER')):
+            result = sampled()
+            with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), patch.object(verify.requests, 'get', return_value=Response(status)):
+                verify.requery(result, now=NOW)
+            for quote in result['quarters'][0]['selected'][0]['requotes']:
+                self.assertEqual(quote['errorCode'], 'REQUERY_HTTP_REJECTED')
+                self.assertEqual(quote['networkErrorClass'], category); self.assertEqual(quote['status'], 'unavailable')
+                self.assertEqual(quote['observedAt'], NOW.isoformat()); self.assertNotIn('fetchedAt', quote)
+                self.assertNotIn('responseSha256', quote)
+
+    def test_wrapped_transport_errors_use_types_and_errno_never_messages(self):
+        req, low = verify.requests.exceptions, verify.urllib3_errors
+        hidden = 'PRIVATE_DIAGNOSTIC_TEXT'
+        cases = [(req.Timeout(hidden), 'REQUERY_TIMEOUT', 'TIMEOUT'),
+                 (req.SSLError(hidden), 'REQUERY_NETWORK_ERROR', 'TLS'),
+                 (req.ConnectionError(low.SSLError(ssl.SSLError(hidden))), 'REQUERY_NETWORK_ERROR', 'TLS'),
+                 (req.ConnectionError(low.ProtocolError(hidden, ConnectionResetError(errno.ECONNRESET, hidden))), 'REQUERY_NETWORK_ERROR', 'CONNECTION_RESET'),
+                 (req.ConnectionError(low.ProtocolError(hidden, http.client.RemoteDisconnected(hidden))), 'REQUERY_NETWORK_ERROR', 'DISCONNECTED'),
+                 (req.ConnectionError(socket.gaierror(socket.EAI_NONAME, hidden)), 'REQUERY_NETWORK_ERROR', 'DNS'),
+                 (req.ConnectionError(low.MaxRetryError(None, 'not-output', reason=socket.gaierror(socket.EAI_AGAIN, hidden))), 'REQUERY_NETWORK_ERROR', 'DNS'),
+                 (req.ConnectionError(low.ReadTimeoutError(None, 'not-output', hidden)), 'REQUERY_NETWORK_ERROR', 'TIMEOUT'),
+                 (req.ConnectionError(BrokenPipeError(errno.EPIPE, hidden)), 'REQUERY_NETWORK_ERROR', 'DISCONNECTED'),
+                 (req.ConnectionError(hidden + ' TLS DNS reset timeout'), 'REQUERY_NETWORK_ERROR', 'OTHER')]
+        for error, code, category in cases:
+            result = sampled()
+            with self.subTest(category=category), patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), patch.object(verify.requests, 'get', side_effect=error):
+                verify.requery(result, now=NOW)
+            quotes = result['quarters'][0]['selected'][0]['requotes']
+            self.assertTrue(all(q['status'] == 'unavailable' and q['errorCode'] == code and q['networkErrorClass'] == category for q in quotes))
+            self.assertEqual(result['quarters'][0]['selected'][0]['requeryComparison']['status'], 'insufficient-verified-responses')
+            self.assertNotIn(hidden, json.dumps(result)); self.assertNotIn('not-output', json.dumps(result))
+
+    def test_exception_walk_is_bounded_and_legacy_errors_do_not_gain_inferred_classes(self):
+        error = verify.requests.exceptions.ConnectionError('TLS is only text'); error.__cause__ = error
+        self.assertEqual(verify.network_error_class(error), 'OTHER')
+        nested = socket.gaierror(socket.EAI_NONAME, 'private')
+        for _ in range(40): nested = verify.requests.exceptions.ConnectionError(nested)
+        self.assertEqual(verify.network_error_class(nested), 'OTHER')
+        result = sampled()
+        def legacy(_): raise verify.DiagnosticError('REQUERY_NETWORK_ERROR')
+        verify.requery(result, fetch=legacy, now=NOW)
+        self.assertTrue(all('networkErrorClass' not in q for q in result['quarters'][0]['selected'][0]['requotes']))
+        with self.assertRaisesRegex(ValueError, 'INVALID_NETWORK_ERROR_CLASS'):
+            verify.DiagnosticError('REQUERY_NETWORK_ERROR', network_error_class='unbounded description')
+
     def test_two_original_sources_only_and_strict_daily_differences_are_retained(self):
         result = sampled(); calls = []
         def fetch(source):

@@ -2,6 +2,16 @@ name: Recheck bounded security price conflicts
 on:
   workflow_dispatch:
     inputs:
+      keys_per_quarter:
+        description: Maximum securities per quarter; at most two original sources each
+        required: true
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
       data_commit:
         description: Published data commit to inspect
         required: true
@@ -69,6 +79,7 @@ jobs:
         run: |
           node --test tests/test_price_conflict_scan.js tests/test_price_validation_cache.js
           python -m unittest discover -s tests -p 'test_price_conflicts.py'
+          python -m unittest discover -s tests -p 'test_price_conflict_limits.py'
           python -m unittest discover -s tests -p 'test_restore_price_conflict_ledger.py'
       - name: Restore explicitly bound prior ledger
         env:
@@ -84,10 +95,12 @@ jobs:
             exit 1
           fi
           python scripts/restore_price_conflict_ledger.py --prior-run-id "$PRIOR_RUN_ID" --prior-source-commit "$PRIOR_SOURCE_COMMIT" --prior-data-commit "$PRIOR_DATA_COMMIT" --data-commit "$data_sha" --output .cache/price-conflicts-restore/state.json
-      - name: Scan published conflicts and recheck up to eight keys
+      - name: Scan published conflicts within each quarter limit
+        env:
+          KEYS_PER_QUARTER: ${{ inputs.keys_per_quarter }}
         run: |
           export PRICE_DIAGNOSTIC_DATA_COMMIT="$(git -C .cache/conflict-source rev-parse HEAD)"
-          python scripts/price_conflicts.py run --data .cache/conflict-source/web/data/periods --output .cache/price-conflicts --quarters both --max-keys 8 --max-requests 16 --restore-state .cache/price-conflicts-restore/state.json
+          python scripts/price_conflicts.py run --data .cache/conflict-source/web/data/periods --output .cache/price-conflicts --quarters both --keys-per-quarter "$KEYS_PER_QUARTER" --restore-state .cache/price-conflicts-restore/state.json
       - name: Retain guarded conflict ledger
         if: always()
         uses: actions/upload-artifact@v4

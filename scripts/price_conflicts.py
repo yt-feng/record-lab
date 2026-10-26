@@ -450,7 +450,7 @@ def validate_quote(quote, request, row, now):
                'responseBytes', 'fetchedAt', 'symbol', 'currency', 'splitEventCount', 'splitDates', 'metadataStatus',
                'low', 'high', 'priceBasis', 'observedCount', 'completeness', 'expectedSessionCount', 'observedDateSetHash',
                'expectedDateSetHash', 'missingSessionCount', 'unexpectedSessionCount', 'rejectedRowCount', 'conflictingDateCount',
-               'storedRangeExactlyReproduced', 'errorCode'}
+               'storedRangeExactlyReproduced', 'errorCode', 'networkErrorClass'}
     if (not isinstance(quote, dict) or set(quote) - allowed or quote.get('groupIndex') != 0 or quote.get('requested') is not True
             or quote.get('status') != request['outcome'] or not instant(quote.get('observedAt'))
             or not instant(request['startedAt']) <= instant(quote['observedAt']) <= now + dt.timedelta(minutes=5)):
@@ -466,6 +466,10 @@ def validate_quote(quote, request, row, now):
         if name.endswith('Count') or name == 'responseBytes':
             if value is not None: bounded_int(value, diagnostic.MAX_RESPONSE, 'CONFLICT_RECEIPT_INVALID')
     if 'errorCode' in quote and not re.fullmatch(r'[A-Z][A-Z0-9_]{1,79}', str(quote['errorCode'])): fail('CONFLICT_RECEIPT_INVALID')
+    if 'errorCode' in quote and request['outcome'] != 'unavailable': fail('CONFLICT_RECEIPT_INVALID')
+    if 'networkErrorClass' in quote and (request['outcome'] != 'unavailable'
+        or not diagnostic.valid_network_error_class(quote.get('errorCode'), quote['networkErrorClass'])):
+        fail('CONFLICT_RECEIPT_INVALID')
     if 'responseSha256' in quote and not HASH.fullmatch(str(quote['responseSha256'])): fail('CONFLICT_RECEIPT_INVALID')
     if 'fetchedAt' in quote and (not instant(quote['fetchedAt']) or not instant(request['startedAt']) <= instant(quote['fetchedAt']) <= now + dt.timedelta(minutes=5)): fail('CONFLICT_RECEIPT_INVALID')
     if 'splitDates' in quote and (not isinstance(quote['splitDates'], list) or len(quote['splitDates']) > 3
@@ -621,14 +625,17 @@ def merge_receipts(registry, previous_ledger, plan, receipts, *, now=None):
     return normalize_ledger(ledger, plan['quarter'], current)
 
 
-def run(data_root, output, *, quarters='both', max_keys=8, max_requests=16, now=None, fetch=None, restored_state=None):
+def run(data_root, output, *, quarters='both', max_keys=8, max_requests=16, keys_per_quarter=1, now=None, fetch=None, restored_state=None):
     """Actions artifact run. The input tree is read-only, including its ledger."""
     if os.environ.get('GITHUB_ACTIONS') != 'true': fail('CONFLICT_REQUIRES_ACTIONS')
     bounded_int(max_keys, MAX_PLAN_KEYS, 'CONFLICT_LIMIT_INVALID'); bounded_int(max_requests, MAX_REQUESTS, 'CONFLICT_LIMIT_INVALID')
+    if type(keys_per_quarter) is not int or not 1 <= keys_per_quarter <= 4: fail('CONFLICT_LIMIT_INVALID')
     if quarters not in ('both', *PHASES): fail('CONFLICT_ARGUMENTS_INVALID')
     source, destination = Path(data_root).resolve(), Path(output).resolve()
     if destination.is_relative_to(source): fail('CONFLICT_OUTPUT_INSIDE_SOURCE')
     selected = list(PHASES) if quarters == 'both' else [quarters]
+    max_keys = min(max_keys, len(selected) * keys_per_quarter)
+    max_requests = min(max_requests, len(selected) * keys_per_quarter * 2)
     restored = normalize_restored_state(restored_state, now) if restored_state is not None else None
     if fetch is None and max_keys and max_requests:
         if restored is None: fail('CONFLICT_PRIOR_LEDGER_REQUIRED')
@@ -658,7 +665,7 @@ def run(data_root, output, *, quarters='both', max_keys=8, max_requests=16, now=
         if restored: write_json(ledger, destination / quarter / 'input-ledger.json')
         write_json(ledger, destination / quarter / 'ledger.json')
     result = {'schemaVersion': 1, 'kind': 'price-conflict-run', 'generatedAt': clock(now).isoformat(),
-              'status': 'complete', 'quarters': [], 'maxKeys': max_keys, 'maxRequests': max_requests,
+              'status': 'complete', 'quarters': [], 'keysPerQuarter': keys_per_quarter, 'maxKeys': max_keys, 'maxRequests': max_requests,
               'productionDataModified': False, 'automaticResolution': False}
     remaining_keys, remaining_requests = max_keys, max_requests
     for position, quarter in enumerate(selected):
@@ -667,8 +674,8 @@ def run(data_root, output, *, quarters='both', max_keys=8, max_requests=16, now=
         directory = destination / quarter
         write_json(registry, directory / 'registry.json')
         left = len(selected) - position
-        plan = plan_rechecks(registry, ledger, max_keys=(remaining_keys + left - 1) // left,
-                             max_requests=(remaining_requests + left - 1) // left, now=now)
+        plan = plan_rechecks(registry, ledger, max_keys=min(keys_per_quarter, (remaining_keys + left - 1) // left),
+                             max_requests=min(keys_per_quarter * 2, (remaining_requests + left - 1) // left), now=now)
         write_json(plan, directory / 'plan.json'); write_json(ledger, directory / 'ledger.json')
         def checkpoint(receipts):
             nonlocal ledger
@@ -701,9 +708,11 @@ def main(argv=None):
         parser.add_argument('--' + field)
     parser.add_argument('--max-keys', type=int, default=10); parser.add_argument('--max-requests', type=int, default=20)
     parser.add_argument('--quarters', choices=('both', *PHASES), default='both')
+    parser.add_argument('--keys-per-quarter', default='1')
     args = parser.parse_args(argv)
     try:
         if os.environ.get('GITHUB_ACTIONS') != 'true': fail('CONFLICT_REQUIRES_ACTIONS')
+        if not re.fullmatch(r'[1-4]', args.keys_per_quarter): fail('CONFLICT_LIMIT_INVALID')
         if not args.output: fail('CONFLICT_ARGUMENTS_INVALID')
         targets = [args.output] + ([args.checkpoint] if args.checkpoint else [])
         if args.data and any(Path(target).resolve().is_relative_to(Path(args.data).resolve()) for target in targets): fail('CONFLICT_OUTPUT_INSIDE_SOURCE')
@@ -711,7 +720,7 @@ def main(argv=None):
             if source and any(Path(source).resolve() == Path(target).resolve() for target in targets): fail('CONFLICT_OUTPUT_OVERWRITES_INPUT')
         if args.command == 'run':
             result = run(args.data, args.output, quarters=args.quarters, max_keys=args.max_keys, max_requests=args.max_requests,
-                         restored_state=read_json(args.restore_state) if args.restore_state else None)
+                         keys_per_quarter=int(args.keys_per_quarter), restored_state=read_json(args.restore_state) if args.restore_state else None)
         elif args.command == 'scan': result = scan_registry(args.data, args.quarter)
         else:
             registry = normalize_registry(read_json(args.registry))

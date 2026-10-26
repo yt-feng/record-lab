@@ -3,6 +3,7 @@ import copy
 import datetime as dt
 import contextlib
 import io
+import http.client
 import json
 import os
 from pathlib import Path
@@ -56,6 +57,45 @@ def registry(groups=None, quarter='2026Q2'):
 
 
 class PriceConflictsTests(unittest.TestCase):
+    def test_new_transport_classes_preserve_old_receipts_and_exhaust_the_same_two_round_budget(self):
+        value = registry(); first_plan = conflicts.plan_rechecks(value, now=NOW)
+        def legacy(_): raise conflicts.diagnostic.DiagnosticError('REQUERY_NETWORK_ERROR')
+        first = conflicts.execute_rechecks(first_plan, value, checkpoint=lambda _: None, fetch=legacy, now=NOW)
+        ledger = conflicts.merge_receipts(value, None, first_plan, first['receipts'], now=NOW)
+        original = copy.deepcopy(ledger)
+        later = NOW + dt.timedelta(minutes=1); plan = conflicts.plan_rechecks(value, ledger, now=later)
+        error = conflicts.diagnostic.requests.exceptions.ConnectionError(http.client.RemoteDisconnected('PRIVATE_DIAGNOSTIC_TEXT'))
+        with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), patch.object(conflicts.diagnostic.requests, 'get', side_effect=error) as request:
+            second = conflicts.execute_rechecks(plan, value, ledger, checkpoint=lambda _: None, now=later)
+        self.assertEqual(request.call_count, 2)
+        ledger = conflicts.merge_receipts(value, ledger, plan, second['receipts'], now=later)
+        self.assertEqual(conflicts.merge_receipts(value, ledger, plan, second['receipts'], now=later), ledger)
+        rounds = ledger['entries'][0]['digests'][0]['rounds']
+        self.assertEqual(rounds[0], original['entries'][0]['digests'][0]['rounds'][0])
+        self.assertTrue(all('networkErrorClass' not in r['quote'] for r in rounds[0]['requests']))
+        self.assertTrue(all(r['quote']['networkErrorClass'] == 'DISCONNECTED' and r['outcome'] == 'unavailable' for r in rounds[1]['requests']))
+        self.assertTrue(all(r['resolution'] == 'unresolved' for r in rounds))
+        self.assertEqual(conflicts.plan_rechecks(value, ledger, now=later)['items'], [])
+        backfill = copy.deepcopy(first['receipts']); backfill[0]['requests'][0]['quote']['networkErrorClass'] = 'DISCONNECTED'
+        with self.assertRaises(conflicts.ConflictError): conflicts.merge_receipts(value, ledger, first_plan, backfill, now=later)
+        self.assertEqual(rounds[0], original['entries'][0]['digests'][0]['rounds'][0])
+
+    def test_error_class_cannot_be_added_to_success_or_unknown_or_mismatched_error_code(self):
+        value = registry(); plan = conflicts.plan_rechecks(value, now=NOW)
+        def failed(_): raise conflicts.diagnostic.DiagnosticError('REQUERY_NETWORK_ERROR', network_error_class='DNS')
+        receipt = conflicts.execute_rechecks(plan, value, checkpoint=lambda _: None, fetch=failed, now=NOW)['receipts'][0]
+        self.assertEqual(conflicts.normalize_receipt(receipt, now=NOW), receipt)
+        for change in ('unknown-class', 'wrong-code', 'observed', 'unknown'):
+            invalid = copy.deepcopy(receipt); event = invalid['requests'][0]
+            if change == 'unknown-class': event['quote']['networkErrorClass'] = 'PRIVATE_DIAGNOSTIC_TEXT'
+            elif change == 'wrong-code': event['quote']['errorCode'] = 'REQUERY_TIMEOUT'
+            else: event['outcome'] = change; event['quote']['status'] = change
+            with self.subTest(change=change), self.assertRaises(conflicts.ConflictError): conflicts.normalize_receipt(invalid, now=NOW)
+        success = conflicts.execute_rechecks(plan, value, checkpoint=lambda _: None,
+            fetch=lambda url: payload('eastmoney' if 'eastmoney' in url else 'tencent'), now=NOW)['receipts'][0]
+        success['requests'][0]['quote'].update(errorCode='REQUERY_NETWORK_ERROR', networkErrorClass='DNS')
+        with self.assertRaises(conflicts.ConflictError): conflicts.normalize_receipt(success, now=NOW)
+
     def test_scanner_timeout_is_explicit_and_only_fixed_progress_counters_are_relayed(self):
         progress = {'kind': 'price-conflict-scan-progress', 'phase': 'index', 'completedCompanyPages': 25, 'totalCompanyPages': 200,
                     'validation': dict(hits=50, misses=5, bypasses=1, evictions=0, checks=5, entries=4, bytes=1000, maxEntries=4096, maxBytes=16777216)}
