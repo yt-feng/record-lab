@@ -110,11 +110,20 @@ class HistoricalUniverseTests(unittest.TestCase):
         self.assertEqual(result['diagnostics']['rejectionReasons']['MISSING_FORMULA_CACHE'], 1)
         self.assertEqual(result['evidence'][0]['unresolvedRows'], 1)
 
-    def test_invalid_dates_and_excel_phantom_leap_day_are_rejected(self):
-        for date in ['60', '0', '-1', '45118.5', str((dt.date(2026, 7, 1) - dt.date(1899, 12, 30)).days)]:
+    def test_unresolved_optional_dates_do_not_drop_readable_product_codes(self):
+        for date in ['60', '0', '-1', '45118.5']:
             result = parse(workbook(files([product(3, '000001'), product(4, '018774', date=date)])))
             self.assertEqual(result['parseStatus'], 'partial')
-            self.assertEqual(result['diagnostics']['rejectionReasons']['INVALID_FOUNDATION_DATE'], 1)
+            self.assertEqual(result['diagnostics']['rejectedRows'], 0)
+            self.assertEqual(result['diagnostics']['unresolvedInceptionRows'], 1)
+            self.assertTrue(result['diagnostics']['productRowsComplete'])
+            self.assertFalse(result['diagnostics']['inceptionMetadataComplete'])
+            self.assertEqual([row['code'] for row in result['records']], ['000001', '018774'])
+            self.assertNotIn('inceptionDate', result['records'][1])
+        future = str((dt.date(2026, 7, 1) - dt.date(1899, 12, 30)).days)
+        result = parse(workbook(files([product(3, '000001'), product(4, '018774', date=future)])))
+        self.assertEqual(result['diagnostics']['rejectionReasons']['FOUNDATION_AFTER_INDEX_DATE'], 1)
+        self.assertEqual([row['code'] for row in result['records']], ['000001'])
         for serial, expected in [('59', '1900-02-28'), ('61', '1900-03-01')]:
             cell = {'type': 'n', 'hasFormula': False, 'numberFormat': 'yyyy/m/d;@', 'rawValue': serial}
             self.assertEqual(history.excel_1900_date(cell), expected)

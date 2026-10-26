@@ -15,7 +15,7 @@ from verify_universe import Workbook, VerificationError, SOURCE_URL, SOURCE_AS_O
 SOURCE_HASH = '0f6ac234b792bb6334c0c94ec37fa6c0548363c80017c946d11a5c7e95d3a9e0'
 EXPECTED_PRODUCTS = 14170
 SOURCE_ID = 'csrc-fund-products-20260630'
-PARSER_VERSION = 'csrc-20260630-abcd-v1'
+PARSER_VERSION = 'csrc-20260630-abcd-v2'
 SHEET = 'Sheet1'
 OUTPUT = Path('.cache/universe-verification/result.json')
 ERRORS = {'ACTIONS_REQUIRED', 'SOURCE_HASH_MISMATCH', 'INVALID_OBSERVATION_TIME', 'HISTORICAL_SCHEMA_MISMATCH',
@@ -123,7 +123,7 @@ def parse_official_index(data, *, retrieved_at):
             code = product_code(code_cells[0]) if len(code_cells) == 1 else None
             if code is not None: code_rows[code].append(number)
         duplicates = {code: numbers for code, numbers in code_rows.items() if len(numbers) > 1}
-        serials, candidates, rejected, name_cache_count = [], [], [], 0
+        serials, candidates, rejected, name_cache_count, date_issues = [], [], [], 0, []
         for number, cells in products:
             reasons = []
             if physical[number] > 1: reasons.append('DUPLICATE_PHYSICAL_ROW')
@@ -152,18 +152,31 @@ def parse_official_index(data, *, retrieved_at):
                     or re.search(r'[\x00-\x1f\x7f]', name) or not re.search(r'[A-Za-z\u4e00-\u9fff]', name)):
                 reasons.append('INVALID_NAME')
             date = excel_1900_date(date_cell)
-            if date is None: reasons.append('INVALID_FOUNDATION_DATE')
+            # An unreadable optional founding date must not drop a readable
+            # product code/name from the dated official index. A demonstrably
+            # later founding date is a period contradiction, not an unknown.
+            if (date is None and date_cell['type'] == 'n' and not date_cell['hasFormula']
+                    and date_cell['numberFormat'] == 'yyyy/m/d;@'
+                    and re.fullmatch(r'[1-9][0-9]{0,5}', date_cell['rawValue'])
+                    and int(date_cell['rawValue']) > (dt.date.fromisoformat(SOURCE_AS_OF) - dt.date(1899, 12, 30)).days):
+                reasons.append('FOUNDATION_AFTER_INDEX_DATE')
             if reasons:
                 rejected.append({'row': number, 'reasons': reasons})
                 continue
             name_cache_count += int(name_cell['hasFormula'])
-            candidates.append({'code': code, 'name': name.strip(), 'type': '未分类', 'inceptionDate': date,
-                               'inceptionSourceUrl': SOURCE_URL,
-                               'inceptionEvidence': {'sourceId': SOURCE_ID, 'sheet': SHEET, 'row': number, 'column': 'D',
-                                                     'rawSerial': date_cell['rawValue'], 'numberFormat': date_cell['numberFormat'],
-                                                     'dateSystem': '1900'},
-                               'nameFromCachedFormula': name_cell['hasFormula'],
-                               'evidence': [{'sourceId': SOURCE_ID, 'sheet': SHEET, 'row': number}]})
+            record = {'code': code, 'name': name.strip(), 'type': '未分类',
+                      'nameFromCachedFormula': name_cell['hasFormula'],
+                      'evidence': [{'sourceId': SOURCE_ID, 'sheet': SHEET, 'row': number}]}
+            if date is not None:
+                record.update(inceptionDate=date, inceptionSourceUrl=SOURCE_URL,
+                    inceptionEvidence={'sourceId': SOURCE_ID, 'sheet': SHEET, 'row': number, 'column': 'D',
+                                       'rawSerial': date_cell['rawValue'], 'numberFormat': date_cell['numberFormat'], 'dateSystem': '1900'})
+            else:
+                date_issues.append({'row': number, 'code': code, 'reason': 'FOUNDATION_DATE_UNRESOLVED',
+                    'type': date_cell['type'], 'hasFormula': date_cell['hasFormula'],
+                    'numberFormat': date_cell['numberFormat'][:80], 'rawValue': date_cell['rawValue'][:80],
+                    'cachedValue': date_cell['value'][:80]})
+            candidates.append(record)
         for numbers in duplicates.values():
             for number in set(numbers):
                 prior = [entry for entry in rejected if entry['row'] == number]
@@ -176,7 +189,9 @@ def parse_official_index(data, *, retrieved_at):
         missing_rows = set(range(3, EXPECTED_PRODUCTS + 3)) - {number for number, _ in products}
         increasing_rows = [number for number, _ in rows] == sorted(set(number for number, _ in rows))
         sequence_complete = increasing_rows and serials == list(range(1, EXPECTED_PRODUCTS + 1))
-        complete = not rejected and not missing_rows and len(records) == EXPECTED_PRODUCTS and sequence_complete
+        date_issues = [issue for issue in date_issues if issue['code'] not in duplicates]
+        product_rows_complete = not rejected and not missing_rows and len(records) == EXPECTED_PRODUCTS and sequence_complete
+        complete = product_rows_complete and not date_issues
         reason_counts = Counter(reason for row in rejected for reason in row['reasons'])
         diagnostics = {'sheet': SHEET, 'observedRows': len(rows), 'headerRows': 2,
                        'expectedProductRows': EXPECTED_PRODUCTS, 'observedProductRows': len(products),
@@ -186,6 +201,10 @@ def parse_official_index(data, *, retrieved_at):
                        'duplicateSerialCount': sum(count - 1 for count in Counter(serials).values() if count > 1),
                        'physicalRowsIncreasing': increasing_rows, 'serialSequenceComplete': sequence_complete,
                        'cachedFormulaNameRows': name_cache_count, 'rejectionReasons': dict(sorted(reason_counts.items())),
+                       'productRowsComplete': product_rows_complete, 'inceptionMetadataComplete': not date_issues,
+                       'unresolvedInceptionRows': len(date_issues), 'unresolvedInceptionSamples': date_issues[:20],
+                       'inceptionFormatIssues': dict(Counter(json.dumps({key: issue[key] for key in ('type', 'hasFormula', 'numberFormat')},
+                            sort_keys=True) for issue in date_issues)),
                        'rejectedRowSamples': sorted(rejected, key=lambda row: row['row'])[:20],
                        'omittedRejectedRowSamples': max(0, len(rejected) - 20),
                        'missingPhysicalRowSamples': sorted(missing_rows)[:20],
@@ -212,7 +231,7 @@ def fetch_official_overlay():
 
 def summary_for(overlay):
     source = overlay['evidence'][0]
-    dates = [record['inceptionDate'] for record in overlay['records']]
+    dates = [record['inceptionDate'] for record in overlay['records'] if record.get('inceptionDate')]
     by_code = {record['code']: record for record in overlay['records']}
     return {'schemaVersion': 1, 'status': 'verified' if overlay['parseStatus'] == 'complete' else 'partial',
             'parseStatus': overlay['parseStatus'], 'recordUnit': 'fund-product-code', 'historicalUniverseVerified': False,
