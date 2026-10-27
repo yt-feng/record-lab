@@ -430,7 +430,10 @@ def protect_market_budgets(before, after, started):
                     if a is None: a = 0
                 if b is None and a == 0: continue
                 if type(a) is not int or type(b) is not int or not 0 <= b - a <= (1 if code in started else 0):
-                    fail('ADMISSION_SOURCE_BUDGET_CHANGED')
+                    # Keep the public failure bounded while identifying the
+                    # counter family that needs a schema/merge fix.  Never
+                    # include a fund code or raw values in the receipt.
+                    fail('ADMISSION_SOURCE_BUDGET_CHANGED_' + key.upper())
 
 
 def protect_funds(before, after, requested):
