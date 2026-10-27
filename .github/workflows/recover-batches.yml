@@ -1,0 +1,74 @@
+name: Recover source records
+on:
+  workflow_dispatch:
+    inputs:
+      data_commit:
+        description: Exact current main commit containing the published recovery hold
+        required: true
+        type: string
+concurrency:
+  group: published-records
+  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: read
+env:
+  NODE_OPTIONS: --max-old-space-size=5120
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/*/
+            /scripts/
+            /lib/
+            /config/
+            /tests/
+            /web/*.js
+            /.github/
+      - name: Validate immutable input
+        env:
+          DATA_COMMIT: ${{ inputs.data_commit }}
+        run: python -c 'import os,re; assert re.fullmatch(r"[0-9a-f]{40}",os.environ["DATA_COMMIT"])'
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.data_commit }}
+          path: source-data
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /web/data/periods/2026Q2/progress.json
+            /web/data/periods/2026Q2/audit.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Verify bounded recovery contracts
+        run: python -m unittest discover -s tests -p test_recover_batches.py
+      - name: Restore verified artifacts and recover reports without market requests
+        id: recover
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATA_COMMIT: ${{ inputs.data_commit }}
+        run: python scripts/recover_batches.py --data source-data --data-commit "$DATA_COMMIT"
+      - name: Validate recovery artifact
+        id: publication
+        if: always()
+        run: python scripts/recover_batches.py --validate-output
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.publication.outcome == 'success'
+        with:
+          name: batch-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .cache/batch-recovery/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
