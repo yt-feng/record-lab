@@ -86,8 +86,18 @@ function sanitizeFund(item, { now, config, envelope }) {
     || Date.parse(item.retrievedAt) > Date.parse(envelope.retrievedAt)
     || (!item.selectedReport && !exemption) || (item.status === 'unavailable' && !exemption && item.selectedReport.reportOnly !== true) || !Array.isArray(item.rows)
     || (config.targetPeriodEnd && item.selectedReport && item.selectedReport.periodEnd !== config.targetPeriodEnd)) return null;
-  const reportList = [...(Array.isArray(item.reports) ? item.reports : []), item.selectedReport, item.previousReport].filter(Boolean);
-  const reports = [...new Map(reportList.map(report => [[report.periodEnd, report.kind, report.sourceUrl].join('|'), report])).values()];
+  // Persisted snapshots already carry the canonical report history.  The
+  // selected/previous pointers are often duplicate references; appending them
+  // and letting the last value win can replace a complete report with a poorer
+  // duplicate during a source-only normalization.  Preserve the first
+  // persisted entry for each identity and only backfill a missing identity.
+  const reports = [];
+  const reportKeys = new Set();
+  for (const report of [...(Array.isArray(item.reports) ? item.reports : []), item.selectedReport, item.previousReport].filter(Boolean)) {
+    const key = [report.periodEnd, report.kind, report.sourceUrl].join('|');
+    if (reportKeys.has(key)) continue;
+    reportKeys.add(key); reports.push(report);
+  }
   const cleanInput = {
     code: item.code, name: label(item.name), company: label(item.company), companyId: label(item.companyId, 40),
     managers: (Array.isArray(item.managers) ? item.managers : []).slice(0, 50)

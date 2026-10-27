@@ -281,6 +281,21 @@ test('a later source-only PDF keeps the independent clock of an actually retaine
   assert.equal(next.manifest.priceUpdatedAt, old.priceUpdatedAt);
 });
 
+test('duplicate selected and previous report pointers cannot replace persisted report evidence', () => {
+  const { sanitizeFund } = require('../scripts/merge-parts');
+  const source = snapshot(['000001']).funds[0];
+  const canonical = structuredClone(source.reports[0]);
+  canonical.strategyExcerpts = [{ text: '完整原文板块证据', sourceUrl: canonical.sourceUrl, page: 6,
+    periodStart: '2026-01-01', periodEnd: canonical.periodEnd }];
+  const duplicate = structuredClone(canonical);
+  duplicate.strategyExcerpts[0].text = '损坏的��块证据';
+  source.reports = [canonical]; source.selectedReport = canonical; source.previousReport = duplicate;
+  const normalized = sanitizeFund(source, { now: new Date('2026-09-29T12:00:00Z'),
+    config: { targetPeriodEnd: '2026-06-30', baselinePeriodEnd: '2026-03-31' },
+    envelope: { asOf: source.asOf, retrievedAt: source.retrievedAt, priceUpdatedAt: source.priceUpdatedAt } });
+  assert.equal(normalized.reports[0].strategyExcerpts[0].text, '完整原文板块证据');
+});
+
 test('an explicit price clock equal to the report clock survives repeated normalization', () => {
   const first = merge({ snapshots: [snapshot(['000001'], { barsByStock: clockBars('600001') })] });
   assert.equal(first.companySnapshots.co1.funds[0].priceUpdatedAt, '2026-09-29T10:00:00Z');
