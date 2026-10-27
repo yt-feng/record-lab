@@ -404,6 +404,31 @@ def fund_protection(quarter):
 def protect_market_budgets(before, after, started):
     previous = {row['code']: row for row in before['funds']}; current = {row['code']: row for row in after['funds']}
     if set(previous) != set(current): fail('ADMISSION_PROGRESS_SCOPE_CHANGED')
+
+    def alias_quality_sync(code, key, old_value, new_value):
+        """Accept quality counters copied from a source-started representative.
+
+        A single quarterly report can be shared by several share classes.  The
+        merger projects the representative's quality counters onto those
+        aliases, even when the alias itself was not part of the source request.
+        The representative is still required to be source-started and may move
+        by at most one real attempt; the alias must exactly match its resulting
+        counter.  This does not permit top-level market or enrichment counters
+        to move.
+        """
+        if code in started or key not in {'attempts', 'totalAttempts', 'managerAttempts',
+                                          'managerTotalAttempts', 'strategyAttempts', 'strategyTotalAttempts'}:
+            return False
+        representative = current[code].get('representativeCode')
+        if not isinstance(representative, str) or representative == code or representative not in started:
+            return False
+        old_rep = previous.get(representative, {}).get('quality', {})
+        new_rep = current.get(representative, {}).get('quality', {})
+        rep_before, rep_after = old_rep.get(key), new_rep.get(key)
+        if any(type(value) is not int for value in (old_value, new_value, rep_before, rep_after)):
+            return False
+        return rep_before <= rep_after <= rep_before + 1 and new_value == rep_after and new_value >= old_value
+
     for code, old in previous.items():
         new = current[code]
         for key in ('reportLocatorAttempts', 'strategyClaimsAttempts', 'strategyClaimsHistoryBlocked', 'reportLocatorHistoryFull'):
@@ -429,6 +454,7 @@ def protect_market_budgets(before, after, started):
                     a = left.get(paired) if paired else 0
                     if a is None: a = 0
                 if b is None and a == 0: continue
+                if container == 'quality' and alias_quality_sync(code, key, a, b): continue
                 if type(a) is not int or type(b) is not int or not 0 <= b - a <= (1 if code in started else 0):
                     # Keep the public failure bounded while identifying the
                     # counter family that needs a schema/merge fix.  Never

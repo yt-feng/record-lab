@@ -257,6 +257,25 @@ class AdmissionTests(unittest.TestCase):
             admission.protect_market_budgets(old,after,set())
         admission.protect_market_budgets(old,after,{'000001'})
 
+    def test_quality_budget_allows_shared_portfolio_alias_sync(self):
+        def quality(total, attempts=1):
+            return {'attempts': attempts, 'totalAttempts': total, 'managerAttempts': 0,
+                    'managerTotalAttempts': 0, 'strategyAttempts': 0, 'strategyTotalAttempts': 0}
+        old={'funds':[
+            {'code':'000744','representativeCode':'000744','quality':quality(4)},
+            {'code':'000745','representativeCode':'000744','quality':quality(3)},
+        ]}
+        after=copy.deepcopy(old)
+        after['funds'][0]['quality']=quality(5, attempts=2)
+        after['funds'][1]['quality']=quality(5, attempts=2)
+        admission.protect_market_budgets(old, after, {'000744'})
+        changed=copy.deepcopy(after); changed['funds'][1]['quality']['totalAttempts']=6
+        with self.assertRaisesRegex(admission.AdmissionError,'SOURCE_BUDGET'):
+            admission.protect_market_budgets(old, changed, {'000744'})
+        unstarted=copy.deepcopy(after)
+        with self.assertRaisesRegex(admission.AdmissionError,'SOURCE_BUDGET'):
+            admission.protect_market_budgets(old, unstarted, set())
+
     def test_no_original_parts_or_missing_status_reconciliation_enters_admission(self):
         source=(ROOT/'scripts/admit_batch_recovery.py').read_text()
         self.assertIn("if row.filename.startswith('original-parts/'): continue",source)
