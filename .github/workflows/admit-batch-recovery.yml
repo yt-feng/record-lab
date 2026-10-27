@@ -1,0 +1,92 @@
+name: Admit recovered source records
+on:
+  workflow_dispatch:
+    inputs:
+      base_data_commit:
+        description: Verified persisted data commit from the original publisher
+        required: true
+        type: string
+      recovery_run_id:
+        description: Completed source recovery run
+        required: true
+        type: string
+      recovery_source_commit:
+        description: Exact source commit of that recovery run
+        required: true
+        type: string
+      artifact_id:
+        description: Verified recovery artifact ID
+        required: true
+        type: string
+      archive_sha256:
+        description: Verified SHA256 of the recovery artifact ZIP
+        required: true
+        type: string
+concurrency:
+  group: published-records
+  cancel-in-progress: false
+permissions:
+  contents: write
+  actions: read
+  pages: write
+  id-token: write
+env:
+  NODE_OPTIONS: --max-old-space-size=5120
+jobs:
+  admit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Verify admission contracts
+        run: python -m unittest discover -s tests -p test_admit_batch_recovery.py
+      - name: Validate and stage only the two recovery parts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_DATA_COMMIT: ${{ inputs.base_data_commit }}
+          RECOVERY_RUN_ID: ${{ inputs.recovery_run_id }}
+          RECOVERY_SOURCE_COMMIT: ${{ inputs.recovery_source_commit }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+        run: |
+          python scripts/admit_batch_recovery.py --base-data-commit "$BASE_DATA_COMMIT" --recovery-run-id "$RECOVERY_RUN_ID" --recovery-source-commit "$RECOVERY_SOURCE_COMMIT" --artifact-id "$ARTIFACT_ID" --archive-sha256 "$ARCHIVE_SHA256"
+      - name: Validate complete publication history
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/publication_guard.py --root . --history
+      - name: Persist verified observations
+        run: python scripts/persist-observations.py
+      - name: Prepare compressed public site
+        run: python scripts/prepare-site.py
+      - name: Verify preparation preserved every persisted data file
+        run: python scripts/admit_batch_recovery.py --verify-protected-output
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: .cache/site
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recovery-admission-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .cache/recovery-admission/result.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+  deploy:
+    needs: admit
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment
