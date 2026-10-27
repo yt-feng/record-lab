@@ -92,11 +92,23 @@ function sanitizeFund(item, { now, config, envelope }) {
   // duplicate during a source-only normalization.  Preserve the first
   // persisted entry for each identity and only backfill a missing identity.
   const reports = [];
-  const reportKeys = new Set();
-  for (const report of [...(Array.isArray(item.reports) ? item.reports : []), item.selectedReport, item.previousReport].filter(Boolean)) {
+  const reportIndexes = new Map();
+  const appendReport = report => {
+    if (!report) return;
     const key = [report.periodEnd, report.kind, report.sourceUrl].join('|');
-    if (reportKeys.has(key)) continue;
-    reportKeys.add(key); reports.push(report);
+    if (reportIndexes.has(key)) return;
+    reportIndexes.set(key, reports.length); reports.push(report);
+  };
+  for (const report of Array.isArray(item.reports) ? item.reports : []) appendReport(report);
+  // The previous pointer is a fallback only; it must never overwrite the
+  // persisted report history for an already-known identity.
+  appendReport(item.previousReport);
+  // The selected pointer may carry a newly accepted strategy patch, so it is
+  // allowed to replace the canonical entry for its own identity.
+  if (item.selectedReport) {
+    const key = [item.selectedReport.periodEnd, item.selectedReport.kind, item.selectedReport.sourceUrl].join('|');
+    if (reportIndexes.has(key)) reports[reportIndexes.get(key)] = item.selectedReport;
+    else appendReport(item.selectedReport);
   }
   const cleanInput = {
     code: item.code, name: label(item.name), company: label(item.company), companyId: label(item.companyId, 40),
