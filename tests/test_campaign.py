@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from campaign import quarter_config, seed_quarter, selected_periods, plan, publish
+from campaign import quarter_config, seed_quarter, selected_periods, plan, publish, deployed_continuation_state
 from traversal import atomic_json, read_json
 
 spec = importlib.util.spec_from_file_location('prepare_site', Path(__file__).resolve().parents[1] / 'scripts/prepare-site.py')
@@ -136,7 +136,26 @@ class CampaignTests(unittest.TestCase):
                 subprocess.run(['node', 'scripts/build-data.js', '--input', 'raw/input.json',
                     '--output', '.cache/parts/part-1/part.json', '--config', '.cache/plan/batch-1.json'],
                     check=True, capture_output=True)
-                result = publish()
+                # A present invalid part blocks publication and persists a batch
+                # diagnostic, never fabricated per-product failures.
+                invalid = Path('.cache/parts/part-0/part.json')
+                invalid.parent.mkdir(parents=True)
+                invalid.write_text('{')
+                previous_data = {path: path.read_bytes() for path in Path('web/data').rglob('*.json')}
+                with self.assertRaisesRegex(Exception, '^BATCH_STATUS_INPUT_ERROR$'):
+                    publish()
+                blocked = read_json('.cache/campaign/result.json')
+                self.assertFalse(blocked['continueRun'])
+                self.assertEqual(blocked['inputErrorCount'], 1)
+                self.assertEqual(blocked['batchInputErrors'][0]['errorCode'], 'SNAPSHOT_INVALID_JSON')
+                self.assertNotIn('funds', read_json('.cache/parts/part-0/status.json'))
+                self.assertTrue(all(path.read_bytes() == before for path, before in previous_data.items()))
+                # The following independent fixture models a genuinely absent
+                # artifact, not a retry that clears a real diagnostic.
+                invalid.unlink()
+                Path('.cache/parts/part-0/status.json').unlink()
+                with patch.dict(os.environ, {'GITHUB_RUN_ID': '123456'}):
+                    result = publish()
                 self.assertEqual([item['quarter'] for item in result['quarters']], ['2026Q2', '2026Q3'])
                 q2 = read_json('web/data/periods/2026Q2/progress.json')
                 q3 = read_json('web/data/periods/2026Q3/progress.json')
@@ -147,15 +166,82 @@ class CampaignTests(unittest.TestCase):
                 self.assertEqual(q3['failedFunds'], 1)
                 self.assertEqual(q3['notApplicableFunds'], 1)
                 self.assertEqual(q3['processedFunds'], 0)
-                self.assertTrue(result['continueRun'])
+                self.assertFalse(result['continueRun'])
+                self.assertEqual(result['missingPartIds'], ['0'])
+                self.assertEqual(result['missingPartCount'], 1)
+                self.assertEqual(result['batchInputErrors'], [{'batchId': '0', 'quarter': '2026Q2', 'errorCode': 'BATCH_ARTIFACT_MISSING'}])
+                q2_audit_before = Path('web/data/periods/2026Q2/audit.json').read_bytes()
+                q2_hold = read_json('web/data/periods/2026Q2/audit.json')['continuationHold']
+                self.assertEqual(q2_hold['quarter'], '2026Q2')
+                self.assertEqual(q2_hold['batchIds'], ['0'])
+                self.assertEqual(q2_hold['sourceRunId'], '123456')
                 self.assertEqual(read_json('web/data/periods/2026Q2/analysis.json')['kind'], 'quarter-analysis')
                 self.assertEqual(read_json('web/data/periods/2026Q3/audit.json')['phase']['targetPeriodEnd'], '2026-09-30')
                 self.assertIn('completionAudit', read_json('web/data/periods/2026Q2/audit.json'))
                 self.assertEqual(read_json('web/data/periods.json')['defaultPeriod'], '2026Q3')
                 self.assertEqual(read_json('web/data/latest.json')['targetPeriodEnd'], '2026-06-30')
+                # A later scheduled plan skips only the held quarter. Publishing
+                # Q3 again must leave Q2's original hold and observations intact.
+                shutil.rmtree('.cache/parts')
+                next_plan = plan('both', '2026-10-26', shards=1, batch_size=2, refresh=False, historical_overlays={})
+                self.assertEqual(next_plan['heldQuarters'], ['2026Q2'])
+                self.assertEqual(next_plan['quarters'], ['2026Q3'])
+                next_matrix = read_json('.cache/plan/matrix.json')
+                self.assertTrue(next_matrix)
+                self.assertTrue(all(item['quarter'] == '2026Q3' for item in next_matrix))
+                for item in next_matrix:
+                    next_batch = read_json('.cache/plan/' + item['config'])
+                    raw = {'asOf': '2026-10-26', 'retrievedAt': dt.datetime.now(dt.timezone.utc).isoformat(),
+                           'funds': [{'code': row['code'], 'reports': [], 'collectionAttempt': {'attempted': False,
+                                      'status': 'deferred-budget', 'errorCode': 'BATCH_DEADLINE_REACHED'}} for row in next_batch['funds']],
+                           'barsByStock': {}, 'errors': []}
+                    atomic_json('raw/input.json', raw)
+                    subprocess.run(['node', 'scripts/build-data.js', '--input', 'raw/input.json',
+                        '--output', f".cache/parts/part-{item['id']}/part.json", '--config', '.cache/plan/' + item['config']],
+                        check=True, capture_output=True)
+                next_result = publish()
+                self.assertEqual(next_result['missingPartCount'], 0)
+                self.assertEqual(next_result['heldQuarters'], ['2026Q2'])
+                self.assertEqual(Path('web/data/periods/2026Q2/audit.json').read_bytes(), q2_audit_before)
             finally:
                 child_runtime.stop()
                 os.chdir(original)
+
+    def test_all_held_plan_and_publish_make_no_requests_or_production_changes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            hold = {'reason': 'BATCH_ARTIFACTS_UNVERIFIED', 'quarter': '2026Q2', 'sourceRunId': '123456',
+                    'batchIds': ['10', '13'], 'requestAccounting': 'unverified'}
+            path = root / 'web/data/periods/2026Q2/audit.json'
+            atomic_json(path, {'schemaVersion': 1, 'quarter': '2026Q2',
+                'phase': {'targetPeriodEnd': '2026-06-30', 'baselinePeriodEnd': '2026-03-31'},
+                'continuationHold': hold, 'batchInputErrors': [{'batchId': identifier, 'quarter': '2026Q2',
+                    'errorCode': 'BATCH_ARTIFACT_MISSING'} for identifier in ['10', '13']]})
+            original = Path.cwd(); before = path.read_bytes()
+            try:
+                os.chdir(root)
+                with patch('campaign.refresh_directory') as refresh, patch('campaign.refresh_registries') as locators, patch('campaign.subprocess.run') as run:
+                    for _ in range(2):
+                        result = plan('2026Q2', '2026-11-20', shards=1, batch_size=2)
+                        self.assertEqual(result['status'], 'held')
+                        self.assertEqual(result['batchCount'], 0)
+                        self.assertEqual(read_json('.cache/plan/matrix.json'), [])
+                        outcome = publish()
+                        self.assertFalse(outcome['continueRun'])
+                        self.assertEqual(outcome['continuationHolds']['2026Q2'], hold)
+                    refresh.assert_not_called(); locators.assert_not_called(); run.assert_not_called()
+                self.assertEqual(path.read_bytes(), before)
+            finally:
+                os.chdir(original)
+
+    def test_malformed_persistent_hold_never_becomes_unheld(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / 'periods/2026Q2/audit.json'
+            for bad in (False, {}, {'reason': 'expired'}):
+                atomic_json(path, {'schemaVersion': 1, 'continuationHold': bad})
+                with self.assertRaisesRegex(ValueError, 'INVALID_CONTINUATION_HOLD'):
+                    deployed_continuation_state(root, '2026Q2')
 
     def test_quarters_have_independent_exact_baselines_and_fresh_cutoff(self):
         base = {'funds': [{'code': '000001'}], 'asOf': '2026-09-29', 'maxWorkers': 2}

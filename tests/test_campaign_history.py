@@ -248,6 +248,16 @@ class CampaignHistoryTests(unittest.TestCase):
                 self.assertEqual(retained['quarterUniverse']['historicalParseStatus'], 'unchecked')
                 self.assertEqual(retained['quarterUniverse']['sources'], [])
                 self.assertFalse(retained['quarterUniverse']['historicalUniverseVerified'])
+                # This fixture tests a later historical-source refresh. Record
+                # explicitly unstarted work; a genuinely missing artifact now
+                # holds continuation until its unknown requests are reconciled.
+                for item in read_json('.cache/plan/matrix.json'):
+                    batch = read_json('.cache/plan/' + item['config'])
+                    atomic_json('.cache/parts/part-' + item['id'] + '/part.json', {
+                        'schemaVersion': 1, 'sourceMode': 'actions', 'funds': [],
+                        'targetPeriodEnd': batch['targetPeriodEnd'], 'baselinePeriodEnd': batch['baselinePeriodEnd'],
+                        'batchResults': [{'code': row['code'], 'status': 'deferred-budget', 'attempted': False,
+                                          'errorCode': 'BATCH_DEADLINE_REACHED'} for row in batch['funds']]})
                 campaign.publish()
                 final_manifest = read_json('web/data/periods/2026Q2/latest.json')
                 final_path = final_manifest['companyFiles'][0]['path'].replace('./data/', 'web/data/periods/2026Q2/')

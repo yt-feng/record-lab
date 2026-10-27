@@ -3,6 +3,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { analyzeFund, normalizeReport, normalizeLifecycleEvidence, validDate, validHoldingIdentity } = require('../lib/fund-analysis');
 const { validCompletePrice, validCompleteQuarterPrice } = require('../lib/price-coverage');
 const { normalizePatch } = require('../lib/price-patches');
@@ -21,7 +22,7 @@ const BUILD_CODES = new Set([
   'PRICE_TIMEZONE_MISMATCH', 'PRICE_INSTRUMENT_MISMATCH',
   'ADJUSTED_PRICE_REJECTED', 'INVALID_PRICE_RANGE', 'PRICE_SOURCES_UNAVAILABLE',
   'BATCH_DEADLINE_REACHED', 'PRICE_BUDGET_REACHED',
-  'INVALID_ARGUMENTS', 'INPUT_READ_FAILED', 'OUTPUT_WRITE_FAILED',
+  'INVALID_ARGUMENTS', 'INPUT_READ_FAILED', 'OUTPUT_WRITE_FAILED', 'OUTPUT_TOO_LARGE',
   'NO_REPORTS', 'INVALID_FORMAT', 'TRUNCATED_RESPONSE', 'NO_HOLDINGS', 'INVALID_URL',
   'HTTP_REJECTED', 'RESPONSE_TOO_LARGE', 'EMPTY_RESPONSE', 'TLS_FAILED', 'INVALID_PDF',
   'PDF_PARSE_FAILED', 'PDF_TEXT_EMPTY', 'HOLDINGS_UNRESOLVED', 'UNSUPPORTED_MARKET', 'INVALID_PRICE_FORMAT', 'NO_PRICE_DATA',
@@ -42,6 +43,8 @@ const STAGES = new Set(['metadata', 'announcements', 'holdings', 'report', 'nav'
   'join', 'prices', 'build', 'collection', 'budget', 'target-report', 'no-equities-report', 'quarterly-report', 'lifecycle', 'strategy-claims']);
 const fundCode = value => typeof value === 'string' && /^\d{6}$/.test(value);
 const clone = value => JSON.parse(JSON.stringify(value));
+// Match the publication guard and the status reader, including the final newline.
+const MAX_OUTPUT_BYTES = 25_000_000;
 
 class SafeBuildError extends Error {
   constructor(code) {
@@ -719,8 +722,46 @@ function readJson(filename, errorCode) {
   catch { throw new SafeBuildError(errorCode); }
 }
 
+function writeSnapshotOutput(result, filename, { maxOutputBytes = MAX_OUTPUT_BYTES } = {}) {
+  // A smaller ceiling is useful for bounded tests; callers cannot raise the public limit.
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1 || maxOutputBytes > MAX_OUTPUT_BYTES) {
+    throw new SafeBuildError('INVALID_ARGUMENTS');
+  }
+  let serialized;
+  try {
+    serialized = JSON.stringify(result);
+    if (typeof serialized !== 'string') throw new Error();
+    serialized += '\n';
+  } catch { throw new SafeBuildError('OUTPUT_WRITE_FAILED'); }
+  const diagnostics = {
+    serialization: 'compact-json',
+    outputBytes: Buffer.byteLength(serialized, 'utf8'),
+    maxOutputBytes,
+    outputSha256: crypto.createHash('sha256').update(serialized, 'utf8').digest('hex'),
+  };
+  if (diagnostics.outputBytes > maxOutputBytes) {
+    const error = new SafeBuildError('OUTPUT_TOO_LARGE');
+    error.outputDiagnostics = diagnostics;
+    throw error;
+  }
+  const temporary = `${filename}.tmp-${process.pid}`;
+  let created = false;
+  try {
+    fs.mkdirSync(path.dirname(filename), { recursive: true });
+    const descriptor = fs.openSync(temporary, 'wx');
+    created = true;
+    try { fs.writeFileSync(descriptor, serialized, { encoding: 'utf8' }); }
+    finally { fs.closeSync(descriptor); }
+    fs.renameSync(temporary, filename);
+    return diagnostics;
+  } catch { throw new SafeBuildError('OUTPUT_WRITE_FAILED'); }
+  finally {
+    if (created) { try { fs.unlinkSync(temporary); } catch { /* Never expose filesystem diagnostics. */ } }
+  }
+}
+
 function main(argv = process.argv.slice(2)) {
-  let temporary;
+  let counts;
   try {
     const args = argumentsFor(argv);
     const raw = readJson(args.input, 'INPUT_READ_FAILED');
@@ -728,23 +769,21 @@ function main(argv = process.argv.slice(2)) {
     const catalog = args.catalog ? readJson(args.catalog, 'INVALID_CATALOG') : null;
     const previous = fs.existsSync(args.output) ? readJson(args.output, 'INVALID_PREVIOUS_SNAPSHOT') : null;
     const result = buildSnapshot(raw, { previous, config, catalog, preserveOthers: args.mergeAll });
-    temporary = `${args.output}.tmp-${process.pid}`;
-    try {
-      fs.mkdirSync(path.dirname(args.output), { recursive: true });
-      fs.writeFileSync(temporary, `${JSON.stringify(result, null, 2)}\n`, { flag: 'wx' });
-      fs.renameSync(temporary, args.output);
-    } catch { throw new SafeBuildError('OUTPUT_WRITE_FAILED'); }
-    process.stdout.write(`${JSON.stringify({ status: 'ok', fundCount: result.coverage.fundCount,
+    counts = { fundCount: result.coverage.fundCount,
       failedFundCount: result.coverage.failedFundCount, holdingCount: result.coverage.holdingCount,
-      errorCount: result.errors.length })}\n`);
+      errorCount: result.errors.length };
+    const diagnostics = writeSnapshotOutput(result, args.output);
+    process.stdout.write(`${JSON.stringify({ status: 'ok', ...counts, ...diagnostics })}\n`);
     return 0;
   } catch (error) {
-    if (temporary) { try { fs.unlinkSync(temporary); } catch { /* No raw filesystem diagnostics. */ } }
-    process.stdout.write(`${JSON.stringify({ status: 'failed', errorCode: safeError(error).errorCode })}\n`);
+    const diagnostics = error instanceof SafeBuildError && error.code === 'OUTPUT_TOO_LARGE'
+      ? { ...counts, ...error.outputDiagnostics } : {};
+    process.stdout.write(`${JSON.stringify({ status: 'failed', errorCode: safeError(error).errorCode, ...diagnostics })}\n`);
     return 1;
   }
 }
 
 if (require.main === module) process.exitCode = main();
 
-module.exports = { buildSnapshot, catalogDetails, deduplicatePortfolios, isValidNoEq, isValidNotApplicable, main, publicUrl, safeError, SafeBuildError };
+module.exports = { buildSnapshot, catalogDetails, deduplicatePortfolios, isValidNoEq, isValidNotApplicable, main,
+  publicUrl, safeError, SafeBuildError, writeSnapshotOutput, MAX_OUTPUT_BYTES };

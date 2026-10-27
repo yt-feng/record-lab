@@ -6,8 +6,11 @@ from collections import deque
 import datetime as dt
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 from urllib.parse import urlparse, parse_qsl
 from lifecycle import normalize_lifecycle_evidence
@@ -36,6 +39,7 @@ REPORT_LOCATOR_MAX_DIGESTS = 16
 STRATEGY_CLAIMS_MAX_ATTEMPTS = 2
 STRATEGY_CLAIMS_MAX_DIGESTS = 16
 STRATEGY_CLAIMS_MAX_QUOTA = 20
+MAX_STATUS_SNAPSHOT_BYTES = 25_000_000
 ERROR_CODES = {
     "BATCH_FAILED", "FUND_FAILED", "NO_VALID_REPORTS", "TARGET_REPORT_MISSING", "FUND_NOT_COLLECTED",
     "NO_VALID_FRESH_FUNDS", "NO_REPORTS", "NO_DATED_HOLDINGS", "EMPTY_HOLDINGS", "OLDER_REPORT",
@@ -51,14 +55,23 @@ PARSER_ERRORS = {"PDF_PARSE_FAILED", "PDF_TEXT_EMPTY", "INVALID_PDF", "UNSUPPORT
 RECOVERABLE_ERRORS = {"NO_VALID_REPORTS", "TARGET_REPORT_MISSING", "NO_REPORTS", "TARGET_REPORT_UNAVAILABLE",
                       "NO_DATED_HOLDINGS", "TIMEOUT", "NETWORK_ERROR", "HTTP_ERROR", "TLS_FAILED",
                       "BATCH_FAILED", "FUND_NOT_COLLECTED", "BATCH_DEADLINE_REACHED"}
+STATUS_SNAPSHOT_ERRORS = {"SNAPSHOT_TOO_LARGE", "SNAPSHOT_INVALID_JSON", "SNAPSHOT_INVALID_SCHEMA",
+                          "SNAPSHOT_PHASE_MISMATCH", "SNAPSHOT_READ_FAILED"}
 COMMAND_ERRORS = {"INVALID_CONFIG", "INVALID_CATALOG", "INVALID_PROGRESS", "INVALID_ARGUMENTS",
-                  "READ_FAILED", "WRITE_FAILED", "TRAVERSAL_FAILED"}
+                  "READ_FAILED", "WRITE_FAILED", "TRAVERSAL_FAILED"} | STATUS_SNAPSHOT_ERRORS
 
 
 class TraversalError(Exception):
     def __init__(self, code):
         self.code = code if code in COMMAND_ERRORS else "TRAVERSAL_FAILED"
         super().__init__(self.code)
+
+
+class StatusSnapshotError(TraversalError):
+    """A present batch artifact could not be inspected; not a product outcome."""
+    def __init__(self, code, byte_length=None):
+        super().__init__(code)
+        self.byte_length = byte_length if type(byte_length) is int and byte_length >= 0 else None
 
 
 class SafeArgumentParser(argparse.ArgumentParser):
@@ -1671,7 +1684,8 @@ def valid_status(document, config, now=None):
     """Validate a saved attempt before reusing its event time during recovery."""
     current = utc_now(now)
     phase = phase_for(config)
-    if not isinstance(document, dict) or document.get("schemaVersion") != 1 or document.get("phase") != phase:
+    if (not isinstance(document, dict) or document.get("kind") == "batch-status-input-error"
+            or document.get("schemaVersion") != 1 or document.get("phase") != phase):
         return False
     attempted = instant(document.get("attemptedAt"))
     planned = instant(config.get("traversal", {}).get("plannedAt"))
@@ -1899,7 +1913,8 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
     matching_previous = isinstance(previous, dict) and previous.get("schemaVersion") == 1 and previous.get("phase") == phase
     events = []
     for document in statuses:
-        if not isinstance(document, dict) or document.get("schemaVersion") != 1 or document.get("phase") != phase:
+        if (not isinstance(document, dict) or document.get("kind") == "batch-status-input-error"
+                or document.get("schemaVersion") != 1 or document.get("phase") != phase):
             continue
         attempted = instant(document.get("attemptedAt"))
         if not attempted or attempted > current + dt.timedelta(minutes=5):
@@ -2251,6 +2266,115 @@ def read_json(path, optional=False):
         raise TraversalError("READ_FAILED") from None
 
 
+def read_status_snapshot(path, config):
+    """Only genuine absence uses the legacy missing-batch outcome.
+
+    Existing unreadable/oversize/malformed artifacts cannot supply product
+    results or request accounting. Keep this stricter contract local to status
+    generation; historical progress and planning readers remain unchanged.
+    """
+    phase = phase_for(config)
+    path = Path(path)
+    byte_length = None
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise StatusSnapshotError("SNAPSHOT_READ_FAILED") from None
+    if not stat.S_ISREG(before.st_mode):
+        raise StatusSnapshotError("SNAPSHOT_READ_FAILED")
+    byte_length = before.st_size
+    if byte_length > MAX_STATUS_SNAPSHOT_BYTES:
+        raise StatusSnapshotError("SNAPSHOT_TOO_LARGE", byte_length)
+    try:
+        # Reject a swapped symlink/device and cap the read even if the file
+        # grows after stat. O_NONBLOCK also prevents a replaced FIFO blocking.
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(descriptor, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode) or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                raise StatusSnapshotError("SNAPSHOT_READ_FAILED", byte_length)
+            if opened.st_size > MAX_STATUS_SNAPSHOT_BYTES:
+                raise StatusSnapshotError("SNAPSHOT_TOO_LARGE", opened.st_size)
+            payload = handle.read(MAX_STATUS_SNAPSHOT_BYTES + 1)
+        byte_length = len(payload)
+    except StatusSnapshotError:
+        raise
+    except OSError:
+        raise StatusSnapshotError("SNAPSHOT_READ_FAILED", byte_length) from None
+    if byte_length > MAX_STATUS_SNAPSHOT_BYTES:
+        raise StatusSnapshotError("SNAPSHOT_TOO_LARGE", byte_length)
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate-key")
+            result[key] = value
+        return result
+
+    def finite_number(value):
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError("non-finite")
+        return result
+
+    def reject_constant(_value):
+        raise ValueError("non-finite")
+
+    try:
+        document = json.loads(payload.decode("utf-8"), object_pairs_hook=unique_object,
+                              parse_float=finite_number, parse_constant=reject_constant)
+    except (ValueError, RecursionError):
+        raise StatusSnapshotError("SNAPSHOT_INVALID_JSON", byte_length) from None
+    if (not isinstance(document, dict) or type(document.get("schemaVersion")) is not int
+            or document["schemaVersion"] != 1 or document.get("sourceMode") != "actions"
+            or not isinstance(document.get("funds"), list)):
+        raise StatusSnapshotError("SNAPSHOT_INVALID_SCHEMA", byte_length)
+    for key in ("funds", "batchResults", "errors", "pricePatches", "inceptionPatches", "reportLocatorReceipts",
+                "strategyClaimsTasks", "strategyClaimsReceipts", "strategyClaimsPatches"):
+        if key in document and (not isinstance(document[key], list)
+                                or any(not isinstance(item, dict) for item in document[key])):
+            raise StatusSnapshotError("SNAPSHOT_INVALID_SCHEMA", byte_length)
+    # Earlier snapshots omitted period metadata; retain that compatibility.
+    # Explicit metadata, including null, must agree with the frozen batch.
+    if any(key in document and document[key] != value for key, value in phase.items()):
+        raise StatusSnapshotError("SNAPSHOT_PHASE_MISMATCH", byte_length)
+    return document
+
+
+def status_input_diagnostic(config, error, now=None):
+    # Deliberately omit attemptedAt, funds and product counts: no observation or
+    # request budget can be reconstructed from an unreadable artifact.
+    return {"schemaVersion": 1, "kind": "batch-status-input-error", "status": "failed",
+            "phase": phase_for(config), "diagnosedAt": utc_now(now).isoformat(), "errorCode": error.code,
+            "snapshotInput": {"state": "present-unreadable", "byteLength": error.byte_length,
+                              "maxBytes": MAX_STATUS_SNAPSHOT_BYTES}}
+
+
+def valid_status_input_diagnostic(document, config, now=None):
+    if (not isinstance(document, dict) or set(document) != {"schemaVersion", "kind", "status", "phase", "diagnosedAt", "errorCode", "snapshotInput"}
+            or type(document["schemaVersion"]) is not int or document["schemaVersion"] != 1
+            or document["kind"] != "batch-status-input-error" or document["status"] != "failed"
+            or document["phase"] != phase_for(config)
+            or not isinstance(document["errorCode"], str) or document["errorCode"] not in STATUS_SNAPSHOT_ERRORS):
+        return False
+    diagnosed = instant(document["diagnosedAt"])
+    planned = instant(config.get("traversal", {}).get("plannedAt"))
+    if not diagnosed or diagnosed > utc_now(now) + dt.timedelta(minutes=5) or planned and diagnosed < planned:
+        return False
+    value = document["snapshotInput"]
+    if (not isinstance(value, dict) or set(value) != {"state", "byteLength", "maxBytes"}
+            or value["state"] != "present-unreadable" or type(value["maxBytes"]) is not int
+            or value["maxBytes"] != MAX_STATUS_SNAPSHOT_BYTES
+            or value["byteLength"] is not None and (type(value["byteLength"]) is not int or value["byteLength"] < 0)):
+        return False
+    if document["errorCode"] == "SNAPSHOT_TOO_LARGE":
+        return value["byteLength"] is not None and value["byteLength"] > MAX_STATUS_SNAPSHOT_BYTES
+    return True
+
+
 def atomic_json(path, value):
     path = Path(path)
     temporary = path.with_name(path.name + ".tmp")
@@ -2298,9 +2422,10 @@ def main(argv=None):
         print(json.dumps({"status": "planned", "batchCount": len(result["matrix"]), "selectedCount": result["meta"]["selectedCount"], "continueRun": result["meta"]["continueRun"]}))
     elif args.command == "status":
         try:
-            snapshot = read_json(args.snapshot, optional=True)
-        except TraversalError:
-            snapshot = None
+            snapshot = read_status_snapshot(args.snapshot, config)
+        except StatusSnapshotError as error:
+            atomic_json(args.output, status_input_diagnostic(config, error))
+            raise
         result = build_status(config, snapshot)
         atomic_json(args.output, result)
         print(json.dumps({"status": "recorded", "fundCount": len(result["funds"]), "failedCount": sum(item["status"] == "failed" for item in result["funds"])}))

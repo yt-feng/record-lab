@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 
-from traversal import atomic_json, read_json
+from traversal import atomic_json, read_json, STATUS_SNAPSHOT_ERRORS
 from publication_guard import inspect_content, content_limit
 from quarter_catalog import (compose_quarter_catalog, freeze_catalog, validate_catalog_lock,
                              normalize_overlay, recover_historical_overlay, combine_historical_overlays,
@@ -173,6 +173,34 @@ def interleave_matrix(matrix, quarters):
             for quarter in quarters if index < len(groups[quarter])]
 
 
+def deployed_continuation_state(root, quarter):
+    audit = read_json(Path(root) / 'periods' / quarter / 'audit.json', optional=True)
+    if audit is None: return {'batchInputErrors': [], 'continuationHold': None}
+    if not isinstance(audit, dict): raise ValueError('INVALID_CONTINUATION_HOLD')
+    hold = audit.get('continuationHold')
+    if hold is None: return {'batchInputErrors': [], 'continuationHold': None}
+    target, baseline = PERIODS[quarter]
+    if (audit.get('schemaVersion') != 1 or audit.get('quarter') != quarter
+            or audit.get('phase') != {'targetPeriodEnd': target, 'baselinePeriodEnd': baseline}
+            or not isinstance(hold, dict) or set(hold) != {'reason', 'quarter', 'sourceRunId', 'batchIds', 'requestAccounting'}
+            or hold['reason'] != 'BATCH_ARTIFACTS_UNVERIFIED' or hold['requestAccounting'] != 'unverified'
+            or hold['quarter'] != quarter
+            or hold['sourceRunId'] is not None and (not isinstance(hold['sourceRunId'], str) or not re.fullmatch(r'[0-9]{1,20}', hold['sourceRunId']))
+            or not isinstance(hold['batchIds'], list) or not 1 <= len(hold['batchIds']) <= 32
+            or any(not isinstance(value, str) or not re.fullmatch(r'[0-9]{1,2}', value) or int(value) > 31 for value in hold['batchIds'])
+            or len(set(hold['batchIds'])) != len(hold['batchIds'])):
+        raise ValueError('INVALID_CONTINUATION_HOLD')
+    errors = audit.get('batchInputErrors')
+    if (not isinstance(errors, list) or len(errors) != len(hold['batchIds'])
+            or any(not isinstance(row, dict) or set(row) != {'batchId', 'quarter', 'errorCode'}
+                   or row['quarter'] != quarter or row['batchId'] not in hold['batchIds']
+                   or not isinstance(row['errorCode'], str)
+                   or row['errorCode'] not in STATUS_SNAPSHOT_ERRORS | {'BATCH_ARTIFACT_MISSING'} for row in errors)
+            or len({row['batchId'] for row in errors}) != len(errors)):
+        raise ValueError('INVALID_CONTINUATION_HOLD')
+    return {'batchInputErrors': errors, 'continuationHold': hold}
+
+
 def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True, historical_overlays=None):
     selected = selected_periods(quarter)
     # Planning, Actions output and missing-part reconciliation share one bound.
@@ -185,6 +213,20 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
     if not isinstance(overlays, dict) or any(name not in PERIODS for name in overlays):
         raise ValueError('INVALID_HISTORICAL_OVERLAYS')
     root = Path(data)
+    requested = selected
+    holds = {name: state['continuationHold'] for name in requested
+             if (state := deployed_continuation_state(root, name))['continuationHold']}
+    selected = [name for name in requested if name not in holds]
+    if not selected:
+        directory_status = {'status': 'held'}
+        atomic_json('.cache/plan/matrix.json', [])
+        atomic_json('.cache/plan/meta.json', {'quarters': [], 'asOf': as_of, 'hasWork': False,
+                    'directoryRefresh': directory_status, 'heldQuarters': list(holds), 'continuationHolds': holds})
+        atomic_json('.cache/campaign/selection.json', {'quarters': [], 'requestedQuarters': requested, 'asOf': as_of,
+                    'selection': quarter, 'directoryRefresh': directory_status, 'heldQuarters': list(holds), 'continuationHolds': holds})
+        scan_campaign_files()
+        return {'status': 'held', 'batchCount': 0, 'quarters': [], 'heldQuarters': list(holds),
+                'continuationHolds': holds, 'directoryRefresh': directory_status}
     directory_status = refresh_directory(root, as_of) if refresh else {'status': 'provided'}
     catalog = read_json(root / 'catalog.json')
     base = read_json('config/universe.json')
@@ -229,13 +271,16 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
             matrix.append({'id': index, 'config': filename, 'quarter': name})
     matrix = interleave_matrix(matrix, selected)
     atomic_json('.cache/plan/matrix.json', matrix)
-    atomic_json('.cache/plan/meta.json', {'quarters': selected, 'asOf': as_of, 'hasWork': bool(matrix), 'directoryRefresh': directory_status})
+    atomic_json('.cache/plan/meta.json', {'quarters': selected, 'asOf': as_of, 'hasWork': bool(matrix), 'directoryRefresh': directory_status,
+                'heldQuarters': list(holds), 'continuationHolds': holds})
     atomic_json('.cache/campaign/selection.json', {'quarters': selected, 'asOf': as_of, 'selection': quarter,
                 'directoryRefresh': directory_status, 'catalogLockVersion': 1, 'catalogs': catalogs,
+                'requestedQuarters': requested, 'heldQuarters': list(holds), 'continuationHolds': holds,
                 'strategyClaimsQuotas': {name: configs[name]['strategyClaimsQuota'] for name in selected},
                 'reportLocators': locator_locks})
     scan_campaign_files()
-    return {'batchCount': len(matrix), 'quarters': selected, 'directoryRefresh': directory_status}
+    return {'batchCount': len(matrix), 'quarters': selected, 'directoryRefresh': directory_status,
+            'heldQuarters': list(holds), 'continuationHolds': holds}
 
 
 def scan_campaign_files():
@@ -379,17 +424,62 @@ def frozen_claims_quotas_for_publish(selection, matrix):
         raise ValueError('INVALID_STRATEGY_CLAIMS_QUOTA')
 
 
+def batch_input_state(reconciliation, matrix):
+    """Missing artifacts leave request accounting unknown, not a free retry."""
+    quarters = {item['id']: item.get('quarter') for item in matrix}
+    rows = []
+    for item in reconciliation.get('inputErrors', []):
+        if item['batchId'] not in quarters: raise ValueError('INVALID_RECONCILIATION')
+        rows.append({'batchId': item['batchId'], 'quarter': quarters[item['batchId']], 'errorCode': item['errorCode']})
+    for identifier in reconciliation.get('missingPartIds', []):
+        if identifier not in quarters: raise ValueError('INVALID_RECONCILIATION')
+        rows.append({'batchId': identifier, 'quarter': quarters[identifier], 'errorCode': 'BATCH_ARTIFACT_MISSING'})
+    rows.sort(key=lambda row: int(row['batchId']))
+    run_id = os.environ.get('GITHUB_RUN_ID')
+    if not isinstance(run_id, str) or not re.fullmatch(r'[0-9]{1,20}', run_id): run_id = None
+    hold = {'reason': 'BATCH_ARTIFACTS_UNVERIFIED', 'quarter': None, 'sourceRunId': run_id,
+            'batchIds': [row['batchId'] for row in rows],
+            'requestAccounting': 'unverified'} if rows else None
+    return {'batchInputErrors': rows, 'continuationHold': hold,
+            'missingPartCount': reconciliation.get('missingPartCount', 0), 'missingPartIds': reconciliation.get('missingPartIds', []),
+            'inputErrorCount': reconciliation.get('inputErrorCount', 0)}
+
+
 def publish(data='web/data', parts='.cache/parts'):
     root, part_root = Path(data), Path(parts)
     selection = read_json('.cache/campaign/selection.json')
     matrix = read_json('.cache/plan/matrix.json')
+    if selection.get('quarters') == []:
+        requested = selected_periods(selection.get('selection'))
+        holds = {name: deployed_continuation_state(root, name)['continuationHold'] for name in requested}
+        if matrix or not all(holds.values()) or selection.get('continuationHolds') != holds:
+            raise ValueError('INVALID_CONTINUATION_HOLD')
+        result = {'status': 'held', 'quarters': [], 'continueRun': False, 'selection': selection['selection'],
+                  'heldQuarters': requested, 'continuationHolds': holds}
+        atomic_json('.cache/campaign/result.json', result)
+        return result
+    prior_input_states = {name: deployed_continuation_state(root, name) for name in selection['quarters']}
     frozen_claims_quotas_for_publish(selection, matrix)
     locator_paths = frozen_locators_for_publish(selection, matrix)
     catalogs = frozen_catalogs_for_publish(selection, matrix, root)
     from importlib.util import spec_from_file_location, module_from_spec
     spec = spec_from_file_location('complete_status', 'scripts/complete-status.py')
     module = module_from_spec(spec); spec.loader.exec_module(module)
-    module.reconcile('.cache/plan', str(part_root))
+    try:
+        reconciliation = module.reconcile('.cache/plan', str(part_root))
+    except module.BatchStatusInputError as error:
+        # No production merge can admit an existing invalid batch artifact.
+        # Still retain a fixed, public diagnostic for the workflow/recovery UI.
+        atomic_json('.cache/campaign/result.json', {
+            'status': 'batch-input-error', 'errorCode': 'BATCH_STATUS_INPUT_ERROR', 'quarters': [],
+            'continueRun': False, 'selection': selection['selection'],
+            **batch_input_state(error.summary, matrix)})
+        raise
+    input_state = batch_input_state(reconciliation, matrix)
+    for name, prior in prior_input_states.items():
+        new_errors = [item for item in input_state['batchInputErrors'] if item['quarter'] == name]
+        if prior['continuationHold'] and new_errors and new_errors != prior['batchInputErrors']:
+            raise ValueError('CONTINUATION_HOLD_REQUIRES_RECOVERY')
     summaries = []
     for quarter in selection['quarters']:
         if quarter not in PERIODS: raise ValueError('INVALID_PERIOD')
@@ -410,18 +500,30 @@ def publish(data='web/data', parts='.cache/parts'):
                         '--catalog', str(catalogs[quarter]), '--progress', str(output / 'progress.json'),
                         '--config', config, '--data-root', str(output)], check=True)
         progress = read_json(output / 'progress.json')
+        quarter_input_errors = [item for item in input_state['batchInputErrors'] if item['quarter'] == quarter]
+        quarter_hold = {**input_state['continuationHold'], 'quarter': quarter,
+                        'batchIds': [item['batchId'] for item in quarter_input_errors]} if quarter_input_errors else None
+        prior = prior_input_states[quarter]
+        if prior['continuationHold']:
+            # A new ordinary publish is not an authorization to discard unknown
+            # requests from an earlier run. Verified recovery admission is separate.
+            quarter_input_errors = prior['batchInputErrors']
+            quarter_hold = prior['continuationHold']
         atomic_json(output / 'audit.json', {
             'schemaVersion': 1, 'quarter': quarter, 'phase': progress.get('phase'),
             'updatedAt': progress.get('updatedAt'), 'completionStatus': progress.get('completionStatus'),
             'totalFunds': progress.get('totalFunds'), 'processedFunds': progress.get('processedFunds'),
             'failedFunds': progress.get('failedFunds'), 'pendingFunds': progress.get('pendingFunds'),
             'notApplicableFunds': progress.get('notApplicableFunds'), 'research': progress.get('research'),
-            'continueRun': progress.get('continueRun'), 'nextRetryAt': progress.get('nextRetryAt'),
+            'continueRun': bool(progress.get('continueRun')) and not quarter_hold, 'nextRetryAt': progress.get('nextRetryAt'),
             'completionAudit': progress.get('completionAudit'),
             'strategyClaims': progress.get('strategyClaims'),
+            'batchInputErrors': quarter_input_errors, 'continuationHold': quarter_hold,
         })
         summary = {'quarter': quarter, **{k: progress.get(k) for k in (
-            'totalFunds', 'processedFunds', 'failedFunds', 'pendingFunds', 'research', 'strategyClaims', 'completionStatus', 'continueRun')}}
+            'totalFunds', 'processedFunds', 'failedFunds', 'pendingFunds', 'research', 'strategyClaims', 'completionStatus', 'continueRun')},
+            'batchInputErrors': quarter_input_errors, 'continuationHold': quarter_hold}
+        if quarter_hold: summary['continueRun'] = False
         # The analyzer reads its own compact progress view. Do not retain the
         # whole per-product checkpoint in this parent process during analysis
         # or while merging the next quarter.
@@ -437,13 +539,21 @@ def publish(data='web/data', parts='.cache/parts'):
                             'targetPeriodEnd': target, 'baselinePeriodEnd': baseline})
     default = '2026Q3' if any(p['id'] == '2026Q3' for p in periods) else '2026Q2'
     atomic_json(root / 'periods.json', {'schemaVersion': 1, 'defaultPeriod': default, 'periods': periods})
-    result = {'quarters': summaries, 'continueRun': any(s['continueRun'] for s in summaries), 'directoryRefresh': selection.get('directoryRefresh'),
-              'selection': selection['selection']}
+    selected_holds = {item['quarter']: item['continuationHold'] for item in summaries if item['continuationHold']}
+    if selected_holds and not input_state['continuationHold']:
+        input_state['batchInputErrors'] = [row for item in summaries for row in item['batchInputErrors']]
+        input_state['continuationHold'] = next(iter(selected_holds.values()))
+    result = {'quarters': summaries, 'continueRun': not any(s['continuationHold'] for s in summaries) and any(s['continueRun'] for s in summaries),
+              'directoryRefresh': selection.get('directoryRefresh'), 'selection': selection['selection'], **input_state,
+              'heldQuarters': list(dict.fromkeys([*selection.get('heldQuarters', []), *selected_holds])),
+              'continuationHolds': {**selection.get('continuationHolds', {}), **selected_holds}}
     atomic_json('.cache/campaign/result.json', result)
     summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
     if summary_file:
         with open(summary_file, 'a') as handle:
             handle.write('## Collection coverage\n\n')
+            if input_state['continuationHold']:
+                handle.write(f"Automatic continuation held: {len(input_state['batchInputErrors'])} batch artifacts missing; request accounting is unverified.\n\n")
             for s in summaries:
                 research = s.get('research') or {}
                 handle.write(f"- {s['quarter']}: {s['totalFunds']} codes; {s['processedFunds']} with holdings/no-equity evidence; "
