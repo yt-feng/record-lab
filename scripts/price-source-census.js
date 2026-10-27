@@ -231,14 +231,15 @@ function scan(root, { dataCommit, now = new Date().toISOString(), limits: overri
 function main(argv = process.argv.slice(2)) {
   try {
     if (process.env.GITHUB_ACTIONS !== 'true') fail('CENSUS_REQUIRES_ACTIONS');
-    if (argv.length !== 6 || argv[0] !== '--data' || argv[2] !== '--data-commit' || argv[4] !== '--output') fail('CENSUS_ARGUMENT_INVALID');
+    if ((argv.length !== 6 && argv.length !== 8) || argv[0] !== '--data' || argv[2] !== '--data-commit' || argv[4] !== '--output'
+        || argv.length === 8 && argv[6] !== '--now') fail('CENSUS_ARGUMENT_INVALID');
     const repo = path.resolve(argv[1], '../../..'), output = path.resolve(argv[5]), relative = path.relative(repo, output);
     if (relative === '' || !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative)) fail('CENSUS_OUTPUT_INSIDE_CHECKOUT');
     // Refuse output through an existing link, including ancestor directories.
     let parent = path.dirname(output);
     while (!fs.existsSync(parent)) parent = path.dirname(parent);
     if (fs.realpathSync(parent) !== parent || fs.existsSync(output) && fs.lstatSync(output).isSymbolicLink()) fail('CENSUS_OUTPUT_PATH_INVALID');
-    const result = scan(argv[1], { dataCommit: argv[3] });
+    const result = scan(argv[1], { dataCommit: argv[3], ...(argv.length === 8 ? { now: argv[7] } : {}) });
     fs.mkdirSync(path.dirname(output), { recursive: true }); fs.writeFileSync(output, JSON.stringify(result) + '\n', { flag: 'wx' });
     process.stdout.write(JSON.stringify({ status: result.status, complete: result.complete, facts: result.counts.factCount,
       sourceObservations: result.counts.sourceObservationCount, quoteRequests: 0 }) + '\n');

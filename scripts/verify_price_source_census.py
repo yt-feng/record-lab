@@ -400,6 +400,8 @@ def run(data_repo, output, api=None, now=None):
         child_output = Path(temporary).resolve() / 'census.json'
         command = ['node', 'scripts/price-source-census.js', '--data', str(source / 'web/data/periods'),
                    '--data-commit', DATA_COMMIT, '--output', str(child_output)]
+        if now is not None:
+            command += ['--now', now.isoformat() if hasattr(now, 'isoformat') else str(now)]
         try:
             child = subprocess.run(command, cwd=ROOT, env=child_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=660)
         except subprocess.TimeoutExpired: fail('CENSUS_SCAN_TIMEOUT')
