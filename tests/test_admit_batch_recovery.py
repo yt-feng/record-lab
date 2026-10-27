@@ -287,7 +287,8 @@ class AdmissionTests(unittest.TestCase):
             envelope = {'funds': [fund]}
             (quarter / 'companies' / 'co.json').write_text(json.dumps(envelope))
             before = admission.fund_protection(quarter)
-            fund['status'] = 'no-equities'; fund['companyMapping'] = 'catalog'; fund['portfolioDeduplicated'] = True
+            fund['status'] = 'no-equities'; fund['company'] = '目录规范名称'; fund['companyId'] = 'normalized-company'
+            fund['companyMapping'] = 'catalog'; fund['portfolioDeduplicated'] = True
             fund['portfolioRepresentativeCode'] = '000001'; fund['aliases'] = [{'code': '000001', 'name': '合成基金'}]
             (quarter / 'companies' / 'co.json').write_text(json.dumps(envelope))
             after = admission.fund_protection(quarter)

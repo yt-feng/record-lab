@@ -395,6 +395,7 @@ def fund_protection(quarter):
                 prices[key] = digest({key: value for key, value in price.items() if key not in {'dataStatus', 'label'}})
             source = copy.deepcopy(fund)
             for key in ('dataStatus', 'cacheReason', 'summary', 'priceUpdatedAt',
+                        'company', 'companyId',
                         'status', 'collectionAttempt', 'collectionErrors',
                         'portfolioDeduplicated', 'portfolioRepresentativeCode',
                         'aliases', 'companyMapping'):
