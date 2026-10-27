@@ -1,0 +1,82 @@
+name: Record pending request accounting
+on:
+  workflow_dispatch:
+    inputs:
+      data_commit:
+        description: Exact current main commit after the original publisher completed
+        required: true
+        type: string
+concurrency:
+  group: published-records
+  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: read
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/*/
+            /scripts/
+            /tests/
+            /.github/
+      - name: Validate immutable input
+        env:
+          DATA_COMMIT: ${{ inputs.data_commit }}
+        run: python -c 'import os,re; assert re.fullmatch(r"[0-9a-f]{40}",os.environ["DATA_COMMIT"])'
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.data_commit }}
+          path: source-data
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /web/data/periods/2026Q2/audit.json
+            /web/data/periods/2026Q2/progress.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify metadata-only contracts
+        run: python -m unittest discover -s tests -p test_record_recovery_hold.py
+      - name: Prepare one audit-only commit
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATA_COMMIT: ${{ inputs.data_commit }}
+        run: python scripts/record_recovery_hold.py prepare --data source-data --data-commit "$DATA_COMMIT"
+      - name: Validate prepared receipt
+        run: python scripts/record_recovery_hold.py validate
+      - name: Preserve receipt before reference update
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-hold-prepared-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .cache/recovery-hold/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Apply once and read back
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/record_recovery_hold.py apply
+      - name: Validate final receipt
+        if: always()
+        id: publication
+        run: python scripts/record_recovery_hold.py validate
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.publication.outcome == 'success'
+        with:
+          name: recovery-hold-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .cache/recovery-hold/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
