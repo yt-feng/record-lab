@@ -254,6 +254,27 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(admission.AdmissionError,'MARKET_LEDGER'):
             admission.protect_market_budgets(old,changed_schedule,set())
 
+    def test_fund_source_hash_allows_only_requested_portfolio_alias_sync(self):
+        before = {
+            '000744': {'sourceHash': 'representative-old', 'prices': {}, 'priceUpdatedAt': None,
+                       'sourcePortfolioCode': '000744', 'shareClassCodes': ['000744', '000745']},
+            '000745': {'sourceHash': 'alias-old', 'prices': {}, 'priceUpdatedAt': None,
+                       'sourcePortfolioCode': '000744', 'shareClassCodes': ['000744', '000745']},
+            '000746': {'sourceHash': 'unrelated-old', 'prices': {}, 'priceUpdatedAt': None,
+                       'sourcePortfolioCode': '000746', 'shareClassCodes': ['000746', '000747']},
+        }
+        after = copy.deepcopy(before)
+        after['000745']['sourceHash'] = 'alias-normalized'
+        admission.protect_funds(before, after, {'000744'})
+        after['000746']['sourceHash'] = 'unrelated-changed'
+        with self.assertRaisesRegex(admission.AdmissionError, 'UNRELATED_SOURCE_CHANGED'):
+            admission.protect_funds(before, after, {'000744'})
+        broken = copy.deepcopy(before)
+        broken['000745']['sourceHash'] = 'alias-normalized'
+        broken['000745']['sourcePortfolioCode'] = '000745'
+        with self.assertRaisesRegex(admission.AdmissionError, 'UNRELATED_SOURCE_CHANGED'):
+            admission.protect_funds(before, broken, {'000744'})
+
     def test_quality_budget_schema_backfill_is_not_a_new_attempt(self):
         old={'funds':[{'code':'000001','quality':{'attempts':1,'totalAttempts':1,
             'managerAttempts':0,'strategyAttempts':0}}]}

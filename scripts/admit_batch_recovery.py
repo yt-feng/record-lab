@@ -481,11 +481,37 @@ def protect_market_budgets(before, after, started):
                     fail('ADMISSION_SOURCE_BUDGET_CHANGED_' + key.upper())
 
 
+def _same_requested_portfolio(old, new, requested):
+    """Allow only alias metadata normalization within a requested portfolio.
+
+    merge-parts rebuilds a deduplicated portfolio from all of its share-class
+    observations.  That can rewrite a non-requested class while preserving
+    the same explicitly evidenced portfolio identity.  A source hash change
+    outside that identity must remain a hard admission failure.
+    """
+    related = set()
+    for row in (old, new):
+        if not isinstance(row, dict):
+            continue
+        representative = row.get('sourcePortfolioCode')
+        if isinstance(representative, str):
+            related.add(representative)
+        aliases = row.get('shareClassCodes')
+        if isinstance(aliases, list):
+            related.update(code for code in aliases if isinstance(code, str))
+    return (bool(related & set(requested))
+            and isinstance(old.get('sourcePortfolioCode'), str)
+            and old.get('sourcePortfolioCode') == new.get('sourcePortfolioCode'))
+
+
 def protect_funds(before, after, requested):
+    requested = set(requested)
     for code, old in before.items():
         if code not in after: fail('ADMISSION_EXISTING_FUND_REMOVED')
         new = after[code]
-        if code not in requested and old['sourceHash'] != new['sourceHash']: fail('ADMISSION_UNRELATED_SOURCE_CHANGED')
+        if (code not in requested and old['sourceHash'] != new['sourceHash']
+                and not _same_requested_portfolio(old, new, requested)):
+            fail('ADMISSION_UNRELATED_SOURCE_CHANGED')
         for key, value in old['prices'].items():
             if new['prices'].get(key) != value: fail('ADMISSION_PRICE_FACT_CHANGED')
         if old['priceUpdatedAt'] is not None and old['priceUpdatedAt'] != new['priceUpdatedAt']:
