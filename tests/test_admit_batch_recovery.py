@@ -290,6 +290,7 @@ class AdmissionTests(unittest.TestCase):
             fund['status'] = 'no-equities'; fund['company'] = '目录规范名称'; fund['companyId'] = 'normalized-company'
             fund['companyMapping'] = 'catalog'; fund['portfolioDeduplicated'] = True
             fund['portfolioRepresentativeCode'] = '000001'; fund['aliases'] = [{'code': '000001', 'name': '合成基金'}]
+            fund['previousReport'] = {'periodEnd': '2026-03-31', 'sourceUrl': 'https://example.org/previous.pdf'}
             (quarter / 'companies' / 'co.json').write_text(json.dumps(envelope))
             after = admission.fund_protection(quarter)
             self.assertEqual(before['000001']['sourceHash'], after['000001']['sourceHash'])

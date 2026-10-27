@@ -398,7 +398,7 @@ def fund_protection(quarter):
                         'company', 'companyId',
                         'status', 'collectionAttempt', 'collectionErrors',
                         'portfolioDeduplicated', 'portfolioRepresentativeCode',
-                        'aliases', 'companyMapping'):
+                        'aliases', 'companyMapping', 'previousReport'):
                 source.pop(key, None)
             for row in source.get('rows', []): row.pop('priceRange', None)
             result[code] = {'sourceHash': digest(source), 'prices': prices,
