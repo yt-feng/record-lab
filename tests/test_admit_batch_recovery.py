@@ -275,6 +275,24 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(admission.AdmissionError, 'UNRELATED_SOURCE_CHANGED'):
             admission.protect_funds(before, broken, {'000744'})
 
+    def test_fund_protection_ignores_only_reconciliation_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            quarter = Path(directory) / '2026Q2'; (quarter / 'companies').mkdir(parents=True)
+            (quarter / 'latest.json').write_text(json.dumps({'companyFiles': [{'path': './data/companies/co.json'}]}))
+            fund = {'code': '000001', 'name': '合成基金', 'status': 'ok', 'companyId': 'co',
+                    'companyMapping': 'catalog', 'portfolioDeduplicated': False,
+                    'portfolioRepresentativeCode': '000001', 'aliases': [],
+                    'rows': [{'stockCode': '600001', 'market': 'CN', 'currency': 'CNY',
+                              'priceRange': {'status': 'observed', 'low': 1, 'high': 2}}]}
+            envelope = {'funds': [fund]}
+            (quarter / 'companies' / 'co.json').write_text(json.dumps(envelope))
+            before = admission.fund_protection(quarter)
+            fund['status'] = 'no-equities'; fund['companyMapping'] = 'catalog'; fund['portfolioDeduplicated'] = True
+            fund['portfolioRepresentativeCode'] = '000001'; fund['aliases'] = [{'code': '000001', 'name': '合成基金'}]
+            (quarter / 'companies' / 'co.json').write_text(json.dumps(envelope))
+            after = admission.fund_protection(quarter)
+            self.assertEqual(before['000001']['sourceHash'], after['000001']['sourceHash'])
+
     def test_quality_budget_schema_backfill_is_not_a_new_attempt(self):
         old={'funds':[{'code':'000001','quality':{'attempts':1,'totalAttempts':1,
             'managerAttempts':0,'strategyAttempts':0}}]}

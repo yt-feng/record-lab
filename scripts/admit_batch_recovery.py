@@ -394,7 +394,11 @@ def fund_protection(quarter):
                 key = '|'.join(str(row.get(field)) for field in ('market', 'stockCode', 'currency'))
                 prices[key] = digest({key: value for key, value in price.items() if key not in {'dataStatus', 'label'}})
             source = copy.deepcopy(fund)
-            for key in ('dataStatus', 'cacheReason', 'summary', 'priceUpdatedAt'): source.pop(key, None)
+            for key in ('dataStatus', 'cacheReason', 'summary', 'priceUpdatedAt',
+                        'status', 'collectionAttempt', 'collectionErrors',
+                        'portfolioDeduplicated', 'portfolioRepresentativeCode',
+                        'aliases', 'companyMapping'):
+                source.pop(key, None)
             for row in source.get('rows', []): row.pop('priceRange', None)
             result[code] = {'sourceHash': digest(source), 'prices': prices,
                             'priceUpdatedAt': fund.get('priceUpdatedAt')}
