@@ -58,7 +58,7 @@ class DeepSeekStrategyTests(unittest.TestCase):
             self.assertEqual(events[-1]['outcome'], 'started')
             self.assertEqual(body['model'], adapter.MODEL)
             self.assertEqual(body['thinking'], {'type': 'enabled'})
-            self.assertEqual(body['reasoning_effort'], 'high')
+            self.assertEqual(body['reasoning_effort'], 'low')
             self.assertNotIn('temperature', body)
             self.assertEqual(body['response_format'], {'type': 'json_object'})
             self.assertFalse(body['stream']); self.assertNotIn('tools', body)
@@ -533,7 +533,7 @@ class DeepSeekStrategyTests(unittest.TestCase):
         base = run()
         with patch.object(adapter, 'THINKING_MODE', 'disabled'):
             mode_changed = run()
-        with patch.object(adapter, 'REASONING_EFFORT', 'low'):
+        with patch.object(adapter, 'REASONING_EFFORT', 'high'):
             effort_changed = run()
         self.assertEqual(base['receipt']['inputDigest'], mode_changed['receipt']['inputDigest'])
         self.assertEqual(base['receipt']['inputDigest'], effort_changed['receipt']['inputDigest'])
@@ -543,7 +543,7 @@ class DeepSeekStrategyTests(unittest.TestCase):
         self.assertEqual(adapter.MAX_RESPONSE_BYTES, 600000)
         body = adapter.request_body(value)
         self.assertEqual(body['thinking'], {'type': 'enabled'})
-        self.assertEqual(body['reasoning_effort'], 'high'); self.assertNotIn('temperature', body)
+        self.assertEqual(body['reasoning_effort'], 'low'); self.assertNotIn('temperature', body)
 
     def test_reasoning_content_never_enters_success_rejection_unknown_checkpoint_or_logs(self):
         sentinel = 'PRIVATE_REASONING_SENTINEL_NEVER_PUBLISHED'
