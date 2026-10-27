@@ -238,13 +238,21 @@ class AdmissionTests(unittest.TestCase):
             if mutate=='source': after['000001']['sourceHash']='changed'
             if mutate=='removed': after={}
             with self.assertRaises(admission.AdmissionError): admission.protect_funds(before,after,set())
-        old={'funds':[{'code':'000001','attempts':1,'totalAttempts':1,'enrichment':{'attempts':2,'totalAttempts':3,'lastAttemptAt':'old','retry':{'status':'exhausted'}}}]}
+        old={'funds':[{'code':'000001','attempts':1,'totalAttempts':1,'enrichment':{'attempts':2,'totalAttempts':3,'lastAttemptAt':'old','retry':{'cycleDate':'2026-10-26','scheduledCycles':0,'nextRetryAt':None}}}]}
         for key in ('attempts','totalAttempts','lastAttemptAt','retry'):
             after=copy.deepcopy(old); after['funds'][0]['enrichment'][key]=0
             with self.assertRaisesRegex(admission.AdmissionError,'MARKET_LEDGER'): admission.protect_market_budgets(old,after,{'000001'})
         after=copy.deepcopy(old); after['funds'][0]['totalAttempts']=2
         with self.assertRaisesRegex(admission.AdmissionError,'SOURCE_BUDGET'): admission.protect_market_budgets(old,after,set())
         admission.protect_market_budgets(old,after,{'000001'})
+        not_applicable=copy.deepcopy(old)
+        not_applicable['funds'][0]['status']='not-applicable'
+        not_applicable['funds'][0]['enrichment']['retry']={'cycleDate':'2026-10-27','scheduledCycles':0,'nextRetryAt':None}
+        admission.protect_market_budgets(old,not_applicable,set())
+        changed_schedule=copy.deepcopy(not_applicable)
+        changed_schedule['funds'][0]['enrichment']['retry']['scheduledCycles']=1
+        with self.assertRaisesRegex(admission.AdmissionError,'MARKET_LEDGER'):
+            admission.protect_market_budgets(old,changed_schedule,set())
 
     def test_quality_budget_schema_backfill_is_not_a_new_attempt(self):
         old={'funds':[{'code':'000001','quality':{'attempts':1,'totalAttempts':1,
@@ -269,6 +277,13 @@ class AdmissionTests(unittest.TestCase):
         after['funds'][0]['quality']=quality(5, attempts=2)
         after['funds'][1]['quality']=quality(5, attempts=2)
         admission.protect_market_budgets(old, after, {'000744'})
+        admission.protect_market_budgets(old, after, {'000744', '000745'})
+        after['funds'][0]['quality']=quality(6, attempts=3)
+        after['funds'][1]['quality']=quality(6, attempts=3)
+        admission.protect_market_budgets(old, after, {'000744', '000745'})
+        after['funds'][0]['quality']=quality(7, attempts=3)
+        with self.assertRaisesRegex(admission.AdmissionError,'SOURCE_BUDGET'):
+            admission.protect_market_budgets(old, after, {'000744', '000745'})
         changed=copy.deepcopy(after); changed['funds'][1]['quality']['totalAttempts']=6
         with self.assertRaisesRegex(admission.AdmissionError,'SOURCE_BUDGET'):
             admission.protect_market_budgets(old, changed, {'000744'})

@@ -404,6 +404,10 @@ def fund_protection(quarter):
 def protect_market_budgets(before, after, started):
     previous = {row['code']: row for row in before['funds']}; current = {row['code']: row for row in after['funds']}
     if set(previous) != set(current): fail('ADMISSION_PROGRESS_SCOPE_CHANGED')
+    quality_groups = {}
+    for code, row in current.items():
+        representative = row.get('representativeCode') if isinstance(row.get('representativeCode'), str) else code
+        quality_groups.setdefault(representative, []).append(code)
 
     def alias_quality_sync(code, key, old_value, new_value):
         """Accept quality counters copied from a source-started representative.
@@ -416,25 +420,40 @@ def protect_market_budgets(before, after, started):
         counter.  This does not permit top-level market or enrichment counters
         to move.
         """
-        if code in started or key not in {'attempts', 'totalAttempts', 'managerAttempts',
-                                          'managerTotalAttempts', 'strategyAttempts', 'strategyTotalAttempts'}:
+        if key not in {'attempts', 'totalAttempts', 'managerAttempts', 'managerTotalAttempts',
+                       'strategyAttempts', 'strategyTotalAttempts'}:
             return False
         representative = current[code].get('representativeCode')
-        if not isinstance(representative, str) or representative == code or representative not in started:
+        if not isinstance(representative, str) or representative not in started:
             return False
         old_rep = previous.get(representative, {}).get('quality', {})
         new_rep = current.get(representative, {}).get('quality', {})
         rep_before, rep_after = old_rep.get(key), new_rep.get(key)
         if any(type(value) is not int for value in (old_value, new_value, rep_before, rep_after)):
             return False
-        return rep_before <= rep_after <= rep_before + 1 and new_value == rep_after and new_value >= old_value
+        started_members = sum(member in started for member in quality_groups.get(representative, ()))
+        return (started_members > 0 and rep_before <= rep_after <= rep_before + started_members
+                and new_value == rep_after and new_value >= old_value)
 
     for code, old in previous.items():
         new = current[code]
         for key in ('reportLocatorAttempts', 'strategyClaimsAttempts', 'strategyClaimsHistoryBlocked', 'reportLocatorHistoryFull'):
             if old.get(key) != new.get(key): fail('ADMISSION_UNRELATED_LEDGER_CHANGED')
         for key in ('attempts', 'totalAttempts', 'lastAttemptAt', 'retry'):
-            if old.get('enrichment', {}).get(key) != new.get('enrichment', {}).get(key): fail('ADMISSION_MARKET_LEDGER_CHANGED')
+            before_value = old.get('enrichment', {}).get(key)
+            after_value = new.get('enrichment', {}).get(key)
+            if key == 'retry' and new.get('status') == 'not-applicable':
+                # Reclassifying a product that was established after the
+                # quarter rehydrates the empty enrichment lane and may stamp
+                # its cycle date.  Its counters and future schedule must stay
+                # unchanged; the date spelling is not a market attempt.
+                before_retry = before_value if isinstance(before_value, dict) else {}
+                after_retry = after_value if isinstance(after_value, dict) else {}
+                if (before_retry.get('scheduledCycles') == after_retry.get('scheduledCycles')
+                        and before_retry.get('nextRetryAt') == after_retry.get('nextRetryAt')
+                        and isinstance(after_retry.get('cycleDate'), str)):
+                    continue
+            if before_value != after_value: fail('ADMISSION_MARKET_LEDGER_CHANGED')
         for container in (None, 'quality'):
             left = old if container is None else old.get(container, {})
             right = new if container is None else new.get(container, {})
