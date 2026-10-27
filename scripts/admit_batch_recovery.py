@@ -415,7 +415,20 @@ def protect_market_budgets(before, after, started):
             right = new if container is None else new.get(container, {})
             for key in ('attempts', 'totalAttempts', 'managerAttempts', 'managerTotalAttempts', 'strategyAttempts', 'strategyTotalAttempts'):
                 a, b = left.get(key), right.get(key)
-                if a is None and b is None: continue
+                # Older persisted quality rows predate the independent manager/
+                # strategy counters.  merge_progress materializes those fields
+                # as zero (or derives a total from its paired attempt counter).
+                # Treat that schema backfill as the historical baseline; only a
+                # real increment for a source-started code may pass this gate.
+                if a is None:
+                    paired = {
+                        'totalAttempts': 'attempts',
+                        'managerTotalAttempts': 'managerAttempts',
+                        'strategyTotalAttempts': 'strategyAttempts',
+                    }.get(key)
+                    a = left.get(paired) if paired else 0
+                    if a is None: a = 0
+                if b is None and a == 0: continue
                 if type(a) is not int or type(b) is not int or not 0 <= b - a <= (1 if code in started else 0):
                     fail('ADMISSION_SOURCE_BUDGET_CHANGED')
 

@@ -246,6 +246,17 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(admission.AdmissionError,'SOURCE_BUDGET'): admission.protect_market_budgets(old,after,set())
         admission.protect_market_budgets(old,after,{'000001'})
 
+    def test_quality_budget_schema_backfill_is_not_a_new_attempt(self):
+        old={'funds':[{'code':'000001','quality':{'attempts':1,'totalAttempts':1,
+            'managerAttempts':0,'strategyAttempts':0}}]}
+        after=copy.deepcopy(old)
+        after['funds'][0]['quality'].update({'managerTotalAttempts':0,'strategyTotalAttempts':0})
+        admission.protect_market_budgets(old,after,set())
+        after['funds'][0]['quality']['managerTotalAttempts']=1
+        with self.assertRaisesRegex(admission.AdmissionError,'SOURCE_BUDGET'):
+            admission.protect_market_budgets(old,after,set())
+        admission.protect_market_budgets(old,after,{'000001'})
+
     def test_no_original_parts_or_missing_status_reconciliation_enters_admission(self):
         source=(ROOT/'scripts/admit_batch_recovery.py').read_text()
         self.assertIn("if row.filename.startswith('original-parts/'): continue",source)
