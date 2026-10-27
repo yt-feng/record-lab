@@ -683,6 +683,7 @@ function writeAtomic(filename, value) {
 
 function mergeFiles(options) {
   return require('./merge-storage').mergeOnDisk({ ...options,
+    reuseAcrossComponents: options.reuseAcrossComponents !== false,
     receiptCodes: options.receiptCodes || statusCodes(options.parts), engine: mergeSnapshots,
     helpers: { readJson, validEnvelope, coverageFor, observationDates, recoverPrice, writeAtomic, finalObservation,
       publicUrl, catalogDetails, maxCompanyBytes: MAX_COMPANY_BYTES, maxCompanyFunds: MAX_COMPANY_FUNDS } });
@@ -690,17 +691,18 @@ function mergeFiles(options) {
 
 function main(argv = process.argv.slice(2)) {
   try {
-    const args = { parts: '.cache/parts', data: 'web/data', catalog: 'web/data/catalog.json', config: 'config/universe.json' };
+    const args = { parts: '.cache/parts', data: 'web/data', catalog: 'web/data/catalog.json', config: 'config/universe.json', reuseMarketPrices: 'true' };
     for (let index = 0; index < argv.length; index += 2) {
       const key = argv[index].slice(2);
-      if (!argv[index].startsWith('--') || !Object.hasOwn(args, key) || !argv[index + 1]) throw new MergeError('INVALID_ARGUMENTS');
+      if (!argv[index].startsWith('--') || !Object.hasOwn(args, key) || !argv[index + 1]
+        || key === 'reuseMarketPrices' && !['true', 'false'].includes(argv[index + 1])) throw new MergeError('INVALID_ARGUMENTS');
       args[key] = argv[index + 1];
     }
     const catalog = readJson(args.catalog);
     const config = fs.existsSync(args.config) ? readJson(args.config) : {};
     const manifestFile = path.join(args.data, 'latest.json');
     const previousManifest = fs.existsSync(manifestFile) ? readJson(manifestFile) : null;
-    const result = mergeFiles({ ...args, catalog, config, previousManifest });
+    const result = mergeFiles({ ...args, reuseAcrossComponents: args.reuseMarketPrices !== 'false', catalog, config, previousManifest });
     process.stdout.write(`${JSON.stringify({ status: result.changed ? 'updated' : 'unchanged', ...result.counts,
       errorCodes: result.errors })}\n`);
     return 0;

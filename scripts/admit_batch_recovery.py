@@ -547,7 +547,8 @@ def admit(repo, bundle, binding, *, env, now=None, runner=command):
         config['asOf'] = max(batch['config']['asOf'] for batch in bundle_info['batches'])
         config_file = Path(temporary) / 'config.json'; atomic_json(config_file, config)
         runner(['node', str(ROOT / 'scripts/merge-parts.js'), '--parts', str(parts), '--data', str(quarter),
-                '--catalog', str(quarter / 'catalog.json'), '--config', str(config_file)], cwd=ROOT, timeout=2400)
+                '--catalog', str(quarter / 'catalog.json'), '--config', str(config_file),
+                '--reuseMarketPrices', 'false'], cwd=ROOT, timeout=2400)
         receipt = read_json(parts / 'merge-receipt.json')
         statuses = reconcile_observations([row['status'] for row in bundle_info['batches']], receipt, config, current)
         updated = merge_progress(bundle_info['catalog'], progress_before, config, statuses, current,

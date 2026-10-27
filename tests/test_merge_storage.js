@@ -111,6 +111,19 @@ test('global prices are sealed across components before reuse; a late conflictin
   assert.equal(conflict.counts.partialConflictRowCount, 1); assert.equal(conflict.counts.reusedPriceFundCount, 0);
 });
 
+test('source-only recovery can disable cross-component price reuse', t => {
+  const state = setup(t);
+  input(state, [snapshot('000004'), snapshot('000001', { kind: 'complete' }), snapshot('000003')]);
+  const first = run(state, { reuseAcrossComponents: false });
+  const before = funds(saved(state, first.manifest)).find(fund => fund.code === '000004');
+  input(state, []);
+  const result = run(state, { reuseAcrossComponents: false, receiptCodes: ['000004'] });
+  const after = funds(saved(state, result.manifest)).find(fund => fund.code === '000004');
+  assert.equal(result.counts.reusedPriceFundCount, 0);
+  assert.equal(after.priceUpdatedAt, before.priceUpdatedAt);
+  assert.equal(after.rows[0].priceRange.status, before.rows[0].priceRange.status);
+});
+
 test('conflict-only metadata is published atomically without any new report, quote request, or timestamps', t => {
   const state = setup(t);
   const old = mergeSnapshots({ snapshots: [snapshot('000001', { kind: 'complete' }), snapshot('000003', { kind: 'complete', low: 9 })],

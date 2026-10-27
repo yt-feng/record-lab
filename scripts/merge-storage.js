@@ -45,7 +45,7 @@ class Components {
 }
 
 function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCodes = [], engine, helpers,
-  now = new Date(), pageLimits, componentLimit = LIMIT, beforeCommit = null } = {}) {
+  now = new Date(), pageLimits, componentLimit = LIMIT, reuseAcrossComponents = true, beforeCommit = null } = {}) {
   const { readJson, validEnvelope, coverageFor, observationDates, recoverPrice, writeAtomic, publicUrl, catalogDetails } = helpers;
   const current = now instanceof Date ? now : new Date(now);
   const directory = catalogDetails(catalog);
@@ -218,7 +218,11 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
       // The bounded page below owns this parsed fund until it is staged.
       // Release only its private normalized copy before writing output pages.
       fs.unlinkSync(entry.file);
-      const applied = applyPriceIndex(priceIndex, [fund], recoverPrice);
+      const applied = reuseAcrossComponents ? applyPriceIndex(priceIndex, [fund], recoverPrice) : {
+        reusedPriceRowCount: 0, reusedPriceFundCount: 0, partialConflictRowCount: 0,
+        conflictMarkedRowCount: 0, conflictMarkedFundCount: 0, conflictingPriceRowCount: 0,
+        eligiblePriceKeyCount: 0, conflictingPriceKeyCount: 0,
+      };
       for (const key of ['reusedPriceRowCount', 'reusedPriceFundCount', 'partialConflictRowCount', 'conflictMarkedRowCount', 'conflictMarkedFundCount', 'conflictingPriceRowCount']) counts[key] += applied[key];
       counts.eligiblePriceKeyCount = applied.eligiblePriceKeyCount; counts.conflictingPriceKeyCount = applied.conflictingPriceKeyCount;
       if (currentCompany !== entry.companyId) {
@@ -243,7 +247,7 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
       page.push(fund); bytes += size;
     }
     flush();
-    if (!funds.length) {
+    if (!funds.length && reuseAcrossComponents) {
       const empty = applyPriceIndex(priceIndex, [], recoverPrice);
       counts.eligiblePriceKeyCount = empty.eligiblePriceKeyCount; counts.conflictingPriceKeyCount = empty.conflictingPriceKeyCount;
     }
