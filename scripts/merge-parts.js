@@ -71,6 +71,13 @@ function recoverPrice(row, supplied, retrievedAt, now = new Date()) {
   return true;
 }
 
+function latestPriceTime(current, observed) {
+  const observedTime = strategyClaimPatches.instant(observed);
+  const currentTime = strategyClaimPatches.instant(current);
+  if (observedTime === null) return current;
+  return currentTime === null || observedTime > currentTime ? observed : current;
+}
+
 function sanitizeFund(item, { now, config, envelope }) {
   const exemption = item?.status === 'unavailable' && item?.notApplicableEvidence;
   if (!item || !CODE.test(item.code) || !['ok', 'no-equities', 'unavailable'].includes(item.status)
@@ -106,16 +113,22 @@ function sanitizeFund(item, { now, config, envelope }) {
   const priceAt = timestamp(item.priceUpdatedAt) && Date.parse(item.priceUpdatedAt) <= now.getTime() + 300000
     && Date.parse(item.priceUpdatedAt) <= Date.parse(envelope.priceUpdatedAt || envelope.retrievedAt)
     ? item.priceUpdatedAt : clean.retrievedAt;
+  let retainedPriceTime;
   for (const row of clean.rows) {
     const supplied = suppliedRows.get(`${row.market}:${row.stockCode}`)?.priceRange;
-    recoverPrice(row, supplied, priceAt, now);
+    if (recoverPrice(row, supplied, priceAt, now)) {
+      retainedPriceTime = latestPriceTime(retainedPriceTime, row.priceRange.fetchedAt);
+    }
     const conflict = normalizeConflict(supplied?.globalPriceConflict,
       { market: row.market, stockCode: row.stockCode, currency: row.currency, rangeStart: row.priceRange.rangeStart,
         rangeEnd: row.priceRange.rangeEnd, calendarId: calendar.id }, now);
     // The globally witnessed key may be present on a row with no local quote.
     if (conflict) row.priceRange.globalPriceConflict = conflict;
   }
-  if (priceAt !== clean.retrievedAt) clean.priceUpdatedAt = priceAt;
+  // A PDF refresh is not a price observation. Preserve an explicit spelling
+  // only when it matches the latest quote actually retained, to microseconds.
+  if (retainedPriceTime) clean.priceUpdatedAt = strategyClaimPatches.instant(item.priceUpdatedAt)
+    === strategyClaimPatches.instant(retainedPriceTime) ? item.priceUpdatedAt : retainedPriceTime;
   clean.summary.observedPriceCount = clean.rows.filter(row => row.priceRange.status === 'observed').length;
   clean.dataStatus = item.dataStatus;
   clean.cacheReason = item.dataStatus === 'cached' ? 'PREVIOUS_OBSERVATION' : null;
@@ -159,6 +172,7 @@ function shouldReplace(current, candidate) {
 function retainPrices(candidate, old, now) {
   if (!old?.selectedReport || !candidate.selectedReport || old.selectedReport.periodEnd !== candidate.selectedReport.periodEnd) return;
   const rows = new Map(old.rows.map(row => [`${row.market}:${row.stockCode}`, row]));
+  let copiedPriceTime;
   for (const row of candidate.rows) {
     const prior = rows.get(`${row.market}:${row.stockCode}`)?.priceRange;
     const conflict = normalizeConflict(prior?.globalPriceConflict,
@@ -170,9 +184,15 @@ function retainPrices(candidate, old, now) {
       const bound = Date.parse(old?.priceUpdatedAt) > Date.parse(candidate.retrievedAt) ? old.priceUpdatedAt : candidate.retrievedAt;
       if (prior && recoverPrice(row, prior, bound, now)) {
         row.priceRange.dataStatus = 'cached';
-        if (Date.parse(bound) > Date.parse(candidate.retrievedAt)) candidate.priceUpdatedAt = bound;
+        copiedPriceTime = latestPriceTime(copiedPriceTime, row.priceRange.fetchedAt);
       }
     }
+  }
+  if (copiedPriceTime) {
+    // Preserve the original spelling of the matching clock. Do not inherit a
+    // later clock that belongs only to an old security absent from this fund.
+    if (strategyClaimPatches.instant(old.priceUpdatedAt) === strategyClaimPatches.instant(copiedPriceTime)) copiedPriceTime = old.priceUpdatedAt;
+    candidate.priceUpdatedAt = latestPriceTime(candidate.priceUpdatedAt, copiedPriceTime);
   }
   candidate.summary.observedPriceCount = candidate.rows.filter(row => row.priceRange.status === 'observed').length;
 }

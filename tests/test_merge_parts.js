@@ -7,7 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { buildSnapshot } = require('../scripts/build-data');
-const { mergeSnapshots, splitCompanyFunds } = require('../scripts/merge-parts');
+const { mergeFiles, mergeSnapshots, splitCompanyFunds } = require('../scripts/merge-parts');
 
 const now = '2026-09-29T12:00:00Z';
 const config = { targetPeriodEnd: '2026-06-30', baselinePeriodEnd: '2026-03-31' };
@@ -258,6 +258,158 @@ test('valid same-window prices survive a new observation with no fresh market da
   assert.equal(price.low, 8);
   assert.equal(price.dataStatus, 'cached');
   assert.equal(price.fetchedAt, '2026-09-29T09:00:00Z');
+  assert.equal(next.companySnapshots.co1.funds[0].priceUpdatedAt, '2026-09-29T09:00:00Z');
+});
+
+const clockBars = code => ({ [`CN:${code}`]: { currency: 'CNY', priceBasis: 'unadjusted',
+  sourceUrl: 'https://example.org/prices', rows: [{ date: '2026-04-10', low: 8, high: 12, close: 10 }] } });
+
+test('a later source-only PDF keeps the independent clock of an actually retained price', () => {
+  const first = merge({ snapshots: [snapshot(['000001'], { barsByStock: clockBars('600001') })] });
+  const envelope = first.companySnapshots.co1; const old = envelope.funds[0];
+  old.priceUpdatedAt = '2026-09-29T10:30:00.000000+00:00';
+  envelope.priceUpdatedAt = old.priceUpdatedAt;
+  old.rows[0].priceRange.fetchedAt = '2026-09-29T10:30:00Z';
+  const before = structuredClone(old.rows[0].priceRange);
+  const next = merge({ snapshots: [snapshot(['000001'], { retrievedAt: '2026-09-29T11:00:00Z' })],
+    previousCompanies: first.companySnapshots, previousManifest: first.manifest });
+  const observed = next.companySnapshots.co1.funds[0];
+  assert.equal(observed.retrievedAt, '2026-09-29T11:00:00Z');
+  assert.equal(observed.priceUpdatedAt, old.priceUpdatedAt);
+  assert.equal(observed.rows[0].priceRange.fetchedAt, before.fetchedAt);
+  assert.deepEqual(observed.rows[0].priceRange, { ...before, dataStatus: 'cached' });
+  assert.equal(next.manifest.priceUpdatedAt, old.priceUpdatedAt);
+});
+
+test('an explicit price clock equal to the report clock survives repeated normalization', () => {
+  const first = merge({ snapshots: [snapshot(['000001'], { barsByStock: clockBars('600001') })] });
+  assert.equal(first.companySnapshots.co1.funds[0].priceUpdatedAt, '2026-09-29T10:00:00Z');
+  const next = merge({ snapshots: [snapshot(['000003'])], previousCompanies: first.companySnapshots, previousManifest: first.manifest });
+  assert.equal(next.companySnapshots.co1.funds[0].priceUpdatedAt, '2026-09-29T10:00:00Z');
+  assert.equal(next.companySnapshots.co1.funds[0].rows[0].priceRange.fetchedAt, '2026-09-29T10:00:00Z');
+});
+
+test('a missing fund price clock is derived from retained quote evidence, never the new PDF', () => {
+  const first = merge({ snapshots: [snapshot(['000001'], { barsByStock: clockBars('600001') })] });
+  delete first.companySnapshots.co1.funds[0].priceUpdatedAt;
+  delete first.companySnapshots.co1.priceUpdatedAt;
+  const next = merge({ snapshots: [snapshot(['000001'], { retrievedAt: '2026-09-29T11:00:00Z' })],
+    previousCompanies: first.companySnapshots, previousManifest: first.manifest });
+  assert.equal(next.companySnapshots.co1.funds[0].priceUpdatedAt, '2026-09-29T10:00:00Z');
+  assert.equal(next.companySnapshots.co1.funds[0].retrievedAt, '2026-09-29T11:00:00Z');
+});
+
+test('a naked explicit clock or rejected quote cannot invent a fund price observation', () => {
+  for (const invalid of ['no-price', 'invalid-source', 'future-quote']) {
+    const first = merge({ snapshots: [snapshot(['000001'], { barsByStock: invalid === 'no-price' ? {} : clockBars('600001') })] });
+    const envelope = first.companySnapshots.co1; const old = envelope.funds[0];
+    old.priceUpdatedAt = '2026-09-29T10:30:00Z'; envelope.priceUpdatedAt = old.priceUpdatedAt;
+    if (invalid === 'invalid-source') old.rows[0].priceRange.sourceUrl = 'https://localhost/prices';
+    if (invalid === 'future-quote') old.rows[0].priceRange.fetchedAt = '2026-09-30T10:30:00Z';
+    const next = merge({ snapshots: [snapshot(['000003'])], previousCompanies: first.companySnapshots, previousManifest: first.manifest });
+    const observed = next.companySnapshots.co1.funds[0];
+    assert.notEqual(observed.rows[0].priceRange.status, 'observed', invalid);
+    assert.equal(Object.hasOwn(observed, 'priceUpdatedAt'), false, invalid);
+    assert.equal(next.manifest.priceUpdatedAt, null, invalid);
+  }
+});
+
+test('a dropped security cannot lend its later price clock to the retained security', () => {
+  const holdings = ['600001', '600002'].map(stockCode => ({ ...report('000001').holdings[0], stockCode }));
+  const first = merge({ snapshots: [snapshot(['000001'], { overrides: { reports: [report('000001', { holdings })] },
+    barsByStock: { ...clockBars('600001'), ...clockBars('600002') } })] });
+  const envelope = first.companySnapshots.co1; const old = envelope.funds[0];
+  old.priceUpdatedAt = '2026-09-29T10:45:00Z'; envelope.priceUpdatedAt = old.priceUpdatedAt;
+  for (const row of old.rows) row.priceRange.fetchedAt = row.stockCode === '600001'
+    ? '2026-09-29T10:30:00Z' : '2026-09-29T10:45:00Z';
+  const freshHoldings = [holdings[0], { ...holdings[1], stockCode: '600003' }];
+  const next = merge({ snapshots: [snapshot(['000001'], { retrievedAt: '2026-09-29T11:00:00Z',
+    overrides: { reports: [report('000001', { holdings: freshHoldings })] } })],
+    previousCompanies: first.companySnapshots, previousManifest: first.manifest });
+  const observed = next.companySnapshots.co1.funds[0];
+  assert.equal(observed.priceUpdatedAt, '2026-09-29T10:30:00Z');
+  assert.equal(observed.rows.some(row => row.stockCode === '600002'), false);
+  assert.equal(observed.rows.find(row => row.stockCode === '600001').priceRange.fetchedAt, '2026-09-29T10:30:00Z');
+  assert.notEqual(observed.rows.find(row => row.stockCode === '600003').priceRange.status, 'observed');
+});
+
+test('a genuinely newer retained quote clock is not moved backward by older report evidence', () => {
+  const first = merge({ snapshots: [snapshot(['000001'], { barsByStock: clockBars('600001') })] });
+  const next = merge({ snapshots: [snapshot(['000001'], { retrievedAt: '2026-09-29T11:00:00Z', barsByStock: clockBars('600001') })],
+    previousCompanies: first.companySnapshots, previousManifest: first.manifest });
+  assert.equal(next.companySnapshots.co1.funds[0].priceUpdatedAt, '2026-09-29T11:00:00Z');
+  assert.equal(next.companySnapshots.co1.funds[0].rows[0].priceRange.fetchedAt, '2026-09-29T11:00:00Z');
+});
+
+test('one microsecond from a dropped security cannot be mistaken for the retained clock', () => {
+  const holdings = ['600001', '600002'].map(stockCode => ({ ...report('000001').holdings[0], stockCode }));
+  const first = merge({ snapshots: [snapshot(['000001'], { overrides: { reports: [report('000001', { holdings })] },
+    barsByStock: { ...clockBars('600001'), ...clockBars('600002') } })] });
+  const envelope = first.companySnapshots.co1; const old = envelope.funds[0];
+  old.priceUpdatedAt = '2026-09-29T10:30:00.123457Z'; envelope.priceUpdatedAt = old.priceUpdatedAt;
+  old.rows.find(row => row.stockCode === '600001').priceRange.fetchedAt = '2026-09-29T18:30:00.123456+08:00';
+  old.rows.find(row => row.stockCode === '600002').priceRange.fetchedAt = old.priceUpdatedAt;
+  const next = merge({ snapshots: [snapshot(['000001'], { retrievedAt: '2026-09-29T11:00:00Z',
+    overrides: { reports: [report('000001', { holdings: [holdings[0], { ...holdings[1], stockCode: '600003' }] })] } })],
+    previousCompanies: first.companySnapshots, previousManifest: first.manifest });
+  assert.equal(next.companySnapshots.co1.funds[0].priceUpdatedAt, '2026-09-29T18:30:00.123456+08:00');
+});
+
+test('latest quote clocks compare microseconds and offset instants independently of row order', () => {
+  const holdings = ['600001', '600002'].map(stockCode => ({ ...report('000001').holdings[0], stockCode }));
+  for (const reverse of [false, true]) {
+    const input = snapshot(['000001'], { retrievedAt: '2026-09-29T11:00:00Z',
+      overrides: { reports: [report('000001', { holdings })] }, barsByStock: { ...clockBars('600001'), ...clockBars('600002') } });
+    const fund = input.funds[0];
+    fund.rows.find(row => row.stockCode === '600001').priceRange.fetchedAt = '2026-09-29T10:30:00.123457Z';
+    fund.rows.find(row => row.stockCode === '600002').priceRange.fetchedAt = '2026-09-29T18:30:00.123456+08:00';
+    fund.priceUpdatedAt = '2026-09-29T18:30:00.123457+08:00'; input.priceUpdatedAt = fund.priceUpdatedAt;
+    if (reverse) fund.rows.reverse();
+    assert.equal(merge({ snapshots: [input] }).companySnapshots.co1.funds[0].priceUpdatedAt, fund.priceUpdatedAt);
+    delete fund.priceUpdatedAt;
+    assert.equal(merge({ snapshots: [input] }).companySnapshots.co1.funds[0].priceUpdatedAt, '2026-09-29T10:30:00.123457Z');
+  }
+});
+
+test('a rejected source or invalid explicit clock cannot supply the time for another valid quote', () => {
+  const holdings = ['600001', '600002'].map(stockCode => ({ ...report('000001').holdings[0], stockCode }));
+  for (const clock of ['2026-09-29T10:45:00Z', '2026-09-29T10:45:00+00:60', '2026-09-29T24:00:00Z']) {
+    const input = snapshot(['000001'], { retrievedAt: '2026-09-29T11:00:00Z',
+      overrides: { reports: [report('000001', { holdings })] }, barsByStock: { ...clockBars('600001'), ...clockBars('600002') } });
+    const fund = input.funds[0];
+    fund.rows.find(row => row.stockCode === '600001').priceRange.fetchedAt = '2026-09-29T10:30:00.123456Z';
+    const rejected = fund.rows.find(row => row.stockCode === '600002').priceRange;
+    rejected.fetchedAt = '2026-09-29T10:45:00Z'; rejected.sourceUrl = 'https://localhost/prices';
+    fund.priceUpdatedAt = clock; input.priceUpdatedAt = clock;
+    const result = merge({ snapshots: [input] }).companySnapshots.co1.funds[0];
+    assert.equal(result.priceUpdatedAt, '2026-09-29T10:30:00.123456Z', clock);
+    assert.notEqual(result.rows.find(row => row.stockCode === '600002').priceRange.status, 'observed');
+  }
+});
+
+test('the bounded disk pipeline preserves the independent price clock through a source-only merge', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'price-clock-test-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const parts = path.join(root, 'parts'); const data = path.join(root, 'data');
+  fs.mkdirSync(parts); fs.mkdirSync(path.join(data, 'companies'), { recursive: true });
+  const first = merge({ snapshots: [snapshot(['000001'], { barsByStock: clockBars('600001') })] });
+  const envelope = first.companySnapshots.co1; const old = envelope.funds[0];
+  old.priceUpdatedAt = '2026-09-29T10:30:00+00:00'; envelope.priceUpdatedAt = old.priceUpdatedAt;
+  old.rows[0].priceRange.fetchedAt = old.priceUpdatedAt;
+  fs.writeFileSync(path.join(data, 'companies', 'co1.json'), JSON.stringify(envelope));
+  fs.writeFileSync(path.join(data, 'latest.json'), JSON.stringify(first.manifest));
+  fs.writeFileSync(path.join(parts, 'part.json'), JSON.stringify(snapshot(['000001'], { retrievedAt: '2026-09-29T11:00:00Z' })));
+  const result = mergeFiles({ parts, data, config, catalog, now, previousManifest: first.manifest });
+  const manifest = JSON.parse(fs.readFileSync(path.join(data, 'latest.json'), 'utf8'));
+  const observed = JSON.parse(fs.readFileSync(path.join(data, 'companies', path.basename(manifest.companyFiles[0].path)), 'utf8')).funds[0];
+  assert.equal(result.counts.acceptedFreshFundCount, 1);
+  assert.equal(observed.retrievedAt, '2026-09-29T11:00:00Z');
+  assert.equal(observed.priceUpdatedAt, old.priceUpdatedAt);
+  assert.equal(manifest.priceUpdatedAt, old.priceUpdatedAt);
+  assert.deepEqual(observed.rows[0].priceRange, { ...old.rows[0].priceRange, dataStatus: 'cached' });
+  const receipt = JSON.parse(fs.readFileSync(path.join(parts, 'merge-receipt.json'), 'utf8'));
+  assert.deepEqual(receipt.pricePatches, []);
+  assert.equal(receipt.funds[0].reportEvidence.observedAt, '2026-09-29T11:00:00Z');
 });
 
 test('CLI merges snapshot files atomically and leaves bytes unchanged on a later empty batch', () => {
