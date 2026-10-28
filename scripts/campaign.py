@@ -20,6 +20,7 @@ from report_identity_catalog import supplement_catalog
 from report_locators import (refresh_registries, registry_locators, freeze_registry, validate_registry_lock,
                              normalize_locator, MAX_BYTES as LOCATOR_MAX_BYTES)
 from source_dates import china_today
+from campaign_accounting import collect_batch_accounting, persist_accounting
 
 PERIODS = {
     '2026Q2': ('2026-06-30', '2026-03-31'),
@@ -223,7 +224,8 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
         atomic_json('.cache/plan/meta.json', {'quarters': [], 'asOf': as_of, 'hasWork': False,
                     'directoryRefresh': directory_status, 'heldQuarters': list(holds), 'continuationHolds': holds})
         atomic_json('.cache/campaign/selection.json', {'quarters': [], 'requestedQuarters': requested, 'asOf': as_of,
-                    'selection': quarter, 'directoryRefresh': directory_status, 'heldQuarters': list(holds), 'continuationHolds': holds})
+                    'selection': quarter, 'marketAccountingVersion': 1,
+                    'directoryRefresh': directory_status, 'heldQuarters': list(holds), 'continuationHolds': holds})
         scan_campaign_files()
         return {'status': 'held', 'batchCount': 0, 'quarters': [], 'heldQuarters': list(holds),
                 'continuationHolds': holds, 'directoryRefresh': directory_status}
@@ -274,6 +276,7 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
     atomic_json('.cache/plan/meta.json', {'quarters': selected, 'asOf': as_of, 'hasWork': bool(matrix), 'directoryRefresh': directory_status,
                 'heldQuarters': list(holds), 'continuationHolds': holds})
     atomic_json('.cache/campaign/selection.json', {'quarters': selected, 'asOf': as_of, 'selection': quarter,
+                'marketAccountingVersion': 1,
                 'directoryRefresh': directory_status, 'catalogLockVersion': 1, 'catalogs': catalogs,
                 'requestedQuarters': requested, 'heldQuarters': list(holds), 'continuationHolds': holds,
                 'strategyClaimsQuotas': {name: configs[name]['strategyClaimsQuota'] for name in selected},
@@ -476,6 +479,9 @@ def publish(data='web/data', parts='.cache/parts'):
             **batch_input_state(error.summary, matrix)})
         raise
     input_state = batch_input_state(reconciliation, matrix)
+    accounting_required = (selection.get('marketAccountingVersion') == 1
+                           or os.environ.get('CAMPAIGN_MARKET_ACCOUNTING') == 'required')
+    accounting = collect_batch_accounting(matrix) if accounting_required else None
     for name, prior in prior_input_states.items():
         new_errors = [item for item in input_state['batchInputErrors'] if item['quarter'] == name]
         if prior['continuationHold'] and new_errors and new_errors != prior['batchInputErrors']:
@@ -509,21 +515,26 @@ def publish(data='web/data', parts='.cache/parts'):
             # requests from an earlier run. Verified recovery admission is separate.
             quarter_input_errors = prior['batchInputErrors']
             quarter_hold = prior['continuationHold']
+        market_accounting = persist_accounting(output, quarter, accounting.get(quarter, [])) if accounting is not None else None
+        accounting_allows_continuation = market_accounting is None or market_accounting['continuationAllowed']
         atomic_json(output / 'audit.json', {
             'schemaVersion': 1, 'quarter': quarter, 'phase': progress.get('phase'),
             'updatedAt': progress.get('updatedAt'), 'completionStatus': progress.get('completionStatus'),
             'totalFunds': progress.get('totalFunds'), 'processedFunds': progress.get('processedFunds'),
             'failedFunds': progress.get('failedFunds'), 'pendingFunds': progress.get('pendingFunds'),
             'notApplicableFunds': progress.get('notApplicableFunds'), 'research': progress.get('research'),
-            'continueRun': bool(progress.get('continueRun')) and not quarter_hold, 'nextRetryAt': progress.get('nextRetryAt'),
+            'continueRun': bool(progress.get('continueRun')) and not quarter_hold and accounting_allows_continuation,
+            'nextRetryAt': progress.get('nextRetryAt'),
             'completionAudit': progress.get('completionAudit'),
             'strategyClaims': progress.get('strategyClaims'),
             'batchInputErrors': quarter_input_errors, 'continuationHold': quarter_hold,
+            **({'marketAccounting': market_accounting} if market_accounting is not None else {}),
         })
         summary = {'quarter': quarter, **{k: progress.get(k) for k in (
             'totalFunds', 'processedFunds', 'failedFunds', 'pendingFunds', 'research', 'strategyClaims', 'completionStatus', 'continueRun')},
-            'batchInputErrors': quarter_input_errors, 'continuationHold': quarter_hold}
-        if quarter_hold: summary['continueRun'] = False
+            'batchInputErrors': quarter_input_errors, 'continuationHold': quarter_hold,
+            **({'marketAccounting': market_accounting} if market_accounting is not None else {})}
+        if quarter_hold or not accounting_allows_continuation: summary['continueRun'] = False
         # The analyzer reads its own compact progress view. Do not retain the
         # whole per-product checkpoint in this parent process during analysis
         # or while merging the next quarter.
@@ -547,6 +558,11 @@ def publish(data='web/data', parts='.cache/parts'):
               'directoryRefresh': selection.get('directoryRefresh'), 'selection': selection['selection'], **input_state,
               'heldQuarters': list(dict.fromkeys([*selection.get('heldQuarters', []), *selected_holds])),
               'continuationHolds': {**selection.get('continuationHolds', {}), **selected_holds}}
+    # A mixed-quarter continuation would select the unresolved scope again.
+    # Persist the verified source results, but require explicit review before
+    # any automatic next run while an accounting batch remains unresolved.
+    if any(not s.get('marketAccounting', {}).get('continuationAllowed', True) for s in summaries):
+        result['continueRun'] = False
     atomic_json('.cache/campaign/result.json', result)
     summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
     if summary_file:
@@ -554,6 +570,9 @@ def publish(data='web/data', parts='.cache/parts'):
             handle.write('## Collection coverage\n\n')
             if input_state['continuationHold']:
                 handle.write(f"Automatic continuation held: {len(input_state['batchInputErrors'])} batch artifacts missing; request accounting is unverified.\n\n")
+            unresolved = sum(s.get('marketAccounting', {}).get('unresolvedBatchCount', 0) for s in summaries)
+            if unresolved:
+                handle.write(f"Automatic continuation held: {unresolved} market-accounting batches remain unresolved; source observations are retained.\n\n")
             for s in summaries:
                 research = s.get('research') or {}
                 handle.write(f"- {s['quarter']}: {s['totalFunds']} codes; {s['processedFunds']} with holdings/no-equity evidence; "

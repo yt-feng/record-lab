@@ -20,6 +20,11 @@ spec.loader.exec_module(site)
 
 
 class CampaignTests(unittest.TestCase):
+    def setUp(self):
+        binding = patch.dict(os.environ, {'GITHUB_RUN_ID': '123456', 'GITHUB_RUN_ATTEMPT': '1',
+                                        'GITHUB_SHA': 'a' * 40})
+        binding.start(); self.addCleanup(binding.stop)
+
     def test_default_campaign_matrix_passes_workflow_output_and_missing_part_reconciliation(self):
         source = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temp:

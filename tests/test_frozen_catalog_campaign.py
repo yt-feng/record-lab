@@ -17,6 +17,9 @@ from test_quarter_catalog import current, overlay
 
 class FrozenCampaignTests(unittest.TestCase):
     def setUp(self):
+        self.binding = patch.dict(os.environ, {'GITHUB_RUN_ID': '123456', 'GITHUB_RUN_ATTEMPT': '1',
+                                              'GITHUB_SHA': 'a' * 40})
+        self.binding.start()
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         for directory in ('scripts', 'lib', 'config'):
@@ -38,6 +41,7 @@ class FrozenCampaignTests(unittest.TestCase):
 
     def tearDown(self):
         self.runtime.stop()
+        self.binding.stop()
         os.chdir(self.original)
         self.temporary.cleanup()
 

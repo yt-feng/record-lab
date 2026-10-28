@@ -46,6 +46,7 @@ jobs:
         id: plan
         env:
           QUARTER: ${{ inputs.quarter || 'both' }}
+          CAMPAIGN_MARKET_ACCOUNTING: required
         run: |
           python scripts/campaign.py plan --quarter "$QUARTER" --shards 16 --batch-size 75
           node scripts/workflow-outputs.js .cache/plan >> "$GITHUB_OUTPUT"
@@ -111,12 +112,30 @@ jobs:
         timeout-minutes: 34
         env:
           BATCH_CONFIG: ${{ matrix.config }}
+          RECEIPT_BATCH_ID: ${{ matrix.id }}
           MINER_U_KEYS: ${{ secrets.MINER_U_KEYS }}
           MINER_U: ${{ secrets.MINER_U }}
           MINERU_API_KEY: ${{ secrets.MINERU_API_KEY }}
         run: |
           AS_OF=$(node -p 'JSON.parse(require("fs").readFileSync(".cache/plan/" + process.env.BATCH_CONFIG)).asOf')
-          python scripts/collect.py --config ".cache/plan/$BATCH_CONFIG" --output raw/input.json --as-of "$AS_OF"
+          python scripts/collect.py --config ".cache/plan/$BATCH_CONFIG" --output raw/input.json --as-of "$AS_OF" --request-receipts .cache/request-accounting-private
+      - name: Validate independent market request accounting
+        id: accounting
+        if: always()
+        env:
+          BATCH_CONFIG: ${{ matrix.config }}
+          RECEIPT_BATCH_ID: ${{ matrix.id }}
+        run: python scripts/request_receipts.py --journal .cache/request-accounting-private --config ".cache/plan/$BATCH_CONFIG" --output .cache/request-accounting-public/receipts.json
+      - name: Preserve independently verified market request accounting
+        id: accounting_upload
+        if: always() && steps.accounting.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: request-accounting-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
+          path: .cache/request-accounting-public/receipts.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
       - name: Build batch
         id: build
         if: always()
@@ -127,7 +146,8 @@ jobs:
           test -f raw/input.json
           node scripts/build-data.js --input raw/input.json --output web/data/part.json --config ".cache/plan/$BATCH_CONFIG"
       - name: Record completion state
-        if: always()
+        id: status
+        if: always() && steps.build.outcome == 'success'
         env:
           BATCH_CONFIG: ${{ matrix.config }}
         run: python scripts/traversal.py status --config ".cache/plan/$BATCH_CONFIG" --snapshot web/data/part.json --output web/data/status.json
@@ -136,7 +156,7 @@ jobs:
         id: publication
         run: python scripts/publication_guard.py --root .
       - uses: actions/upload-artifact@v4
-        if: always() && steps.publication.outcome == 'success'
+        if: always() && steps.build.outcome == 'success' && steps.status.outcome == 'success' && steps.publication.outcome == 'success'
         with:
           name: part-${{ matrix.id }}
           path: |
@@ -144,6 +164,24 @@ jobs:
             web/data/status.json
           if-no-files-found: error
           retention-days: 2
+      - name: Preserve technical failure status
+        if: always()
+        env:
+          COLLECT_OUTCOME: ${{ steps.collect.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          STATUS_OUTCOME: ${{ steps.status.outcome }}
+          PUBLICATION_OUTCOME: ${{ steps.publication.outcome }}
+          ACCOUNTING_OUTCOME: ${{ steps.accounting.outcome }}
+          ACCOUNTING_UPLOAD_OUTCOME: ${{ steps.accounting_upload.outcome }}
+          ACCOUNTING_COMPLETED: ${{ steps.accounting.outputs.completed }}
+        run: |
+          python - <<'PY'
+          import os
+          names = ('COLLECT_OUTCOME', 'BUILD_OUTCOME', 'STATUS_OUTCOME', 'PUBLICATION_OUTCOME', 'ACCOUNTING_OUTCOME', 'ACCOUNTING_UPLOAD_OUTCOME')
+          if any(os.environ.get(name) != 'success' for name in names) or os.environ.get('ACCOUNTING_COMPLETED') != 'true':
+              print('{"status":"failed","errorCode":"BATCH_STEP_FAILED"}')
+              raise SystemExit(1)
+          PY
   publish:
     needs: [plan, batch]
     if: always() && needs.plan.result == 'success'
@@ -184,11 +222,19 @@ jobs:
         with:
           name: campaign
           path: .cache/campaign
+      - name: Restore independent market request accounting
+        if: needs.plan.outputs.has_work == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: request-accounting-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: .cache/request-accounting
       - name: Merge source-linked results
         id: history
         env:
           GH_TOKEN: ${{ github.token }}
           PUBLICATION_CACHE_OUTPUT: ${{ runner.temp }}/publication-history.json
+          CAMPAIGN_MARKET_ACCOUNTING: required
         run: |
           python scripts/campaign.py publish
           python scripts/publication_guard.py --root . --history

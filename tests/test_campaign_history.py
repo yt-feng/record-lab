@@ -59,7 +59,9 @@ def workspace():
             return real_run(command, **kwargs)
         try:
             os.chdir(root)
-            with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), patch('campaign.subprocess.run', side_effect=local_run):
+            with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'GITHUB_RUN_ID': '123456',
+                                        'GITHUB_RUN_ATTEMPT': '1', 'GITHUB_SHA': 'a' * 40}), \
+                    patch('campaign.subprocess.run', side_effect=local_run):
                 yield root
         finally:
             os.chdir(previous)
