@@ -32,6 +32,14 @@ MAX_ARCHIVE = 1_000_000_000
 MAX_FILE = 25_000_000
 LEDGER = 'recovery-admissions.json'
 ROOT = Path(__file__).resolve().parents[1]
+EXECUTION_STAGE = 'START'
+
+
+def stage(name):
+    """Keep only a fixed, non-sensitive phase label for failure receipts."""
+    global EXECUTION_STAGE
+    if re.fullmatch(r'[A-Z0-9_]{1,48}', name):
+        EXECUTION_STAGE = name
 
 
 class AdmissionError(ValueError):
@@ -540,6 +548,7 @@ def protect_funds(before, after, requested):
 
 
 def admit(repo, bundle, binding, *, env, now=None, runner=command):
+    stage('ADMIT_LOAD_LEDGER')
     repo = Path(repo); quarter = repo / 'web/data/periods/2026Q2'
     ledger = load_ledger(quarter); identifier = digest(binding)
     existing = [row for row in ledger['entries'] if row.get('binding', {}).get('recoveryRunId') == binding['recoveryRunId']]
@@ -547,8 +556,11 @@ def admit(repo, bundle, binding, *, env, now=None, runner=command):
         if len(existing) != 1 or existing[0]['admissionDigest'] != identifier: fail('ADMISSION_REPLAY_CONFLICT')
         return {'status': 'already-admitted', 'admissionDigest': identifier, 'sourceRequests': 0, 'marketRequests': 0, 'continueRun': False}
     if len(ledger['entries']) >= 16: fail('ADMISSION_LEDGER_FULL')
+    stage('ADMIT_CHECK_BASE')
     hold = check_base(repo, binding, env)
+    stage('ADMIT_VERIFY_BUNDLE')
     bundle_info = verify_bundle(bundle, binding, repo)
+    stage('ADMIT_PROTECT_BEFORE')
     protected = protected_files(repo / 'web/data'); before = fund_protection(quarter)
     audit = read_json(quarter / 'audit.json'); progress_before = bundle_info['progress']
     current = now or dt.datetime.now(dt.timezone.utc)
@@ -562,16 +574,21 @@ def admit(repo, bundle, binding, *, env, now=None, runner=command):
         config['funds'] = [item for batch in bundle_info['batches'] for item in batch['config']['funds']]
         config['asOf'] = max(batch['config']['asOf'] for batch in bundle_info['batches'])
         config_file = Path(temporary) / 'config.json'; atomic_json(config_file, config)
+        stage('ADMIT_MERGE_PARTS')
         runner(['node', str(ROOT / 'scripts/merge-parts.js'), '--parts', str(parts), '--data', str(quarter),
                 '--catalog', str(quarter / 'catalog.json'), '--config', str(config_file),
                 '--reuseMarketPrices', 'false'], cwd=ROOT, timeout=2400)
+        stage('ADMIT_RECONCILE')
         receipt = read_json(parts / 'merge-receipt.json')
         statuses = reconcile_observations([row['status'] for row in bundle_info['batches']], receipt, config, current)
         updated = merge_progress(bundle_info['catalog'], progress_before, config, statuses, current,
                                  retained=load_retained_funds(quarter))
+        stage('ADMIT_PROTECT_BUDGETS')
         protect_market_budgets(progress_before, updated, bundle_info['started'])
+        stage('ADMIT_PROTECT_FUNDS')
         protect_funds(before, fund_protection(quarter), bundle_info['requested'])
         if protected_files(repo / 'web/data') != protected: fail('ADMISSION_NON_TARGET_DATA_CHANGED')
+        stage('ADMIT_PERSIST')
         atomic_json(quarter / 'progress.json', updated)
         # Coverage may advance, but a source-only recovery cannot settle unknown markets.
         for key in ('updatedAt', 'completionStatus', 'totalFunds', 'processedFunds', 'failedFunds', 'pendingFunds',
@@ -579,8 +596,10 @@ def admit(repo, bundle, binding, *, env, now=None, runner=command):
             if key in updated: audit[key] = updated[key]
         audit.update(**hold, continueRun=False)
         atomic_json(quarter / 'audit.json', audit)
+        stage('ADMIT_ANALYZE')
         runner(['node', str(ROOT / 'scripts/analyze-data.js'), '--data', str(quarter), '--output', str(quarter / 'analysis.json')],
                cwd=ROOT, timeout=2400)
+        stage('ADMIT_PROTECT_AFTER')
         if protected_files(repo / 'web/data') != protected or deployed_continuation_state(repo / 'web/data', QUARTER) != hold:
             fail('ADMISSION_PROTECTION_FAILED')
     entry = {'admissionDigest': identifier, 'binding': binding, 'admittedAt': current.isoformat(),
@@ -595,6 +614,7 @@ def admit(repo, bundle, binding, *, env, now=None, runner=command):
 
 def run(repo, binding, *, api=None, env=None):
     env = os.environ if env is None else env; repo = Path(repo)
+    stage('RUN_CHECK_RUNTIME')
     check_runtime(repo, env)
     # Idempotent already-persisted admissions require no artifact download.
     entries = load_ledger(repo / 'web/data/periods/2026Q2')['entries']
@@ -602,14 +622,20 @@ def run(repo, binding, *, api=None, env=None):
     if matching:
         if len(matching) != 1 or matching[0]['admissionDigest'] != digest(binding): fail('ADMISSION_REPLAY_CONFLICT')
         return {'status': 'already-admitted', 'admissionDigest': digest(binding), 'sourceRequests': 0, 'marketRequests': 0, 'continueRun': False}
+    stage('RUN_CHECK_BASE')
     check_base(repo, binding, env)
     api = api or ActionsAPI()
+    stage('RUN_CHECK_MAIN')
     if api.get('commits/main').get('sha') != env.get('GITHUB_SHA'): fail('ADMISSION_MAIN_MOVED')
+    stage('RUN_VERIFY_METADATA')
     metadata = verified_metadata(api, binding)
     with tempfile.TemporaryDirectory(prefix='verified-recovery-artifact-') as temporary:
         archive = Path(temporary) / 'recovery.zip'; bundle = Path(temporary) / 'bundle'; bundle.mkdir()
+        stage('RUN_DOWNLOAD')
         api.download(binding['artifactId'], archive)
+        stage('RUN_EXTRACT')
         extract_archive(archive, bundle, metadata, binding)
+        stage('RUN_ADMIT')
         return admit(repo, bundle, binding, env=env)
 
 
@@ -639,7 +665,11 @@ def main(argv=None):
         recovery.public_write(ROOT / '.cache/recovery-admission/result.json', result)
         print(json.dumps(result)); return 0
     except Exception as error:
-        code = str(error) if isinstance(error, AdmissionError) and re.fullmatch(r'ADMISSION_[A-Z_]{1,64}', str(error)) else 'ADMISSION_EXECUTION_FAILED'
+        if isinstance(error, AdmissionError) and re.fullmatch(r'ADMISSION_[A-Z_]{1,64}', str(error)):
+            code = str(error)
+        else:
+            error_type = re.sub(r'[^A-Z0-9_]', '_', type(error).__name__.upper())[:24] or 'UNKNOWN'
+            code = f'ADMISSION_EXECUTION_FAILED_{EXECUTION_STAGE}_{error_type}'
         result = {'status': 'failed', 'errorCode': code, 'continueRun': False, 'sourceRequests': 0, 'marketRequests': 0}
         try: recovery.public_write(ROOT / '.cache/recovery-admission/result.json', result)
         except Exception: pass
