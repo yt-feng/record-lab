@@ -459,15 +459,16 @@ function preserveUnrequestedPortfolioIdentity(funds, previousByCode, requestedCo
     // source hash.  Otherwise a source-only recovery would rewrite an
     // unrelated product merely because the new group was normalized globally.
     const exactPrevious = previousByCode instanceof Map ? previousByCode.get(fund.code) : null;
-    if (exactPrevious && !portfolioIdentity(exactPrevious)) {
-      if (Object.hasOwn(exactPrevious, 'sourcePortfolioCode')) fund.sourcePortfolioCode = exactPrevious.sourcePortfolioCode;
-      else delete fund.sourcePortfolioCode;
-      if (Object.hasOwn(exactPrevious, 'portfolioSourceUrl')) fund.portfolioSourceUrl = exactPrevious.portfolioSourceUrl;
-      else delete fund.portfolioSourceUrl;
-      if (Array.isArray(exactPrevious.shareClassCodes)) fund.shareClassCodes = [...exactPrevious.shareClassCodes];
-      else delete fund.shareClassCodes;
-      if (Array.isArray(exactPrevious.aliases)) fund.aliases = clone(exactPrevious.aliases);
-      else delete fund.aliases;
+    if (exactPrevious) {
+      // With no requested alias, the whole current representative is
+      // unrelated to this source-only recovery.  Restore the persisted
+      // observation exactly, not just its portfolio URL: deduplication can
+      // also project a fresh report, holdings table, manager table or other
+      // source fields onto the unrequested code.  Prices and clocks are part
+      // of that persisted observation and must remain untouched as well.
+      const preserved = clone(exactPrevious);
+      for (const key of Object.keys(fund)) delete fund[key];
+      Object.assign(fund, preserved);
       continue;
     }
     const matches = new Set();
