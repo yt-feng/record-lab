@@ -401,8 +401,9 @@ def fund_protection(quarter):
                         'aliases', 'companyMapping', 'selectedReport', 'previousReport'):
                 source.pop(key, None)
             for row in source.get('rows', []): row.pop('priceRange', None)
-            result[code] = {'sourceHash': digest(source), 'prices': prices,
-                            'priceUpdatedAt': fund.get('priceUpdatedAt')}
+            result[code] = {'sourceHash': digest(source),
+                            'sourceFields': {key: digest(value) for key, value in source.items()},
+                            'prices': prices, 'priceUpdatedAt': fund.get('priceUpdatedAt')}
     return result
 
 
@@ -527,7 +528,11 @@ def protect_funds(before, after, requested):
         new = after[code]
         if (code not in requested and old['sourceHash'] != new['sourceHash']
                 and not _same_requested_portfolio(old, new, requested, code)):
-            fail('ADMISSION_UNRELATED_SOURCE_CHANGED')
+            before_fields, after_fields = old.get('sourceFields', {}), new.get('sourceFields', {})
+            changed = sorted(key for key in set(before_fields) | set(after_fields)
+                             if before_fields.get(key) != after_fields.get(key))
+            suffix = '_'.join(changed[:3]) if changed else 'unknown_field'
+            fail('ADMISSION_UNRELATED_SOURCE_CHANGED_' + suffix)
         for key, value in old['prices'].items():
             if new['prices'].get(key) != value: fail('ADMISSION_PRICE_FACT_CHANGED')
         if old['priceUpdatedAt'] is not None and old['priceUpdatedAt'] != new['priceUpdatedAt']:
