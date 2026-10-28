@@ -283,6 +283,16 @@ class AdmissionTests(unittest.TestCase):
         normalized['000745']['sourceHash'] = 'alias-normalized'
         admission.protect_funds(filled, normalized, {'000744'})
 
+        url_before = copy.deepcopy(before)
+        url_after = copy.deepcopy(before)
+        url_before['000745'].update(sourceHash='url-old', sourceFields={'portfolioSourceUrl': 'old'})
+        url_after['000745'].update(sourceHash='url-new', sourceFields={'portfolioSourceUrl': 'new'})
+        admission.protect_funds(url_before, url_after, {'000744'})
+        url_after['000745']['shareClassCodes'] = ['000745']
+        url_after['000745']['sourcePortfolioCode'] = '000745'
+        with self.assertRaisesRegex(admission.AdmissionError, 'UNRELATED_SOURCE_CHANGED'):
+            admission.protect_funds(url_before, url_after, {'000744'})
+
     def test_fund_protection_ignores_only_reconciliation_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             quarter = Path(directory) / '2026Q2'; (quarter / 'companies').mkdir(parents=True)

@@ -529,16 +529,34 @@ def _same_requested_portfolio(old, new, requested, code=None):
             and isinstance(old_code, str) and old_code in new_aliases)
 
 
+def _same_requested_portfolio_url(old, new, requested, code=None):
+    """Recognize URL-only normalization inside an evidenced alias group."""
+    requested = set(requested)
+    old_aliases = set(old.get('shareClassCodes') or []) if isinstance(old, dict) else set()
+    new_aliases = set(new.get('shareClassCodes') or []) if isinstance(new, dict) else set()
+    for row, target in ((old, old_aliases), (new, new_aliases)):
+        representative = row.get('sourcePortfolioCode') if isinstance(row, dict) else None
+        if isinstance(representative, str):
+            target.add(representative)
+    common = old_aliases & new_aliases
+    members = old_aliases | new_aliases
+    return bool(common & requested) and isinstance(code, str) and code in members
+
+
 def protect_funds(before, after, requested):
     requested = set(requested)
     for code, old in before.items():
         if code not in after: fail('ADMISSION_EXISTING_FUND_REMOVED')
         new = after[code]
-        if (code not in requested and old['sourceHash'] != new['sourceHash']
-                and not _same_requested_portfolio(old, new, requested, code)):
+        if code not in requested and old['sourceHash'] != new['sourceHash']:
             before_fields, after_fields = old.get('sourceFields', {}), new.get('sourceFields', {})
             changed = sorted(key for key in set(before_fields) | set(after_fields)
                              if before_fields.get(key) != after_fields.get(key))
+            same_portfolio = _same_requested_portfolio(old, new, requested, code)
+            url_only_alias_normalization = (changed == ['portfolioSourceUrl']
+                                            and _same_requested_portfolio_url(old, new, requested, code))
+            if same_portfolio or url_only_alias_normalization:
+                continue
             # Keep the receipt bounded and category-only; the first changed
             # field is sufficient to route the next repair without exposing
             # values or allowing the public error-code grammar to overflow.
