@@ -539,7 +539,10 @@ def protect_funds(before, after, requested):
             before_fields, after_fields = old.get('sourceFields', {}), new.get('sourceFields', {})
             changed = sorted(key for key in set(before_fields) | set(after_fields)
                              if before_fields.get(key) != after_fields.get(key))
-            suffix = '_'.join(re.sub(r'[^A-Z0-9_]', '_', key.upper()) for key in changed[:3]) if changed else 'UNKNOWN_FIELD'
+            # Keep the receipt bounded and category-only; the first changed
+            # field is sufficient to route the next repair without exposing
+            # values or allowing the public error-code grammar to overflow.
+            suffix = re.sub(r'[^A-Z_]', '_', changed[0].upper())[:32] if changed else 'UNKNOWN_FIELD'
             fail('ADMISSION_UNRELATED_SOURCE_CHANGED_' + suffix)
         for key, value in old['prices'].items():
             if new['prices'].get(key) != value: fail('ADMISSION_PRICE_FACT_CHANGED')
