@@ -33,13 +33,27 @@ MAX_FILE = 25_000_000
 LEDGER = 'recovery-admissions.json'
 ROOT = Path(__file__).resolve().parents[1]
 EXECUTION_STAGE = 'START'
+EXECUTION_STAGE_STARTED = time.monotonic()
+FUND_DIAGNOSTICS = None
+STAGES = frozenset(('START', 'RUN_CHECK_RUNTIME', 'RUN_CHECK_BASE', 'RUN_CHECK_MAIN',
+    'RUN_VERIFY_METADATA', 'RUN_DOWNLOAD', 'RUN_EXTRACT', 'RUN_ADMIT', 'ADMIT_LOAD_LEDGER',
+    'ADMIT_CHECK_BASE', 'ADMIT_VERIFY_BUNDLE', 'ADMIT_PROTECT_BEFORE', 'ADMIT_MERGE_PARTS',
+    'ADMIT_RECONCILE', 'ADMIT_PROTECT_BUDGETS', 'ADMIT_PROTECT_FUNDS', 'ADMIT_PERSIST',
+    'ADMIT_ANALYZE', 'ADMIT_PROTECT_AFTER', 'WRITE_PROTECTION', 'COMPLETE'))
 
 
 def stage(name):
-    """Keep only a fixed, non-sensitive phase label for failure receipts."""
-    global EXECUTION_STAGE
-    if re.fullmatch(r'[A-Z0-9_]{1,48}', name):
-        EXECUTION_STAGE = name
+    """Flush fixed phase labels and elapsed time, never command output."""
+    global EXECUTION_STAGE, EXECUTION_STAGE_STARTED
+    if name not in STAGES:
+        return
+    current = time.monotonic()
+    if os.environ.get('GITHUB_ACTIONS') == 'true':
+        print(json.dumps({'event': 'admission-stage', 'stage': name,
+            'previousStage': EXECUTION_STAGE,
+            'previousStageMilliseconds': max(0, min(86_400_000,
+                int((current - EXECUTION_STAGE_STARTED) * 1000)))}), flush=True)
+    EXECUTION_STAGE, EXECUTION_STAGE_STARTED = name, current
 
 
 class AdmissionError(ValueError):
@@ -424,6 +438,8 @@ def fund_protection(quarter):
             result[code] = {'sourceHash': digest(source),
                             'sourceFields': {key: digest(value) for key, value in source.items()},
                             'prices': prices, 'priceUpdatedAt': fund.get('priceUpdatedAt'),
+                            'holdingKeys': sorted({'|'.join(str(row.get(field)) for field in
+                                ('market', 'stockCode', 'currency')) for row in fund.get('rows', [])}),
                             'sourcePortfolioCode': representative,
                             'shareClassCodes': portfolio_codes or [code]}
     return result
@@ -589,70 +605,114 @@ def _same_requested_portfolio_url(old, new, requested, code=None):
     return _portfolio_url_relation(old, new, requested, code) in {'REQUESTED_BOTH', 'REQUESTED_EXPANDED'}
 
 
-def protect_funds(before, after, requested):
+def fund_protection_diagnostics(before, after, requested):
+    """Inspect every record and expose only fixed mismatch categories/counts.
+
+    Alias normalization never exempts market evidence.  A requested portfolio
+    can inherit a previously observed price from its old share classes; no new
+    quote or changed quote is introduced by a source-only recovery.  A price
+    may disappear only with its holding, not from a retained security row.
+    """
     requested = set(requested)
+    categories, rejected, first_error = {}, set(), None
+    def mismatch(code, category, error):
+        nonlocal first_error
+        categories[category] = categories.get(category, 0) + 1
+        rejected.add(code)
+        first_error = first_error or error
+
+    # Index identity members once rather than scanning all funds per removal.
+    replacements = {}
+    for candidate_code, candidate in after.items():
+        _, aliases = _portfolio_identity_fields(candidate)
+        if aliases & requested:
+            for alias in aliases:
+                replacements.setdefault(alias, []).append((candidate_code, candidate))
+
     for code, old in before.items():
+        replacement = False
         if code not in after:
-            # A deduplicated portfolio is persisted under one representative
-            # code.  Either requested or unrequested share classes may
-            # therefore disappear as top-level records while remaining
-            # explicitly represented in the requested representative's alias
-            # set.  Only allow a unique, requested alias-backed replacement;
-            # unrelated removals remain a hard admission failure.
-            matches = []
-            for candidate in after.values():
-                _, aliases = _portfolio_identity_fields(candidate)
-                if code in aliases and aliases & requested:
-                    matches.append(candidate)
-            if len(matches) == 1:
+            matches = replacements.get(code, [])
+            if len(matches) != 1:
+                mismatch(code, 'FUND_REMOVED_OR_AMBIGUOUS', 'ADMISSION_EXISTING_FUND_REMOVED')
                 continue
-            fail('ADMISSION_EXISTING_FUND_REMOVED')
-        new = after[code]
-        if code not in requested and old['sourceHash'] != new['sourceHash']:
+            new_code, new = matches[0]
+            replacement = True
+        else:
+            new_code, new = code, after[code]
+        same_portfolio = _same_requested_portfolio(old, new, requested, code)
+        if not replacement and code not in requested and old['sourceHash'] != new['sourceHash']:
             before_fields, after_fields = old.get('sourceFields', {}), new.get('sourceFields', {})
             changed = sorted(key for key in set(before_fields) | set(after_fields)
                              if before_fields.get(key) != after_fields.get(key))
-            same_portfolio = _same_requested_portfolio(old, new, requested, code)
             url_relation = _portfolio_url_relation(old, new, requested, code)
             url_only_alias_normalization = (changed == ['portfolioSourceUrl']
                                             and url_relation in {'REQUESTED_BOTH', 'REQUESTED_EXPANDED'})
-            if same_portfolio or url_only_alias_normalization:
-                continue
-            # Keep the receipt bounded and category-only; the first changed
-            # field is sufficient to route the next repair without exposing
-            # values or allowing the public error-code grammar to overflow.
-            # The long historical prefix plus a relation label can exceed the
-            # bounded public error-code grammar. Keep URL-related failures in
-            # a compact, category-only namespace so the next recovery attempt
-            # can identify the alias relation without falling back to a generic
-            # execution error. A multi-field change is intentionally never
-            # admitted; it is only classified here for the next repair.
-            if 'portfolioSourceUrl' in changed:
-                relation_code = {
-                    'NO_REQUESTED_ALIAS': 'NO_REQUESTED_ALIAS',
-                    'REQUESTED_REMOVED': 'REQUESTED_REMOVED',
-                    'CODE_NOT_NEW_ALIAS': 'CODE_NOT_NEW_ALIAS',
-                    'IDENTITY_CONFLICT': 'IDENTITY_CONFLICT',
-                    'REQUESTED_BOTH': 'REQUESTED_BOTH',
-                    'REQUESTED_EXPANDED': 'REQUESTED_EXPANDED',
-                }.get(url_relation, 'OTHER')
-                scope = 'MULTI_' if len(changed) > 1 else ''
-                fail('ADMISSION_SOURCE_URL_UNRELATED_' + scope + relation_code)
-            suffix = re.sub(r'[^A-Z_]', '_', changed[0].upper())[:32] if changed else 'UNKNOWN_FIELD'
-            fail('ADMISSION_UNRELATED_SOURCE_CHANGED_' + suffix)
-        if code in requested:
-            # Recovery parts carry no market lane.  A requested source refresh
-            # may legitimately drop a quote row when the new holdings table no
-            # longer contains that security, and may recompute the independent
-            # clock from the rows that remain.  It must never add or mutate a
-            # previously observed price fact.
+            if not (same_portfolio or url_only_alias_normalization):
+                if 'portfolioSourceUrl' in changed:
+                    relation_code = url_relation if url_relation in {
+                        'NO_REQUESTED_ALIAS', 'REQUESTED_REMOVED', 'CODE_NOT_NEW_ALIAS',
+                        'IDENTITY_CONFLICT', 'REQUESTED_BOTH', 'REQUESTED_EXPANDED'} else 'OTHER'
+                    scope = 'MULTI_' if len(changed) > 1 else ''
+                    error = 'ADMISSION_SOURCE_URL_UNRELATED_' + scope + relation_code
+                    mismatch(code, 'SOURCE_URL_' + scope + relation_code, error)
+                else:
+                    mismatch(code, 'UNRELATED_SOURCE_CHANGED', 'ADMISSION_UNRELATED_SOURCE_CHANGED')
+        portfolio_requested = code in requested or same_portfolio or replacement
+        scope = 'REPLACEMENT' if replacement else ('REQUESTED' if code in requested else
+                ('ALIAS' if same_portfolio else 'UNREQUESTED'))
+        if portfolio_requested:
+            # A deduplicated representative can inherit exact observed facts
+            # from its prior share classes. Only the new evidenced alias group
+            # is eligible, never the global security-price cache.
+            _, aliases = _portfolio_identity_fields(new)
+            members = (aliases | {code, new_code}) if aliases & requested else {code}
+            known = {}
+            for member in members:
+                prior = before.get(member)
+                if prior:
+                    for key, value in prior['prices'].items():
+                        known.setdefault(key, set()).add(value)
             for key, value in new['prices'].items():
-                if old['prices'].get(key) != value: fail('ADMISSION_PRICE_FACT_CHANGED')
+                if value not in known.get(key, set()):
+                    kind = 'CHANGED' if key in known else 'ADDED'
+                    mismatch(code, scope + '_PRICE_' + kind, 'ADMISSION_PRICE_FACT_CHANGED')
+            retained_keys = set(new.get('holdingKeys', new['prices']))
+            for key in old['prices']:
+                if key in retained_keys and key not in new['prices']:
+                    mismatch(code, scope + '_PRICE_REMOVED', 'ADMISSION_PRICE_FACT_CHANGED')
         else:
-            for key, value in old['prices'].items():
-                if new['prices'].get(key) != value: fail('ADMISSION_PRICE_FACT_CHANGED')
-            if old['priceUpdatedAt'] is not None and old['priceUpdatedAt'] != new['priceUpdatedAt']:
-                fail('ADMISSION_PRICE_CLOCK_CHANGED')
+            for key in set(old['prices']) | set(new['prices']):
+                if old['prices'].get(key) != new['prices'].get(key):
+                    kind = 'ADDED' if key not in old['prices'] else ('REMOVED' if key not in new['prices'] else 'CHANGED')
+                    mismatch(code, scope + '_PRICE_' + kind, 'ADMISSION_PRICE_FACT_CHANGED')
+            if old['priceUpdatedAt'] != new['priceUpdatedAt']:
+                mismatch(code, 'UNREQUESTED_PRICE_CLOCK_CHANGED', 'ADMISSION_PRICE_CLOCK_CHANGED')
+    for code in set(after) - set(before):
+        new = after[code]
+        _, aliases = _portfolio_identity_fields(new)
+        known = {}
+        if aliases & requested:
+            for member in aliases:
+                for key, value in before.get(member, {}).get('prices', {}).items():
+                    known.setdefault(key, set()).add(value)
+        for key, value in new['prices'].items():
+            if value not in known.get(key, set()):
+                mismatch(code, 'NEW_FUND_PRICE_ADDED', 'ADMISSION_PRICE_FACT_CHANGED')
+    return {'schemaVersion': 1, 'status': 'rejected' if first_error else 'verified',
+            'beforeFundCount': len(before), 'afterFundCount': len(after),
+            'requestedFundCount': len(requested), 'checkedFundCount': len(before),
+            'rejectedFundCount': len(rejected), 'mismatchCount': sum(categories.values()),
+            'categoryCounts': dict(sorted(categories.items())), 'firstErrorCode': first_error}
+
+
+def protect_funds(before, after, requested):
+    global FUND_DIAGNOSTICS
+    FUND_DIAGNOSTICS = fund_protection_diagnostics(before, after, requested)
+    if os.environ.get('GITHUB_ACTIONS') == 'true':
+        print(json.dumps({'event': 'admission-fund-protection', **FUND_DIAGNOSTICS}), flush=True)
+    if FUND_DIAGNOSTICS['firstErrorCode']:
+        fail(FUND_DIAGNOSTICS['firstErrorCode'])
 
 
 def admit(repo, bundle, binding, *, env, now=None, runner=command):
@@ -752,6 +812,8 @@ class SafeParser(argparse.ArgumentParser):
 
 
 def main(argv=None):
+    global FUND_DIAGNOSTICS
+    FUND_DIAGNOSTICS = None
     try:
         parser = SafeParser()
         parser.add_argument('--verify-protected-output', action='store_true')
@@ -769,8 +831,12 @@ def main(argv=None):
             print(json.dumps({'status': 'protected-output-verified'})); return 0
         binding = binding_for(args.base_data_commit, args.recovery_run_id, args.recovery_source_commit, args.artifact_id, args.archive_sha256)
         result = run(ROOT, binding)
+        stage('WRITE_PROTECTION')
         atomic_json(proof_path, protected_files(ROOT / 'web/data', all_files=True))
+        if FUND_DIAGNOSTICS is not None:
+            result['fundProtection'] = FUND_DIAGNOSTICS
         recovery.public_write(ROOT / '.cache/recovery-admission/result.json', result)
+        stage('COMPLETE')
         print(json.dumps(result)); return 0
     except Exception as error:
         if isinstance(error, AdmissionError) and re.fullmatch(r'ADMISSION_[A-Z_]{1,64}', str(error)):
@@ -778,7 +844,10 @@ def main(argv=None):
         else:
             error_type = re.sub(r'[^A-Z0-9_]', '_', type(error).__name__.upper())[:24] or 'UNKNOWN'
             code = f'ADMISSION_EXECUTION_FAILED_{EXECUTION_STAGE}_{error_type}'
-        result = {'status': 'failed', 'errorCode': code, 'continueRun': False, 'sourceRequests': 0, 'marketRequests': 0}
+        result = {'status': 'failed', 'errorCode': code, 'stage': EXECUTION_STAGE,
+                  'continueRun': False, 'sourceRequests': 0, 'marketRequests': 0}
+        if FUND_DIAGNOSTICS is not None:
+            result['fundProtection'] = FUND_DIAGNOSTICS
         try: recovery.public_write(ROOT / '.cache/recovery-admission/result.json', result)
         except Exception: pass
         print(json.dumps(result)); return 1

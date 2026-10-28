@@ -119,6 +119,106 @@ def setup(root):
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_stage_logging_is_flushed_fixed_category_and_elapsed_time_only(self):
+        with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), \
+                patch.object(admission, 'EXECUTION_STAGE', 'START'), \
+                patch.object(admission, 'EXECUTION_STAGE_STARTED', 10.0), \
+                patch.object(admission.time, 'monotonic', return_value=11.5), \
+                patch('builtins.print') as output:
+            admission.stage('ADMIT_MERGE_PARTS')
+            admission.stage('PRIVATE_UPPERCASE_SENTINEL')
+            admission.stage('https://example.org/private-sentinel')
+            output.assert_called_once()
+            self.assertTrue(output.call_args.kwargs['flush'])
+            self.assertEqual(json.loads(output.call_args.args[0]), {
+                'event': 'admission-stage', 'stage': 'ADMIT_MERGE_PARTS',
+                'previousStage': 'START', 'previousStageMilliseconds': 1500})
+
+    def test_fund_diagnostics_cover_all_mismatches_without_record_values(self):
+        before = {
+            '000001': {'sourceHash': 'old', 'prices': {'CN|600001|CNY': 'old-price'}, 'priceUpdatedAt': 'old-clock'},
+            '000002': {'sourceHash': 'old', 'prices': {'CN|600001|CNY': 'old-price'}, 'priceUpdatedAt': None},
+            '000003': {'sourceHash': 'old', 'prices': {}, 'priceUpdatedAt': None}}
+        after = copy.deepcopy(before)
+        after['000001'].update(sourceHash='PRIVATE_SOURCE_SENTINEL', prices={}, priceUpdatedAt='new-clock')
+        after['000002']['prices']['CN|600001|CNY'] = 'PRIVATE_PRICE_SENTINEL'
+        after['000002']['prices']['CN|600002|CNY'] = 'PRIVATE_ADDED_SENTINEL'
+        del after['000003']
+        summary = admission.fund_protection_diagnostics(before, after, {'000002'})
+        self.assertEqual(summary['rejectedFundCount'], 3)
+        self.assertEqual(summary['checkedFundCount'], 3)
+        self.assertEqual(summary['mismatchCount'], 6)
+        self.assertEqual(summary['categoryCounts'], {
+            'UNRELATED_SOURCE_CHANGED': 1, 'UNREQUESTED_PRICE_REMOVED': 1,
+            'UNREQUESTED_PRICE_CLOCK_CHANGED': 1, 'REQUESTED_PRICE_CHANGED': 1,
+            'REQUESTED_PRICE_ADDED': 1, 'FUND_REMOVED_OR_AMBIGUOUS': 1})
+        serialized = json.dumps(summary)
+        for private in ('000001', '600001', 'SENTINEL', 'old-clock', 'new-clock'):
+            self.assertNotIn(private, serialized)
+        with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}), patch('builtins.print') as output:
+            with self.assertRaises(admission.AdmissionError):
+                admission.protect_funds(before, after, {'000002'})
+        self.assertEqual(json.loads(output.call_args.args[0])['mismatchCount'], 6)
+        self.assertTrue(output.call_args.kwargs['flush'])
+
+    def test_alias_normalization_and_replacement_cannot_bypass_quote_protection(self):
+        before = {'000001': {'sourceHash': 'old', 'prices': {'CN|600001|CNY': 'observed'},
+                            'priceUpdatedAt': 'old-clock', 'sourcePortfolioCode': '000002',
+                            'shareClassCodes': ['000001', '000002']}}
+        for replacement in (False, True):
+            key = '000002' if replacement else '000001'
+            fresh = {key: {**copy.deepcopy(before['000001']), 'sourceHash': 'new'}}
+            admission.protect_funds(before, fresh, {'000002'})
+            fresh[key]['prices']['CN|600001|CNY'] = 'invented'
+            with self.subTest(replacement=replacement), self.assertRaisesRegex(
+                    admission.AdmissionError, 'PRICE_FACT_CHANGED'):
+                admission.protect_funds(before, fresh, {'000002'})
+            fresh[key]['prices'] = {}
+            fresh[key]['holdingKeys'] = ['CN|600001|CNY']
+            with self.assertRaisesRegex(admission.AdmissionError, 'PRICE_FACT_CHANGED'):
+                admission.protect_funds(before, fresh, {'000002'})
+            fresh[key]['holdingKeys'] = []
+            admission.protect_funds(before, fresh, {'000002'})
+
+    def test_alias_price_inheritance_is_limited_to_old_evidenced_portfolio(self):
+        old = {'000001': {'sourceHash': 'old', 'prices': {'CN|600001|CNY': 'observed'},
+                         'priceUpdatedAt': 'old-clock'},
+               '000003': {'sourceHash': 'unrelated', 'prices': {'CN|600002|CNY': 'unrelated-price'},
+                          'priceUpdatedAt': 'unrelated-clock'}}
+        fresh = {'000002': {'sourceHash': 'new', 'prices': {'CN|600001|CNY': 'observed'},
+                           'priceUpdatedAt': 'old-clock', 'sourcePortfolioCode': '000002',
+                           'shareClassCodes': ['000001', '000002']},
+                 '000003': copy.deepcopy(old['000003'])}
+        admission.protect_funds(old, fresh, {'000002'})
+        fresh['000002']['prices']['CN|600002|CNY'] = 'unrelated-price'
+        with self.assertRaisesRegex(admission.AdmissionError, 'PRICE_FACT_CHANGED'):
+            admission.protect_funds(old, fresh, {'000002'})
+        # A wholly new requested fund cannot inject prices merely because it
+        # was absent from the pre-merge protection loop.
+        with self.assertRaisesRegex(admission.AdmissionError, 'PRICE_FACT_CHANGED'):
+            admission.protect_funds({}, {'000002': fresh['000002']}, {'000002'})
+
+    def test_failed_main_retains_complete_bounded_diagnostics_in_artifact(self):
+        def reject(*_args, **_kwargs):
+            admission.stage('ADMIT_PROTECT_FUNDS')
+            admission.protect_funds(
+                {'000001': {'sourceHash': 'old', 'prices': {}, 'priceUpdatedAt': None}},
+                {'000001': {'sourceHash': 'old', 'prices': {'private-key': 'private-price'},
+                            'priceUpdatedAt': 'private-clock'}}, set())
+        with tempfile.TemporaryDirectory() as directory, patch.object(admission, 'ROOT', Path(directory)), \
+                patch.object(admission, 'run', side_effect=reject), patch('builtins.print'):
+            code = admission.main(['--base-data-commit', 'a' * 40, '--recovery-run-id', '1',
+                                  '--recovery-source-commit', 'b' * 40, '--artifact-id', '2',
+                                  '--archive-sha256', 'c' * 64])
+            self.assertEqual(code, 1)
+            raw = (Path(directory) / '.cache/recovery-admission/result.json').read_text()
+            result = json.loads(raw)
+            self.assertEqual(result['stage'], 'ADMIT_PROTECT_FUNDS')
+            self.assertEqual(result['fundProtection']['categoryCounts'], {
+                'UNREQUESTED_PRICE_ADDED': 1, 'UNREQUESTED_PRICE_CLOCK_CHANGED': 1})
+            self.assertEqual(result['errorCode'], 'ADMISSION_PRICE_FACT_CHANGED')
+            self.assertNotIn('private-', raw)
+
     def test_binding_is_stable_and_strict(self):
         value = admission.binding_for('a'*40, 1, 'b'*40, 2, 'c'*64)
         self.assertEqual(admission.digest(value), admission.digest(copy.deepcopy(value)))
