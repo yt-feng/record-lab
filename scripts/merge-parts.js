@@ -574,7 +574,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
   // example price rows or a missing clock) even when no source request covers
   // that product.  The admission guard must compare against the bytes that
   // were actually published, not a reconstructed approximation.
-  const previousByCode = persistedByCode.size
+  const previousByCode = previousManifest && persistedByCode.size
     ? persistedByCode
     : new Map([...byCode.entries()].map(([code, fund]) => [code, clone(fund)]));
   let acceptedFreshFundCount = 0;
