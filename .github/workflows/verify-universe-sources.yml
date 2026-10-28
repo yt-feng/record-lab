@@ -1,0 +1,43 @@
+name: Diagnose official universe source scope
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: verify-official-universe-sources
+  cancel-in-progress: false
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/verify_universe_sources.py
+            /scripts/verify_universe.py
+            /scripts/historical_universe.py
+            /scripts/source_dates.py
+            /scripts/publication_guard.py
+            /scripts/publication_cache.py
+            /tests/test_verify_universe_sources.py
+            /tests/test_historical_universe.py
+            /.github/workflows/verify-universe-sources.yml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test source diagnostics with synthetic archives
+        run: python -m unittest discover -s tests -p 'test_verify_universe_sources.py'
+      - name: Inspect pinned source metadata and unresolved aggregate discrepancy
+        run: python scripts/verify_universe_sources.py
+      - name: Retain guarded diagnostic without publishing corpus data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: official-universe-source-diagnostic
+          path: .cache/universe-source-verification/result.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
