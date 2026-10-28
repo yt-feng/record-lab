@@ -293,6 +293,14 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(admission.AdmissionError, 'UNRELATED_SOURCE_CHANGED'):
             admission.protect_funds(url_before, url_after, {'000744'})
 
+        expanded_before = {'000745': {'sourceHash': 'url-old', 'prices': {}, 'priceUpdatedAt': None,
+                                      'sourcePortfolioCode': None, 'shareClassCodes': ['000745'],
+                                      'sourceFields': {'portfolioSourceUrl': 'old'}}}
+        expanded_after = {'000745': {'sourceHash': 'url-new', 'prices': {}, 'priceUpdatedAt': None,
+                                     'sourcePortfolioCode': '000744', 'shareClassCodes': ['000744', '000745'],
+                                     'sourceFields': {'portfolioSourceUrl': 'new'}}}
+        admission.protect_funds(expanded_before, expanded_after, {'000744'})
+
     def test_fund_protection_ignores_only_reconciliation_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             quarter = Path(directory) / '2026Q2'; (quarter / 'companies').mkdir(parents=True)

@@ -538,9 +538,15 @@ def _same_requested_portfolio_url(old, new, requested, code=None):
         representative = row.get('sourcePortfolioCode') if isinstance(row, dict) else None
         if isinstance(representative, str):
             target.add(representative)
-    common = old_aliases & new_aliases
     members = old_aliases | new_aliases
-    return bool(common & requested) and isinstance(code, str) and code in members
+    if not (requested & new_aliases) or not isinstance(code, str) or code not in new_aliases:
+        return False
+    old_rep = old.get('sourcePortfolioCode') if isinstance(old, dict) else None
+    new_rep = new.get('sourcePortfolioCode') if isinstance(new, dict) else None
+    if (isinstance(old_rep, str) and isinstance(new_rep, str) and old_rep != new_rep
+            and old_rep not in new_aliases and new_rep not in old_aliases):
+        return False
+    return bool(members)
 
 
 def protect_funds(before, after, requested):
