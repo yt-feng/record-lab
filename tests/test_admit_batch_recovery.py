@@ -290,8 +290,23 @@ class AdmissionTests(unittest.TestCase):
         admission.protect_funds(url_before, url_after, {'000744'})
         url_after['000745']['shareClassCodes'] = ['000745']
         url_after['000745']['sourcePortfolioCode'] = '000745'
-        with self.assertRaisesRegex(admission.AdmissionError, 'UNRELATED_SOURCE_CHANGED'):
+        with self.assertRaisesRegex(admission.AdmissionError,
+                                    'ADMISSION_SOURCE_URL_UNRELATED_REQUESTED_REMOVED'):
             admission.protect_funds(url_before, url_after, {'000744'})
+
+        multi_before = copy.deepcopy(url_before)
+        multi_after = copy.deepcopy(url_after)
+        multi_before['000745']['sourceFields'] = {
+            'portfolioSourceUrl': 'old', 'sourcePortfolioCode': '000744',
+            'shareClassCodes': ['000744', '000745']}
+        multi_after['000745']['sourceFields'] = {
+            'portfolioSourceUrl': 'new', 'sourcePortfolioCode': '000745',
+            'shareClassCodes': ['000745']}
+        multi_after['000745']['sourcePortfolioCode'] = '000745'
+        multi_after['000745']['shareClassCodes'] = ['000745']
+        with self.assertRaisesRegex(admission.AdmissionError,
+                                    'ADMISSION_SOURCE_URL_UNRELATED_MULTI_REQUESTED_REMOVED'):
+            admission.protect_funds(multi_before, multi_after, {'000744'})
 
         expanded_before = {'000745': {'sourceHash': 'url-old', 'prices': {}, 'priceUpdatedAt': None,
                                       'sourcePortfolioCode': None, 'shareClassCodes': ['000745'],

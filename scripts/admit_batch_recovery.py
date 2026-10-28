@@ -578,9 +578,25 @@ def protect_funds(before, after, requested):
             # Keep the receipt bounded and category-only; the first changed
             # field is sufficient to route the next repair without exposing
             # values or allowing the public error-code grammar to overflow.
+            # The long historical prefix plus a relation label can exceed the
+            # bounded public error-code grammar. Keep URL-related failures in
+            # a compact, category-only namespace so the next recovery attempt
+            # can identify the alias relation without falling back to a generic
+            # execution error. A multi-field change is intentionally never
+            # admitted; it is only classified here for the next repair.
+            if 'portfolioSourceUrl' in changed:
+                relation_code = {
+                    'NO_REQUESTED_ALIAS': 'NO_REQUESTED_ALIAS',
+                    'REQUESTED_REMOVED': 'REQUESTED_REMOVED',
+                    'CODE_NOT_NEW_ALIAS': 'CODE_NOT_NEW_ALIAS',
+                    'IDENTITY_CONFLICT': 'IDENTITY_CONFLICT',
+                    'REQUESTED_BOTH': 'REQUESTED_BOTH',
+                    'REQUESTED_EXPANDED': 'REQUESTED_EXPANDED',
+                }.get(url_relation, 'OTHER')
+                scope = 'MULTI_' if len(changed) > 1 else ''
+                fail('ADMISSION_SOURCE_URL_UNRELATED_' + scope + relation_code)
             suffix = re.sub(r'[^A-Z_]', '_', changed[0].upper())[:32] if changed else 'UNKNOWN_FIELD'
-            relation = '_' + url_relation if changed == ['portfolioSourceUrl'] else ''
-            fail('ADMISSION_UNRELATED_SOURCE_CHANGED_' + suffix + relation)
+            fail('ADMISSION_UNRELATED_SOURCE_CHANGED_' + suffix)
         for key, value in old['prices'].items():
             if new['prices'].get(key) != value: fail('ADMISSION_PRICE_FACT_CHANGED')
         if old['priceUpdatedAt'] is not None and old['priceUpdatedAt'] != new['priceUpdatedAt']:
