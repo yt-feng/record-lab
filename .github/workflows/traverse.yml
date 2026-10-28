@@ -11,10 +11,16 @@ on:
         description: Continue remaining batches automatically
         type: boolean
         default: true
+      source_repair:
+        description: Repair report sources without market requests
+        type: boolean
+        default: false
   schedule:
     - cron: '17 */12 * * *'
 concurrency:
-  group: published-records
+  # Only one traversal plans at a time. Source collection may run while an
+  # independent recovery publishes; the publish job shares the writer lock.
+  group: traversal-records
   cancel-in-progress: false
 permissions:
   contents: read
@@ -47,8 +53,11 @@ jobs:
         env:
           QUARTER: ${{ inputs.quarter || 'both' }}
           CAMPAIGN_MARKET_ACCOUNTING: required
+          SOURCE_REPAIR: ${{ inputs.source_repair || false }}
         run: |
-          python scripts/campaign.py plan --quarter "$QUARTER" --shards 16 --batch-size 75
+          ARGS=()
+          if [ "$SOURCE_REPAIR" = 'true' ]; then ARGS+=(--source-repair); fi
+          python scripts/campaign.py plan --quarter "$QUARTER" --shards 16 --batch-size 75 "${ARGS[@]}"
           node scripts/workflow-outputs.js .cache/plan >> "$GITHUB_OUTPUT"
       - run: python scripts/publication_guard.py --root . --plan-dir .cache/plan
       - uses: actions/upload-artifact@v4
@@ -185,14 +194,21 @@ jobs:
   publish:
     needs: [plan, batch]
     if: always() && needs.plan.result == 'success'
+    concurrency:
+      group: published-records
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     # Merge both quarters and allow a full history scan if no verified proof
     # exists yet; subsequent unchanged scanner runs can reuse the proof.
     timeout-minutes: 60
     permissions:
       contents: write
-      pages: read
+      pages: write
       actions: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -254,6 +270,9 @@ jobs:
       - uses: actions/upload-pages-artifact@v4
         with:
           path: .cache/site
+      - name: Deploy verified public observations
+        uses: actions/deploy-pages@v4
+        id: deployment
       - name: Continue unfinished traversal
         env:
           GH_TOKEN: ${{ github.token }}
@@ -262,19 +281,6 @@ jobs:
         run: |
           if [ "$CONTINUE_CHAIN" = 'true' ] && [ "$(node -p 'JSON.parse(require("fs").readFileSync(".cache/campaign/result.json")).continueRun')" = 'true' ]; then
             QUARTER=$(node -p 'JSON.parse(require("fs").readFileSync(".cache/campaign/result.json")).selection')
-            gh workflow run traverse.yml --ref main -f continue_chain=true -f quarter="$QUARTER"
+            SOURCE_REPAIR=$(node -p 'JSON.parse(require("fs").readFileSync(".cache/campaign/result.json")).sourceRepair === true')
+            gh workflow run traverse.yml --ref main -f continue_chain=true -f quarter="$QUARTER" -f source_repair="$SOURCE_REPAIR"
           fi
-  deploy:
-    needs: publish
-    if: needs.publish.result == 'success'
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4

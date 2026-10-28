@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 
-from traversal import atomic_json, read_json, STATUS_SNAPSHOT_ERRORS
+from traversal import atomic_json, read_json, STATUS_SNAPSHOT_ERRORS, source_repair_mode, SOURCE_REPAIR_LANE
 from publication_guard import inspect_content, content_limit
 from quarter_catalog import (compose_quarter_catalog, freeze_catalog, validate_catalog_lock,
                              normalize_overlay, recover_historical_overlay, combine_historical_overlays,
@@ -202,7 +202,8 @@ def deployed_continuation_state(root, quarter):
     return {'batchInputErrors': errors, 'continuationHold': hold}
 
 
-def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True, historical_overlays=None):
+def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True, historical_overlays=None, source_repair=False):
+    if type(source_repair) is not bool: raise ValueError('INVALID_SOURCE_REPAIR_LANE')
     selected = selected_periods(quarter)
     # Planning, Actions output and missing-part reconciliation share one bound.
     # Reject unsupported configurations before fetching or changing any files.
@@ -217,7 +218,7 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
     requested = selected
     holds = {name: state['continuationHold'] for name in requested
              if (state := deployed_continuation_state(root, name))['continuationHold']}
-    selected = [name for name in requested if name not in holds]
+    selected = [name for name in requested if source_repair or name not in holds]
     if not selected:
         directory_status = {'status': 'held'}
         atomic_json('.cache/plan/matrix.json', [])
@@ -233,6 +234,9 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
     catalog = read_json(root / 'catalog.json')
     base = read_json('config/universe.json')
     configs = {name: quarter_config(base, name, as_of) for name in selected}
+    if source_repair:
+        for config in configs.values():
+            config.update(collectionLane=SOURCE_REPAIR_LANE, maxPriceSymbols=0, maxPriceSeconds=0)
     locator_registries = refresh_registries(root, selected, as_of, allow_fetch=refresh)
     scoped_catalogs, identity_parts = {}, {}
     for name in selected:
@@ -277,6 +281,7 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
                 'heldQuarters': list(holds), 'continuationHolds': holds})
     atomic_json('.cache/campaign/selection.json', {'quarters': selected, 'asOf': as_of, 'selection': quarter,
                 'marketAccountingVersion': 1,
+                **({'sourceRepair': True} if source_repair else {}),
                 'directoryRefresh': directory_status, 'catalogLockVersion': 1, 'catalogs': catalogs,
                 'requestedQuarters': requested, 'heldQuarters': list(holds), 'continuationHolds': holds,
                 'strategyClaimsQuotas': {name: configs[name]['strategyClaimsQuota'] for name in selected},
@@ -448,6 +453,18 @@ def batch_input_state(reconciliation, matrix):
             'inputErrorCount': reconciliation.get('inputErrorCount', 0)}
 
 
+def source_repair_for_publish(selection, matrix):
+    enabled = selection.get('sourceRepair', False)
+    if type(enabled) is not bool: raise ValueError('INVALID_SOURCE_REPAIR_LANE')
+    for quarter in selection['quarters']:
+        if source_repair_mode(read_json(f'.cache/campaign/{quarter}.json')) != enabled:
+            raise ValueError('INVALID_SOURCE_REPAIR_LANE')
+    for item in matrix:
+        if source_repair_mode(read_json(Path('.cache/plan') / item['config'])) != enabled:
+            raise ValueError('INVALID_SOURCE_REPAIR_LANE')
+    return enabled
+
+
 def publish(data='web/data', parts='.cache/parts'):
     root, part_root = Path(data), Path(parts)
     selection = read_json('.cache/campaign/selection.json')
@@ -462,6 +479,7 @@ def publish(data='web/data', parts='.cache/parts'):
         atomic_json('.cache/campaign/result.json', result)
         return result
     prior_input_states = {name: deployed_continuation_state(root, name) for name in selection['quarters']}
+    source_repair = source_repair_for_publish(selection, matrix)
     frozen_claims_quotas_for_publish(selection, matrix)
     locator_paths = frozen_locators_for_publish(selection, matrix)
     catalogs = frozen_catalogs_for_publish(selection, matrix, root)
@@ -479,12 +497,12 @@ def publish(data='web/data', parts='.cache/parts'):
             **batch_input_state(error.summary, matrix)})
         raise
     input_state = batch_input_state(reconciliation, matrix)
-    accounting_required = (selection.get('marketAccountingVersion') == 1
+    accounting_required = (source_repair or selection.get('marketAccountingVersion') == 1
                            or os.environ.get('CAMPAIGN_MARKET_ACCOUNTING') == 'required')
     accounting = collect_batch_accounting(matrix) if accounting_required else None
     for name, prior in prior_input_states.items():
         new_errors = [item for item in input_state['batchInputErrors'] if item['quarter'] == name]
-        if prior['continuationHold'] and new_errors and new_errors != prior['batchInputErrors']:
+        if not source_repair and prior['continuationHold'] and new_errors and new_errors != prior['batchInputErrors']:
             raise ValueError('CONTINUATION_HOLD_REQUIRES_RECOVERY')
     summaries = []
     for quarter in selection['quarters']:
@@ -501,7 +519,8 @@ def publish(data='web/data', parts='.cache/parts'):
                 if src.is_dir(): shutil.copytree(src, scoped_parts / src.name, dirs_exist_ok=True)
         config = f'.cache/campaign/{quarter}.json'
         subprocess.run(['node', 'scripts/merge-parts.js', '--parts', str(scoped_parts), '--data', str(output),
-                        '--catalog', str(catalogs[quarter]), '--config', config], check=True)
+                        '--catalog', str(catalogs[quarter]), '--config', config,
+                        *(['--reuseMarketPrices', 'false'] if source_repair else [])], check=True)
         subprocess.run([sys.executable, 'scripts/traversal.py', 'merge', '--parts', str(scoped_parts),
                         '--catalog', str(catalogs[quarter]), '--progress', str(output / 'progress.json'),
                         '--config', config, '--data-root', str(output)], check=True)
@@ -517,6 +536,16 @@ def publish(data='web/data', parts='.cache/parts'):
             quarter_hold = prior['continuationHold']
         market_accounting = persist_accounting(output, quarter, accounting.get(quarter, [])) if accounting is not None else None
         accounting_allows_continuation = market_accounting is None or market_accounting['continuationAllowed']
+        source_lane = None
+        if source_repair:
+            entries = accounting.get(quarter, [])
+            verified_zero = (len(entries) == sum(item['quarter'] == quarter for item in matrix)
+                             and all(row['status'] == 'complete' and row['counts'] is not None
+                                     and all(value == 0 for value in row['counts'].values()) for row, _ in entries))
+            current_errors = [item for item in input_state['batchInputErrors'] if item['quarter'] == quarter]
+            source_lane = {'lane': SOURCE_REPAIR_LANE, 'currentMarketAccountingVerifiedZero': verified_zero,
+                           'batchInputErrors': current_errors,
+                           'continueRun': progress.get('sourceRepairContinueRun') is True and verified_zero and not current_errors}
         atomic_json(output / 'audit.json', {
             'schemaVersion': 1, 'quarter': quarter, 'phase': progress.get('phase'),
             'updatedAt': progress.get('updatedAt'), 'completionStatus': progress.get('completionStatus'),
@@ -529,11 +558,13 @@ def publish(data='web/data', parts='.cache/parts'):
             'strategyClaims': progress.get('strategyClaims'),
             'batchInputErrors': quarter_input_errors, 'continuationHold': quarter_hold,
             **({'marketAccounting': market_accounting} if market_accounting is not None else {}),
+            **({'sourceRepair': source_lane} if source_lane is not None else {}),
         })
         summary = {'quarter': quarter, **{k: progress.get(k) for k in (
             'totalFunds', 'processedFunds', 'failedFunds', 'pendingFunds', 'research', 'strategyClaims', 'completionStatus', 'continueRun')},
             'batchInputErrors': quarter_input_errors, 'continuationHold': quarter_hold,
             **({'marketAccounting': market_accounting} if market_accounting is not None else {})}
+        if source_lane is not None: summary['sourceRepair'] = source_lane
         if quarter_hold or not accounting_allows_continuation: summary['continueRun'] = False
         # The analyzer reads its own compact progress view. Do not retain the
         # whole per-product checkpoint in this parent process during analysis
@@ -563,6 +594,11 @@ def publish(data='web/data', parts='.cache/parts'):
     # any automatic next run while an accounting batch remains unresolved.
     if any(not s.get('marketAccounting', {}).get('continuationAllowed', True) for s in summaries):
         result['continueRun'] = False
+    if source_repair:
+        result['sourceRepair'] = True
+        result['continueRun'] = (all(s['sourceRepair']['currentMarketAccountingVerifiedZero']
+                                    and not s['sourceRepair']['batchInputErrors'] for s in summaries)
+                                 and any(s['sourceRepair']['continueRun'] for s in summaries))
     atomic_json('.cache/campaign/result.json', result)
     summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
     if summary_file:
@@ -588,11 +624,13 @@ def main():
     parser.add_argument('--as-of', default=china_today())
     parser.add_argument('--shards', type=int, default=16)
     parser.add_argument('--batch-size', type=int, default=75)
+    parser.add_argument('--source-repair', action='store_true')
     parser.add_argument('--historical-overlays', help='JSON object mapping quarter IDs to normalized historical overlays')
     args = parser.parse_args()
     if os.environ.get('GITHUB_ACTIONS') != 'true': raise ValueError('BATCH_REQUIRES_ACTIONS')
     overlays = read_json(args.historical_overlays) if args.historical_overlays else None
-    result = plan(args.quarter, args.as_of, shards=args.shards, batch_size=args.batch_size, historical_overlays=overlays) if args.command == 'plan' else publish()
+    result = plan(args.quarter, args.as_of, shards=args.shards, batch_size=args.batch_size, historical_overlays=overlays,
+                  source_repair=args.source_repair) if args.command == 'plan' else publish()
     print(json.dumps(result, ensure_ascii=False))
 
 

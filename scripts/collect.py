@@ -407,6 +407,8 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
 
 
 def collect(config, as_of, checkpoint=None, request_journal=None):
+    from traversal import source_repair_mode
+    source_only = source_repair_mode(config)
     items = config["funds"]
     strategy_items = [item for item in items if 'strategyClaimsOnly' in item]
     if strategy_items:
@@ -491,6 +493,11 @@ def collect(config, as_of, checkpoint=None, request_journal=None):
                 snapshot("funds")
     order = {item["code"]: index for index, item in enumerate(items)}
     funds.sort(key=lambda fund: order[fund["code"]])
+    if source_only:
+        # This is an independent source pass: no quote candidates, providers,
+        # observers or Session.get market reservations are created at all.
+        if request_journal is not None: request_journal.assert_healthy()
+        return snapshot("finished")
     item_by_code = {item["code"]: item for item in items}
     fund_price_keys = []
     for patch in price_patches:

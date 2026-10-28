@@ -58,7 +58,7 @@ RECOVERABLE_ERRORS = {"NO_VALID_REPORTS", "TARGET_REPORT_MISSING", "NO_REPORTS",
 STATUS_SNAPSHOT_ERRORS = {"SNAPSHOT_TOO_LARGE", "SNAPSHOT_INVALID_JSON", "SNAPSHOT_INVALID_SCHEMA",
                           "SNAPSHOT_PHASE_MISMATCH", "SNAPSHOT_READ_FAILED"}
 COMMAND_ERRORS = {"INVALID_CONFIG", "INVALID_CATALOG", "INVALID_PROGRESS", "INVALID_ARGUMENTS",
-                  "READ_FAILED", "WRITE_FAILED", "TRAVERSAL_FAILED"} | STATUS_SNAPSHOT_ERRORS
+                  "READ_FAILED", "WRITE_FAILED", "TRAVERSAL_FAILED", "INVALID_SOURCE_REPAIR_LANE"} | STATUS_SNAPSHOT_ERRORS
 
 
 class TraversalError(Exception):
@@ -1309,7 +1309,23 @@ def fair_research_selection(states, source_codes, quality_codes, enrich_codes, c
     return selected
 
 
-def eligible_work(states, config):
+SOURCE_REPAIR_LANE = 'source-repair-no-market-v1'
+
+
+def source_repair_mode(config):
+    """An explicit source lane cannot contain any market-request work."""
+    if 'collectionLane' not in config:
+        return False
+    if (config['collectionLane'] != SOURCE_REPAIR_LANE
+            or any(type(config.get(key)) is not int or config[key] != 0
+                   for key in ('maxPriceSymbols', 'maxPriceSeconds'))
+            or config.get('traversal', {}).get('enrichmentCodes', [])
+            or any(any(key in item for key in ('priceOnly', 'priceTargets')) for item in config.get('funds', []))):
+        raise TraversalError('INVALID_SOURCE_REPAIR_LANE')
+    return True
+
+
+def eligible_work(states, config, lane_scoped=False):
     """Use the same nonoverlapping task lanes for planning and coverage audits."""
     enrich_codes = set(enrichment_eligible(states))
     quality_codes = set(quality_eligible(states)) if quality_enabled(config) else set()
@@ -1325,6 +1341,11 @@ def eligible_work(states, config):
                       if states[code]["quality"]["missingFields"] == ["prices"]
                       and states[code]["enrichment"]["missingStocks"]}
     source_codes = sorted(set(eligible(states)) | set(locator_eligible(states)))
+    if lane_scoped and source_repair_mode(config):
+        # A missing price alone must not repeatedly consume a report attempt.
+        quality_codes = {code for code in quality_codes
+                         if set(states[code]['quality']['missingFields']) - {'prices'}}
+        enrich_codes = set()
     return source_codes, quality_codes, enrich_codes
 
 
@@ -1438,7 +1459,7 @@ def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, r
     hydrate_quality(states, captured_funds(), phase, current)
     apply_retry_policy(states, config, current)
     selected = []
-    source_codes, quality_codes, enrich_codes = eligible_work(states, config)
+    source_codes, quality_codes, enrich_codes = eligible_work(states, config, lane_scoped=True)
     locator_codes = set(locator_eligible(states))
     # Existing quote repair state is insufficient without the exact retained
     # source/universe. Recover that source through the report lane instead.
@@ -2196,6 +2217,10 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
     not_applicable = sum(state["status"] == "not-applicable" for state in all_states)
     continuing = bool(eligible(states) or locator_eligible(states) or enrichment_eligible(states) or claims_eligible(states, config)
                       or quality_enabled(config) and quality_eligible(states))
+    source_continuing = None
+    if source_repair_mode(config):
+        source, quality, _ = eligible_work(states, config, lane_scoped=True)
+        source_continuing = bool(source or quality or claims_eligible(states, config, set(source) | quality))
     enrichment_states = [state["enrichment"] for state in all_states if state["status"] in SUCCESS and state["attribution"] != "portfolio-evidence" and state["representativeCode"] == state["code"]]
     research_complete = sum(state["status"] in SUCCESS and state["quality"]["status"] == "complete" for state in all_states)
     six_fields_complete = sum(state["status"] in SUCCESS and all(state["quality"]["fields"][key] in QUALITY_ACCEPTED for key in SIX_QUALITY_FIELDS) for state in all_states)
@@ -2226,6 +2251,7 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
             "unmappedFunds": sum(state["companyCode"] is None for state in all_states),
             "completionStatus": "complete" if completed else "incomplete-running" if continuing else "incomplete-exhausted",
             "completionAudit": audit, "quarterUniverse": universe,
+            **({'sourceRepairContinueRun': source_continuing} if source_continuing is not None else {}),
             "research": {"enabled": quality_enabled(config), "applicableFunds": applicable, "completeFunds": research_complete,
                          "sixFieldsCompleteFunds": six_fields_complete,
                          "incompleteFunds": applicable - research_complete, "pendingFunds": research_pending,
