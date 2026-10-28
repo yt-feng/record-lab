@@ -9,6 +9,7 @@ const { mergeFiles, mergeSnapshots } = require('../scripts/merge-parts');
 const { bindingFor } = require('../lib/price-patches');
 const { expectedSessions } = require('../lib/price-coverage');
 const { diagnose } = require('../lib/merge-diagnostics');
+const { mergeOnDisk } = require('../scripts/merge-storage');
 const now = '2026-10-26T12:00:00Z';
 const phase = { targetPeriodEnd: '2026-06-30', baselinePeriodEnd: '2026-03-31' };
 const catalog = { fundCount: 4, companyCount: 2,
@@ -122,6 +123,55 @@ test('source-only recovery can disable cross-component price reuse', t => {
   assert.equal(result.counts.reusedPriceFundCount, 0);
   assert.equal(after.priceUpdatedAt, before.priceUpdatedAt);
   assert.equal(after.rows[0].priceRange.status, before.rows[0].priceRange.status);
+});
+
+test('source-only disk merge preserves unrelated persisted price facts that normalize differently', t => {
+  const state = setup(t);
+  input(state, [snapshot('000001', { kind: 'complete' })]);
+  const first = run(state, { reuseAcrossComponents: false });
+  const file = path.join(state.data, 'companies', path.basename(first.manifest.companyFiles[0].path));
+  const envelope = json(file), prior = envelope.funds[0];
+  // Older published records can lack these optional fields. Re-sanitization
+  // fills them, but a source-only request for another portfolio must preserve
+  // the actual persisted quote and its clock, not a reconstruction.
+  delete prior.priceUpdatedAt;
+  delete envelope.priceUpdatedAt;
+  delete prior.rows[0].priceRange.sourceUrls;
+  fs.writeFileSync(file, JSON.stringify(envelope));
+  const before = clone(prior);
+  input(state, [snapshot('000003', { at: '2026-10-26T11:00:00Z' })]);
+  // Reproduce the old component path: its bootstrap manifest is null, so the
+  // provenance flag was effectively false even with a persisted outer tree.
+  const oldPath = t.mock.method(require('../scripts/merge-storage'), 'mergeOnDisk', options => mergeOnDisk({ ...options,
+    engine: component => options.engine({ ...component, preservePersisted: false }) }));
+  const control = run(state, { reuseAcrossComponents: false });
+  const reconstructed = funds(saved(state, control.manifest)).find(fund => fund.code === before.code);
+  assert.notDeepEqual(reconstructed.rows[0].priceRange, before.rows[0].priceRange);
+  oldPath.mock.restore();
+  fs.writeFileSync(file, JSON.stringify(envelope));
+  fs.writeFileSync(path.join(state.data, 'latest.json'), JSON.stringify(first.manifest));
+  const result = run(state, { reuseAcrossComponents: false });
+  assert.equal(result.changed, true);
+  const actual = funds(saved(state, result.manifest)).find(fund => fund.code === before.code);
+  assert.deepEqual(actual, before);
+  assert.equal(result.counts.reusedPriceFundCount, 0);
+  assert.equal(result.counts.acceptedFreshFundCount, 1);
+});
+
+test('source-only disk merge never constructs an unused cross-component price index', t => {
+  const state = setup(t);
+  input(state, [snapshot('000001', { kind: 'complete' })]);
+  let calls = 0;
+  t.mock.method(require('../scripts/merge-storage'), 'mergeOnDisk', options => mergeOnDisk({ ...options,
+    engine: component => {
+      calls++;
+      assert.equal(component.onSourceFunds, null);
+      return options.engine(component);
+    } }));
+  const result = run(state, { reuseAcrossComponents: false });
+  assert.equal(calls, 1);
+  assert.equal(result.manifest.coverage.priceAvailable, 1);
+  assert.equal(result.counts.eligiblePriceKeyCount, 0);
 });
 
 test('conflict-only metadata is published atomically without any new report, quote request, or timestamps', t => {

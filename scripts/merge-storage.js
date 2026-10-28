@@ -176,8 +176,12 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
       const componentCatalog = { funds: componentFunds, companies: componentCompanies,
         fundCount: directory.fundCount, companyCount: directory.companyCount };
       const result = engine({ snapshots, previousCompanies, previousManifest: bootstrap, catalog: componentCatalog, config, now: current,
+        // Component-local bootstrap is null for ordinary persisted pages.
+        // Keep the outer manifest's provenance without passing that global
+        // manifest into a component's no-change/output decision.
+        preservePersisted: Boolean(previousManifest),
         receiptCodes: group.codes.filter(code => requested.has(code)), pageLimits, reusePrices: false,
-        onSourceFunds: values => addPriceSources(priceIndex, values) });
+        onSourceFunds: reuseAcrossComponents ? values => addPriceSources(priceIndex, values) : null });
       for (const key of ['acceptedFreshFundCount', 'acceptedPricePatchCount', 'acceptedInceptionPatchCount', 'acceptedStrategyClaimsPatchCount', 'migratedBootstrapFundCount']) counts[key] += result.counts[key] || 0;
       errorCount += result.counts.errorCount || 0;
       result.errors.forEach(code => errors.add(code));

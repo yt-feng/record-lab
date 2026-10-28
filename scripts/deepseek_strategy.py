@@ -23,13 +23,8 @@ from strategy_semantics import (PrivateSemanticPacket, semantic_response_schema,
 ENDPOINT = 'https://api.deepseek.com/chat/completions'
 MODEL = 'deepseek-flash'
 PROMPT_VERSION = 'source-bound-deepseek-v5'
-# The verifier requires a complete, literal-bound JSON response.  The prior
-# enabled-thinking request exhausted the output budget and returned a truncated
-# 269-byte JSON body. Reserve the budget for the structured answer; literal
-# claims are still independently checked by the local validator.
-# https://api-docs.deepseek.com/api/create-chat-completion/
-THINKING_MODE = 'disabled'
-REASONING_EFFORT = 'none'
+THINKING_MODE = 'enabled'
+REASONING_EFFORT = 'low'
 BINDING_METHOD = 'unique-exact-sentence-span-v1'
 MODEL_SPAN_FORMAT = 'text-only-v1'
 CONSTRAINT_METHOD = 'core-validator-derived-constraints-v1'

@@ -488,7 +488,8 @@ function preserveUnrequestedPortfolioIdentity(funds, previousByCode, requestedCo
 }
 
 function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManifest = null, catalog,
-  config = {}, now = new Date(), receiptCodes = [], pageLimits, reusePrices = true, onSourceFunds = null } = {}) {
+  config = {}, now = new Date(), receiptCodes = [], pageLimits, reusePrices = true, onSourceFunds = null,
+  preservePersisted = Boolean(previousManifest) } = {}) {
   const currentTime = now instanceof Date ? now : new Date(now);
   if (!Number.isFinite(currentTime.getTime())) throw new MergeError('MERGE_FAILED');
   let directory;
@@ -574,7 +575,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
   // example price rows or a missing clock) even when no source request covers
   // that product.  The admission guard must compare against the bytes that
   // were actually published, not a reconstructed approximation.
-  const previousByCode = previousManifest && persistedByCode.size
+  const previousByCode = preservePersisted && persistedByCode.size
     ? persistedByCode
     : new Map([...byCode.entries()].map(([code, fund]) => [code, clone(fund)]));
   let acceptedFreshFundCount = 0;
