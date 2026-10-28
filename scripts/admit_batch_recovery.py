@@ -486,7 +486,7 @@ def protect_market_budgets(before, after, started):
                     fail('ADMISSION_SOURCE_BUDGET_CHANGED_' + key.upper())
 
 
-def _same_requested_portfolio(old, new, requested):
+def _same_requested_portfolio(old, new, requested, code=None):
     """Allow only alias metadata normalization within a requested portfolio.
 
     merge-parts rebuilds a deduplicated portfolio from all of its share-class
@@ -495,6 +495,10 @@ def _same_requested_portfolio(old, new, requested):
     outside that identity must remain a hard admission failure.
     """
     related = set()
+    old_code = (old.get('code') if isinstance(old, dict) else None) or code
+    old_portfolio = old.get('sourcePortfolioCode') if isinstance(old, dict) else None
+    new_portfolio = new.get('sourcePortfolioCode') if isinstance(new, dict) else None
+    new_aliases = set(new.get('shareClassCodes') or []) if isinstance(new, dict) else set()
     for row in (old, new):
         if not isinstance(row, dict):
             continue
@@ -504,9 +508,16 @@ def _same_requested_portfolio(old, new, requested):
         aliases = row.get('shareClassCodes')
         if isinstance(aliases, list):
             related.update(code for code in aliases if isinstance(code, str))
-    return (bool(related & set(requested))
-            and isinstance(old.get('sourcePortfolioCode'), str)
-            and old.get('sourcePortfolioCode') == new.get('sourcePortfolioCode'))
+    requested = set(requested)
+    if not related & requested:
+        return False
+    if isinstance(old_portfolio, str) and old_portfolio == new_portfolio:
+        return True
+    # A source refresh may fill a previously absent representative identity on
+    # a non-requested share class. Allow that one-way normalization only when
+    # the new representative is requested and the old code is in that alias group.
+    return (isinstance(new_portfolio, str) and new_portfolio in requested
+            and isinstance(old_code, str) and old_code in new_aliases)
 
 
 def protect_funds(before, after, requested):
@@ -515,7 +526,7 @@ def protect_funds(before, after, requested):
         if code not in after: fail('ADMISSION_EXISTING_FUND_REMOVED')
         new = after[code]
         if (code not in requested and old['sourceHash'] != new['sourceHash']
-                and not _same_requested_portfolio(old, new, requested)):
+                and not _same_requested_portfolio(old, new, requested, code)):
             fail('ADMISSION_UNRELATED_SOURCE_CHANGED')
         for key, value in old['prices'].items():
             if new['prices'].get(key) != value: fail('ADMISSION_PRICE_FACT_CHANGED')

@@ -274,6 +274,14 @@ class AdmissionTests(unittest.TestCase):
         broken['000745']['sourcePortfolioCode'] = '000745'
         with self.assertRaisesRegex(admission.AdmissionError, 'UNRELATED_SOURCE_CHANGED'):
             admission.protect_funds(before, broken, {'000744'})
+        filled = copy.deepcopy(before)
+        filled['000745']['sourcePortfolioCode'] = None
+        filled['000745']['shareClassCodes'] = ['000745']
+        normalized = copy.deepcopy(filled)
+        normalized['000745']['sourcePortfolioCode'] = '000744'
+        normalized['000745']['shareClassCodes'] = ['000744', '000745']
+        normalized['000745']['sourceHash'] = 'alias-normalized'
+        admission.protect_funds(filled, normalized, {'000744'})
 
     def test_fund_protection_ignores_only_reconciliation_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
