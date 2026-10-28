@@ -451,6 +451,25 @@ function preserveUnrequestedPortfolioIdentity(funds, previousByCode, requestedCo
     const current = portfolioIdentity(fund);
     const currentAliases = current?.aliases || portfolioAliasSet(fund);
     if (!currentAliases.size || [...currentAliases].some(code => requested.has(code))) continue;
+    // An unrelated code may have had no confirmed portfolio identity at all
+    // in the persisted snapshot.  A fresh requested observation can still
+    // make the deduplicator attach a URL/alias group beside it.  With no
+    // requested alias in the resulting group, preserve the exact old spelling
+    // (including an absent identity) before the admission guard compares the
+    // source hash.  Otherwise a source-only recovery would rewrite an
+    // unrelated product merely because the new group was normalized globally.
+    const exactPrevious = previousByCode instanceof Map ? previousByCode.get(fund.code) : null;
+    if (exactPrevious && !portfolioIdentity(exactPrevious)) {
+      if (Object.hasOwn(exactPrevious, 'sourcePortfolioCode')) fund.sourcePortfolioCode = exactPrevious.sourcePortfolioCode;
+      else delete fund.sourcePortfolioCode;
+      if (Object.hasOwn(exactPrevious, 'portfolioSourceUrl')) fund.portfolioSourceUrl = exactPrevious.portfolioSourceUrl;
+      else delete fund.portfolioSourceUrl;
+      if (Array.isArray(exactPrevious.shareClassCodes)) fund.shareClassCodes = [...exactPrevious.shareClassCodes];
+      else delete fund.shareClassCodes;
+      if (Array.isArray(exactPrevious.aliases)) fund.aliases = clone(exactPrevious.aliases);
+      else delete fund.aliases;
+      continue;
+    }
     const matches = new Set();
     for (const code of currentAliases) for (const representative of byAlias.get(code) || []) matches.add(representative);
     if (matches.size !== 1) continue;
