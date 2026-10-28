@@ -89,19 +89,22 @@ class SourceCensusProofTests(unittest.TestCase):
         self.assertEqual(result['censusScope']['dataCommit'], commit)
         self.assertEqual(result['priceLedgerParentRunId'], expected['runId'])
         self.assertEqual(result['diagnosticCandidate']['matchedObservationCount'], 2)
-        self.assertEqual(result['diagnosticCandidate']['admission'], 'not-implemented')
+        self.assertEqual(result['diagnosticCandidate']['admission'], 'independent-document-opt-in')
         self.assertEqual(result['marketDataRequests'], 0); self.assertFalse(result['ledgerModified'])
 
-    def test_new_original_clock_with_identical_fact_and_extremes_remains_uncovered(self):
+    def test_new_original_clock_is_fact_compatible_but_response_stays_uncovered(self):
         api, expected = fixture()
         with patch.object(census, 'PROOF', expected): proof = census.restore_proof(api, LATER)
         with tempfile.TemporaryDirectory() as directory:
             commit = sample_checkout(directory, proof, new_observation=True); value = scan(directory, commit)
-            with patch.object(census, 'DATA_COMMIT', commit): result = census.certificate(value, proof, LATER)
-        self.assertEqual(result['status'], 'partial'); self.assertFalse(result['diagnosticCandidate']['eligible'])
+            with patch.object(census, 'DATA_COMMIT', commit), patch.object(census, 'PROOF', expected): result = census.certificate(value, proof, LATER)
+        self.assertEqual(result['status'], 'complete'); self.assertTrue(result['diagnosticCandidate']['eligible'])
         self.assertEqual(result['diagnosticCandidate']['uncoveredObservationCount'], 1)
         self.assertEqual(result['diagnosticCandidate']['uncoveredFactIds'], [])
         self.assertEqual(result['censusScope']['rawRegistry']['digest'], proof['registryDigest'])
+        self.assertEqual(result['representation']['mathematicallyClassifiedObservationCount'], 2)
+        self.assertEqual(result['representation']['directlyBoundRecheckObservationCount'], 1)
+        self.assertEqual(result['representation']['responseCoverage'], 'partial')
 
     def test_source_facts_observation_body_digest_and_completeness_cannot_be_self_asserted(self):
         api, expected = fixture()
@@ -147,9 +150,9 @@ class SourceCensusProofTests(unittest.TestCase):
                     code = census.main(['--data-repo', str(root), '--output', str(output)])
                 result = json.loads((output / 'result.json').read_bytes()); printed = json.loads(stdout.getvalue())
                 self.assertEqual(code, 0); self.assertTrue(result['executionSuccess']); self.assertTrue(printed['executionSuccess'])
-                self.assertEqual(result['status'], 'partial' if new_observation else 'complete')
+                self.assertEqual(result['status'], 'complete')
                 self.assertEqual(result['dataStatus'], result['status']); self.assertEqual(printed['dataStatus'], result['status'])
-                self.assertEqual(result['diagnosticCandidate']['eligible'], not new_observation)
+                self.assertTrue(result['diagnosticCandidate']['eligible'])
                 self.assertEqual(result['diagnosticCandidate']['uncoveredObservationCount'], int(new_observation))
                 self.assertEqual(result['resolution'], 'unresolved'); self.assertFalse(result['automaticResolution'])
                 self.assertFalse(result['ledgerModified']); self.assertFalse(result['productionDataModified'])

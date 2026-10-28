@@ -13,6 +13,7 @@
   <script src="./strategy-sections.js" defer></script>
   <script src="./source-dates.js" defer></script>
   <script src="./analysis.js" defer></script>
+  <script src="./price-representations.js" defer></script>
   <script src="./app.js" defer></script>
 </head>
 <body>
@@ -36,6 +37,7 @@
       <div class="stat"><span>完整交易日价格区间</span><strong id="stat-prices">—</strong><small id="stat-prices-note">已逐日核验的证券区间</small></div>
     </section>
     <section class="method-note" aria-label="计算口径"><span class="note-icon" aria-hidden="true">i</span><p><strong>读数口径</strong> 季报通常披露前十大重仓股；进入 / 离开披露名单不等同于新买入 / 清仓。体量优先展示披露市值，另列「期末净资产 × 持仓占比」估算。期间最低 / 最高价仅作交易区间参考，<strong>真实持有成本未知</strong>。</p><a href="#methodology">查看完整说明 ↗</a></section>
+    <section id="price-representation-panel" class="catalog-panel" aria-label="价格来源数值核验" hidden></section>
     <section class="catalog-panel" id="stock-analysis" aria-label="跨基金个股分析">
       <div class="section-title"><div><p class="eyebrow">CROSS-FUND ANALYSIS</p><h2>一只股票，哪些基金在持有</h2></div></div>
       <p id="analysis-status" role="status">等待本季度分析结果。</p>

@@ -22,6 +22,7 @@ import zipfile
 import price_conflicts as conflicts
 import price_daily_evidence as daily
 import price_consistency as consistency
+from price_representation import classify_stored_facts
 import restore_price_conflict_ledger as restore
 from publication_cache import read_bounded_command
 from publication_guard import inspect_content
@@ -339,8 +340,10 @@ def certificate(census, proof, now=None):
     matched = sorted(current_ids & covered_ids); uncovered = sorted(current_ids - covered_ids)
     proof_fact_ids = {fact['factId'] for fact in proof['facts']}
     new_facts = sorted(fact['factId'] for fact in census['facts'] if fact['factId'] not in proof_fact_ids)
-    eligible = (census['complete'] and len(matched) == len(covered_ids) == 2 and not uncovered and not new_facts
-                and census['rawRegistry']['digest'] == proof['registryDigest'])
+    # Original-response bindings and immutable stored-fact compatibility are
+    # different evidence scopes. A changed timestamp does not change a fact.
+    representation = classify_stored_facts(census, proof, PROOF)
+    eligible = representation['eligible']
     parts_digest = conflicts.digest(census['parts'])
     candidate_digest = conflicts.digest({'schemaVersion': 1, 'key': KEY, 'proof': proof['provenance'],
         'dataCommit': census['dataCommit'], 'manifest': census['manifest'], 'partsDigest': parts_digest,
@@ -354,10 +357,11 @@ def certificate(census, proof, now=None):
         'censusScope': {'dataCommit': census['dataCommit'], 'manifest': census['manifest'], 'partsDigest': parts_digest,
                         'sourceUniverseDigest': census['sourceUniverseDigest'], 'rawRegistry': census['rawRegistry'],
                         'complete': census['complete'], 'reasonCodes': census['reasonCodes'], 'counts': census['counts']},
-        'diagnosticCandidate': {'eligible': eligible, 'digest': candidate_digest, 'admission': 'not-implemented',
+        'diagnosticCandidate': {'eligible': eligible, 'digest': candidate_digest, 'admission': 'independent-document-opt-in',
             'classification': 'exact-or-yahoo-equals-binary32-eastmoney', 'matchedObservationCount': len(matched),
             'uncoveredObservationCount': len(uncovered), 'uncoveredObservationIds': uncovered,
             'uncoveredFactIds': new_facts, 'comparison': proof['dailyEvidence']['comparison']},
+        'representation': representation,
         'proofLedgerHashes': proof['ledgerHashes'], 'priceLedgerParentRunId': PROOF['runId'],
         'marketDataRequests': 0, 'ledgerModified': False, 'productionDataModified': False,
         'automaticResolution': False, 'resolution': 'unresolved'}
