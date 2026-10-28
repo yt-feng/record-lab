@@ -529,8 +529,8 @@ def _same_requested_portfolio(old, new, requested, code=None):
             and isinstance(old_code, str) and old_code in new_aliases)
 
 
-def _same_requested_portfolio_url(old, new, requested, code=None):
-    """Recognize URL-only normalization inside an evidenced alias group."""
+def _portfolio_url_relation(old, new, requested, code=None):
+    """Return a bounded category for URL-only portfolio normalization."""
     requested = set(requested)
     old_aliases = set(old.get('shareClassCodes') or []) if isinstance(old, dict) else set()
     new_aliases = set(new.get('shareClassCodes') or []) if isinstance(new, dict) else set()
@@ -538,15 +538,26 @@ def _same_requested_portfolio_url(old, new, requested, code=None):
         representative = row.get('sourcePortfolioCode') if isinstance(row, dict) else None
         if isinstance(representative, str):
             target.add(representative)
-    members = old_aliases | new_aliases
-    if not (requested & new_aliases) or not isinstance(code, str) or code not in new_aliases:
-        return False
+    if not isinstance(code, str):
+        return 'CODE_INVALID'
+    old_requested = bool(requested & old_aliases)
+    new_requested = bool(requested & new_aliases)
+    if not old_requested and not new_requested:
+        return 'NO_REQUESTED_ALIAS'
+    if not new_requested:
+        return 'REQUESTED_REMOVED'
+    if code not in new_aliases:
+        return 'CODE_NOT_NEW_ALIAS'
     old_rep = old.get('sourcePortfolioCode') if isinstance(old, dict) else None
     new_rep = new.get('sourcePortfolioCode') if isinstance(new, dict) else None
     if (isinstance(old_rep, str) and isinstance(new_rep, str) and old_rep != new_rep
             and old_rep not in new_aliases and new_rep not in old_aliases):
-        return False
-    return bool(members)
+        return 'IDENTITY_CONFLICT'
+    return 'REQUESTED_BOTH' if old_requested else 'REQUESTED_EXPANDED'
+
+
+def _same_requested_portfolio_url(old, new, requested, code=None):
+    return _portfolio_url_relation(old, new, requested, code) in {'REQUESTED_BOTH', 'REQUESTED_EXPANDED'}
 
 
 def protect_funds(before, after, requested):
@@ -559,15 +570,17 @@ def protect_funds(before, after, requested):
             changed = sorted(key for key in set(before_fields) | set(after_fields)
                              if before_fields.get(key) != after_fields.get(key))
             same_portfolio = _same_requested_portfolio(old, new, requested, code)
+            url_relation = _portfolio_url_relation(old, new, requested, code)
             url_only_alias_normalization = (changed == ['portfolioSourceUrl']
-                                            and _same_requested_portfolio_url(old, new, requested, code))
+                                            and url_relation in {'REQUESTED_BOTH', 'REQUESTED_EXPANDED'})
             if same_portfolio or url_only_alias_normalization:
                 continue
             # Keep the receipt bounded and category-only; the first changed
             # field is sufficient to route the next repair without exposing
             # values or allowing the public error-code grammar to overflow.
             suffix = re.sub(r'[^A-Z_]', '_', changed[0].upper())[:32] if changed else 'UNKNOWN_FIELD'
-            fail('ADMISSION_UNRELATED_SOURCE_CHANGED_' + suffix)
+            relation = '_' + url_relation if changed == ['portfolioSourceUrl'] else ''
+            fail('ADMISSION_UNRELATED_SOURCE_CHANGED_' + suffix + relation)
         for key, value in old['prices'].items():
             if new['prices'].get(key) != value: fail('ADMISSION_PRICE_FACT_CHANGED')
         if old['priceUpdatedAt'] is not None and old['priceUpdatedAt'] != new['priceUpdatedAt']:
