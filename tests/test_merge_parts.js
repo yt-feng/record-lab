@@ -257,6 +257,17 @@ test('source-only recovery preserves an unrelated persisted portfolio identity',
   assert.deepEqual(attached, oldWithoutIdentity);
 });
 
+test('source-only normalization preserves a missing persisted price clock', () => {
+  const prices = { 'CN:600001': { currency: 'CNY', priceBasis: 'unadjusted', sourceUrl: 'https://example.org/prices',
+    rows: [{ date: '2026-04-10', low: 8, high: 12 }] } };
+  const first = merge({ snapshots: [snapshot(['000001'], { barsByStock: prices })] });
+  const prior = structuredClone(first.companySnapshots.co1);
+  delete prior.priceUpdatedAt;
+  delete prior.funds[0].priceUpdatedAt;
+  const next = merge({ snapshots: [snapshot(['000003'])], previousCompanies: { co1: prior }, previousManifest: first.manifest });
+  assert.equal(Object.hasOwn(next.companySnapshots.co1.funds[0], 'priceUpdatedAt'), false);
+});
+
 test('no-equities is a valid company observation and is counted separately', () => {
   const part = snapshot(['000001'], { overrides: { reports: [], noEquitiesEvidence: {
     confirmed: true, sourceUrl: 'https://example.org/empty-report.pdf', periodEnd: '2026-06-30',

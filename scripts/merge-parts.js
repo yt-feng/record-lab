@@ -533,17 +533,50 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
       }
     }
   }
+  const persistedByCode = new Map();
   for (const [companyCode, envelope] of Object.entries(previousCompanies)) {
     if (!COMPANY_FILE.test(companyCode) || !validEnvelope(envelope, currentTime, config)) { addError('INVALID_COMPANY_SNAPSHOT'); continue; }
     for (const item of envelope.funds) {
+      if (CODE.test(item?.code || '')) {
+        const prior = persistedByCode.get(item.code);
+        if (!prior || Date.parse(item.retrievedAt || '') > Date.parse(prior.retrievedAt || '')) {
+          persistedByCode.set(item.code, clone(item));
+        }
+      }
       let fund = sanitizeFund(item, { now: currentTime, config, envelope });
       if (!fund) { addError('INVALID_FUND'); continue; }
+      // Re-normalizing a persisted observation may derive a price clock from
+      // an already-observed row when the old record intentionally had no
+      // explicit clock.  A source-only recovery must retain the persisted
+      // spelling; it must not manufacture a new market observation time.
+      const retainedObserved = fund.rows.some(row => row.priceRange?.status === 'observed'
+        && timestamp(row.priceRange.fetchedAt));
+      if (Object.hasOwn(item, 'priceUpdatedAt') && (item.priceUpdatedAt === null || retainedObserved)) {
+        fund.priceUpdatedAt = item.priceUpdatedAt;
+      } else {
+        delete fund.priceUpdatedAt;
+      }
+      const persisted = persistedByCode.get(item.code);
+      const persistedObserved = (item.rows || []).map(row => row?.priceRange || {})
+        .filter(price => price.status === 'observed');
+      if (persisted && persistedObserved.some(price => !publicUrl(price.sourceUrl)
+        || !timestamp(price.fetchedAt) || Date.parse(price.fetchedAt) > currentTime.getTime() + 300000)) {
+        persistedByCode.delete(item.code);
+      }
+      if (persisted && persisted.priceUpdatedAt !== null && !retainedObserved) delete persisted.priceUpdatedAt;
       const actual = mapCompany(fund, directoryMap);
       if (!actual) { addError('CATALOG_IDENTITY_MISMATCH'); continue; }
       if (!byCode.has(fund.code) || Date.parse(fund.retrievedAt) > Date.parse(byCode.get(fund.code).retrievedAt)) byCode.set(fund.code, fund);
     }
   }
-  const previousByCode = new Map([...byCode.entries()].map(([code, fund]) => [code, clone(fund)]));
+  // For an unrelated persisted code, preserve the exact public observation.
+  // Re-sanitizing an old page can legitimately normalize derived fields (for
+  // example price rows or a missing clock) even when no source request covers
+  // that product.  The admission guard must compare against the bytes that
+  // were actually published, not a reconstructed approximation.
+  const previousByCode = persistedByCode.size
+    ? persistedByCode
+    : new Map([...byCode.entries()].map(([code, fund]) => [code, clone(fund)]));
   let acceptedFreshFundCount = 0;
   for (const envelope of snapshots) {
     if (!validEnvelope(envelope, currentTime, config)) { addError('INVALID_PART'); continue; }

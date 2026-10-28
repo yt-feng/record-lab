@@ -409,9 +409,23 @@ def fund_protection(quarter):
                         'aliases', 'companyMapping', 'selectedReport', 'previousReport'):
                 source.pop(key, None)
             for row in source.get('rows', []): row.pop('priceRange', None)
+            # Keep only bounded portfolio identity metadata outside the source
+            # digest.  The admission guard compares the persisted snapshot
+            # with the post-merge snapshot, and needs the alias set to tell a
+            # requested share-class normalization from an unrelated rewrite.
+            # Do not retain the raw portfolio URL here; its digest remains in
+            # sourceFields and the URL is not needed for the relation check.
+            portfolio_codes = sorted({value for value in [fund.get('sourcePortfolioCode'),
+                              *(fund.get('shareClassCodes') or [])]
+                              if isinstance(value, str) and re.fullmatch(r'[0-9]{6}', value)})
+            representative = fund.get('sourcePortfolioCode')
+            if not isinstance(representative, str) or not re.fullmatch(r'[0-9]{6}', representative):
+                representative = None
             result[code] = {'sourceHash': digest(source),
                             'sourceFields': {key: digest(value) for key, value in source.items()},
-                            'prices': prices, 'priceUpdatedAt': fund.get('priceUpdatedAt')}
+                            'prices': prices, 'priceUpdatedAt': fund.get('priceUpdatedAt'),
+                            'sourcePortfolioCode': representative,
+                            'shareClassCodes': portfolio_codes or [code]}
     return result
 
 
@@ -495,6 +509,27 @@ def protect_market_budgets(before, after, started):
                     fail('ADMISSION_SOURCE_BUDGET_CHANGED_' + key.upper())
 
 
+def _portfolio_identity_fields(row):
+    """Return the representative and bounded alias set for a protection row.
+
+    Protection rows contain identity metadata separately from their source
+    digest so admission can reason about a share-class collapse without
+    retaining or printing a raw source URL.
+    """
+    if not isinstance(row, dict):
+        return None, set()
+    representative = row.get('sourcePortfolioCode')
+    if not isinstance(representative, str):
+        representative = row.get('portfolioRepresentativeCode')
+    aliases = row.get('shareClassCodes')
+    if not isinstance(aliases, list):
+        aliases = row.get('portfolioAliases')
+    aliases = set(value for value in (aliases or []) if isinstance(value, str))
+    if isinstance(representative, str):
+        aliases.add(representative)
+    return representative, aliases
+
+
 def _same_requested_portfolio(old, new, requested, code=None):
     """Allow only alias metadata normalization within a requested portfolio.
 
@@ -505,39 +540,35 @@ def _same_requested_portfolio(old, new, requested, code=None):
     """
     related = set()
     old_code = (old.get('code') if isinstance(old, dict) else None) or code
-    old_portfolio = old.get('sourcePortfolioCode') if isinstance(old, dict) else None
-    new_portfolio = new.get('sourcePortfolioCode') if isinstance(new, dict) else None
-    new_aliases = set(new.get('shareClassCodes') or []) if isinstance(new, dict) else set()
+    old_portfolio, old_aliases = _portfolio_identity_fields(old)
+    new_portfolio, new_aliases = _portfolio_identity_fields(new)
     for row in (old, new):
         if not isinstance(row, dict):
             continue
-        representative = row.get('sourcePortfolioCode')
+        representative, aliases = _portfolio_identity_fields(row)
         if isinstance(representative, str):
             related.add(representative)
-        aliases = row.get('shareClassCodes')
-        if isinstance(aliases, list):
-            related.update(code for code in aliases if isinstance(code, str))
+        related.update(code for code in aliases if isinstance(code, str))
     requested = set(requested)
     if not related & requested:
         return False
     if isinstance(old_portfolio, str) and old_portfolio == new_portfolio:
         return True
     # A source refresh may fill a previously absent representative identity on
-    # a non-requested share class. Allow that one-way normalization only when
-    # the new representative is requested and the old code is in that alias group.
-    return (isinstance(new_portfolio, str) and new_portfolio in requested
-            and isinstance(old_code, str) and old_code in new_aliases)
+    # a non-requested share class.  The deduplicator may choose either the
+    # requested class or an unrequested class as the persisted representative;
+    # the requested alias in the new group is the evidence that makes this a
+    # source-scoped normalization rather than an unrelated rewrite.
+    return (isinstance(old_code, str) and old_code in new_aliases
+            and bool(new_aliases & requested)
+            and old_portfolio is None)
 
 
 def _portfolio_url_relation(old, new, requested, code=None):
     """Return a bounded category for URL-only portfolio normalization."""
     requested = set(requested)
-    old_aliases = set(old.get('shareClassCodes') or []) if isinstance(old, dict) else set()
-    new_aliases = set(new.get('shareClassCodes') or []) if isinstance(new, dict) else set()
-    for row, target in ((old, old_aliases), (new, new_aliases)):
-        representative = row.get('sourcePortfolioCode') if isinstance(row, dict) else None
-        if isinstance(representative, str):
-            target.add(representative)
+    old_rep, old_aliases = _portfolio_identity_fields(old)
+    new_rep, new_aliases = _portfolio_identity_fields(new)
     if not isinstance(code, str):
         return 'CODE_INVALID'
     old_requested = bool(requested & old_aliases)
@@ -548,8 +579,6 @@ def _portfolio_url_relation(old, new, requested, code=None):
         return 'REQUESTED_REMOVED'
     if code not in new_aliases:
         return 'CODE_NOT_NEW_ALIAS'
-    old_rep = old.get('sourcePortfolioCode') if isinstance(old, dict) else None
-    new_rep = new.get('sourcePortfolioCode') if isinstance(new, dict) else None
     if (isinstance(old_rep, str) and isinstance(new_rep, str) and old_rep != new_rep
             and old_rep not in new_aliases and new_rep not in old_aliases):
         return 'IDENTITY_CONFLICT'
@@ -563,7 +592,21 @@ def _same_requested_portfolio_url(old, new, requested, code=None):
 def protect_funds(before, after, requested):
     requested = set(requested)
     for code, old in before.items():
-        if code not in after: fail('ADMISSION_EXISTING_FUND_REMOVED')
+        if code not in after:
+            # A deduplicated portfolio is persisted under one representative
+            # code.  Either requested or unrequested share classes may
+            # therefore disappear as top-level records while remaining
+            # explicitly represented in the requested representative's alias
+            # set.  Only allow a unique, requested alias-backed replacement;
+            # unrelated removals remain a hard admission failure.
+            matches = []
+            for candidate in after.values():
+                _, aliases = _portfolio_identity_fields(candidate)
+                if code in aliases and aliases & requested:
+                    matches.append(candidate)
+            if len(matches) == 1:
+                continue
+            fail('ADMISSION_EXISTING_FUND_REMOVED')
         new = after[code]
         if code not in requested and old['sourceHash'] != new['sourceHash']:
             before_fields, after_fields = old.get('sourceFields', {}), new.get('sourceFields', {})
@@ -597,10 +640,19 @@ def protect_funds(before, after, requested):
                 fail('ADMISSION_SOURCE_URL_UNRELATED_' + scope + relation_code)
             suffix = re.sub(r'[^A-Z_]', '_', changed[0].upper())[:32] if changed else 'UNKNOWN_FIELD'
             fail('ADMISSION_UNRELATED_SOURCE_CHANGED_' + suffix)
-        for key, value in old['prices'].items():
-            if new['prices'].get(key) != value: fail('ADMISSION_PRICE_FACT_CHANGED')
-        if old['priceUpdatedAt'] is not None and old['priceUpdatedAt'] != new['priceUpdatedAt']:
-            fail('ADMISSION_PRICE_CLOCK_CHANGED')
+        if code in requested:
+            # Recovery parts carry no market lane.  A requested source refresh
+            # may legitimately drop a quote row when the new holdings table no
+            # longer contains that security, and may recompute the independent
+            # clock from the rows that remain.  It must never add or mutate a
+            # previously observed price fact.
+            for key, value in new['prices'].items():
+                if old['prices'].get(key) != value: fail('ADMISSION_PRICE_FACT_CHANGED')
+        else:
+            for key, value in old['prices'].items():
+                if new['prices'].get(key) != value: fail('ADMISSION_PRICE_FACT_CHANGED')
+            if old['priceUpdatedAt'] is not None and old['priceUpdatedAt'] != new['priceUpdatedAt']:
+                fail('ADMISSION_PRICE_CLOCK_CHANGED')
 
 
 def admit(repo, bundle, binding, *, env, now=None, runner=command):

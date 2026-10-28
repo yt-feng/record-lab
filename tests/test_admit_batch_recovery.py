@@ -238,6 +238,16 @@ class AdmissionTests(unittest.TestCase):
             if mutate=='source': after['000001']['sourceHash']='changed'
             if mutate=='removed': after={}
             with self.assertRaises(admission.AdmissionError): admission.protect_funds(before,after,set())
+        requested_before = {'000001': {'sourceHash': 's',
+                                       'prices': {'CN|600001|CNY': 'p', 'CN|600002|CNY': 'q'},
+                                       'priceUpdatedAt': None}}
+        requested_after = {'000001': {'sourceHash': 'fresh',
+                                      'prices': {'CN|600001|CNY': 'p'},
+                                      'priceUpdatedAt': '2026-10-26T19:00:00Z'}}
+        admission.protect_funds(requested_before, requested_after, {'000001'})
+        requested_after['000001']['prices']['CN|600001|CNY'] = 'changed'
+        with self.assertRaisesRegex(admission.AdmissionError, 'PRICE_FACT_CHANGED'):
+            admission.protect_funds(requested_before, requested_after, {'000001'})
         old={'funds':[{'code':'000001','attempts':1,'totalAttempts':1,'enrichment':{'attempts':2,'totalAttempts':3,'lastAttemptAt':'old','retry':{'cycleDate':'2026-10-26','scheduledCycles':0,'nextRetryAt':None}}}]}
         for key in ('attempts','totalAttempts','lastAttemptAt','retry'):
             after=copy.deepcopy(old); after['funds'][0]['enrichment'][key]=0
@@ -315,6 +325,23 @@ class AdmissionTests(unittest.TestCase):
                                      'sourcePortfolioCode': '000744', 'shareClassCodes': ['000744', '000745'],
                                      'sourceFields': {'portfolioSourceUrl': 'new'}}}
         admission.protect_funds(expanded_before, expanded_after, {'000744'})
+        unrequested_representative = {'000745': {'sourceHash': 'url-new', 'prices': {}, 'priceUpdatedAt': None,
+                                                 'sourcePortfolioCode': '000743',
+                                                 'shareClassCodes': ['000743', '000744', '000745'],
+                                                 'sourceFields': {'portfolioSourceUrl': 'new'}}}
+        admission.protect_funds(expanded_before, unrequested_representative, {'000744'})
+
+        # The persisted representative may replace an unrequested alias as a
+        # top-level fund record.  The alias remains protected when the new
+        # identity proves a unique requested portfolio group.
+        collapsed_before = copy.deepcopy(expanded_before)
+        collapsed_after = {'000744': {'sourceHash': 'representative-new', 'prices': {}, 'priceUpdatedAt': None,
+                                      'sourcePortfolioCode': '000744', 'shareClassCodes': ['000744', '000745'],
+                                      'sourceFields': {'portfolioSourceUrl': 'new'}}}
+        admission.protect_funds(collapsed_before, collapsed_after, {'000744'})
+        with self.assertRaisesRegex(admission.AdmissionError, 'EXISTING_FUND_REMOVED'):
+            admission.protect_funds(collapsed_before, {'000744': {**collapsed_after['000744'],
+                                                                   'shareClassCodes': ['000744']}}, {'000744'})
 
     def test_fund_protection_ignores_only_reconciliation_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
