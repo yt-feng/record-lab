@@ -240,6 +240,13 @@ test('source-only recovery preserves an unrelated persisted portfolio identity',
   assert.equal(current.sourcePortfolioCode, old.sourcePortfolioCode);
   assert.deepEqual(current.shareClassCodes, old.shareClassCodes);
   assert.deepEqual(current.aliases, old.aliases);
+
+  const malformed = { code: '000003', sourcePortfolioCode: '000999',
+    portfolioSourceUrl: 'https://example.org/new.pdf', shareClassCodes: ['000003'] };
+  preserveUnrequestedPortfolioIdentity([malformed], new Map([['000003', old]]), new Set(['000001']));
+  assert.equal(malformed.portfolioSourceUrl, old.portfolioSourceUrl);
+  assert.equal(malformed.sourcePortfolioCode, old.sourcePortfolioCode);
+  assert.deepEqual(malformed.shareClassCodes, old.shareClassCodes);
 });
 
 test('no-equities is a valid company observation and is counted separately', () => {

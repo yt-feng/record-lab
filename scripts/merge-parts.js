@@ -419,6 +419,14 @@ function portfolioIdentity(fund) {
   };
 }
 
+function portfolioAliasSet(fund) {
+  const aliases = new Set();
+  for (const code of [fund?.code, fund?.sourcePortfolioCode, ...(Array.isArray(fund?.shareClassCodes) ? fund.shareClassCodes : [])]) {
+    if (CODE.test(code || '')) aliases.add(code);
+  }
+  return aliases;
+}
+
 function preserveUnrequestedPortfolioIdentity(funds, previousByCode, requestedCodes) {
   const groups = new Map();
   const ambiguous = new Set();
@@ -441,9 +449,10 @@ function preserveUnrequestedPortfolioIdentity(funds, previousByCode, requestedCo
   const requested = requestedCodes instanceof Set ? requestedCodes : new Set(requestedCodes || []);
   for (const fund of funds) {
     const current = portfolioIdentity(fund);
-    if (!current || [...current.aliases].some(code => requested.has(code))) continue;
+    const currentAliases = current?.aliases || portfolioAliasSet(fund);
+    if (!currentAliases.size || [...currentAliases].some(code => requested.has(code))) continue;
     const matches = new Set();
-    for (const code of current.aliases) for (const representative of byAlias.get(code) || []) matches.add(representative);
+    for (const code of currentAliases) for (const representative of byAlias.get(code) || []) matches.add(representative);
     if (matches.size !== 1) continue;
     const representative = [...matches][0];
     const group = groups.get(representative);
