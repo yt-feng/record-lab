@@ -408,6 +408,56 @@ function mergeReceipt(funds, codes, config, now, attempts = new Map()) {
     generatedAt: now.toISOString(), requestedCodes: [...codes].sort(), funds: [...observations.values()].sort((a, b) => a.code.localeCompare(b.code)) };
 }
 
+function portfolioIdentity(fund) {
+  if (!fund || !CODE.test(fund.code || '') || !CODE.test(fund.sourcePortfolioCode || '')
+    || !publicUrl(fund.portfolioSourceUrl) || !Array.isArray(fund.shareClassCodes)
+    || !fund.shareClassCodes.includes(fund.code) || !fund.shareClassCodes.includes(fund.sourcePortfolioCode)) return null;
+  return {
+    representative: fund.sourcePortfolioCode,
+    sourceUrl: fund.portfolioSourceUrl,
+    aliases: new Set([fund.code, fund.sourcePortfolioCode, ...fund.shareClassCodes.filter(code => CODE.test(code || ''))]),
+  };
+}
+
+function preserveUnrequestedPortfolioIdentity(funds, previousByCode, requestedCodes) {
+  const groups = new Map();
+  const ambiguous = new Set();
+  for (const old of previousByCode instanceof Map ? previousByCode.values() : []) {
+    const identity = portfolioIdentity(old);
+    if (!identity) continue;
+    const prior = groups.get(identity.representative);
+    if (!prior) groups.set(identity.representative, { ...identity, fund: old });
+    else if (prior.sourceUrl !== identity.sourceUrl || JSON.stringify([...prior.aliases].sort())
+      !== JSON.stringify([...identity.aliases].sort())) ambiguous.add(identity.representative);
+  }
+  const byAlias = new Map();
+  for (const [representative, group] of groups) {
+    if (ambiguous.has(representative)) continue;
+    for (const code of group.aliases) {
+      if (!byAlias.has(code)) byAlias.set(code, new Set());
+      byAlias.get(code).add(representative);
+    }
+  }
+  const requested = requestedCodes instanceof Set ? requestedCodes : new Set(requestedCodes || []);
+  for (const fund of funds) {
+    const current = portfolioIdentity(fund);
+    if (!current || [...current.aliases].some(code => requested.has(code))) continue;
+    const matches = new Set();
+    for (const code of current.aliases) for (const representative of byAlias.get(code) || []) matches.add(representative);
+    if (matches.size !== 1) continue;
+    const representative = [...matches][0];
+    const group = groups.get(representative);
+    if (!group || [...group.aliases].some(code => requested.has(code))) continue;
+    // A source-only recovery must not rewrite an unrelated persisted portfolio
+    // identity merely because a fresh group was deduplicated beside it.
+    fund.sourcePortfolioCode = group.representative;
+    fund.portfolioSourceUrl = group.sourceUrl;
+    fund.shareClassCodes = [...group.aliases].sort();
+    if (Array.isArray(group.fund.aliases)) fund.aliases = clone(group.fund.aliases);
+  }
+  return funds;
+}
+
 function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManifest = null, catalog,
   config = {}, now = new Date(), receiptCodes = [], pageLimits, reusePrices = true, onSourceFunds = null } = {}) {
   const currentTime = now instanceof Date ? now : new Date(now);
@@ -464,6 +514,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
       if (!byCode.has(fund.code) || Date.parse(fund.retrievedAt) > Date.parse(byCode.get(fund.code).retrievedAt)) byCode.set(fund.code, fund);
     }
   }
+  const previousByCode = new Map([...byCode.entries()].map(([code, fund]) => [code, clone(fund)]));
   let acceptedFreshFundCount = 0;
   for (const envelope of snapshots) {
     if (!validEnvelope(envelope, currentTime, config)) { addError('INVALID_PART'); continue; }
@@ -559,6 +610,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
   const sourceFunds = [...byCode.values()];
   if (onSourceFunds) onSourceFunds(sourceFunds);
   const funds = deduplicatePortfolios(sourceFunds, addError);
+  preserveUnrequestedPortfolioIdentity(funds, previousByCode, requestedCodes);
   // Patch the final representative so a valid alias request cannot disappear
   // when its share class is subsequently collapsed into the same portfolio.
   for (const event of strategyEvents.values()) {
@@ -736,4 +788,5 @@ function main(argv = process.argv.slice(2)) {
 
 if (require.main === module) process.exitCode = main();
 
-module.exports = { MergeError, main, mergeFiles, mergeSnapshots, sanitizeFund, splitCompanyFunds };
+module.exports = { MergeError, main, mergeFiles, mergeSnapshots, preserveUnrequestedPortfolioIdentity,
+  sanitizeFund, splitCompanyFunds };

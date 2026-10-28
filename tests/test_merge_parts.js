@@ -7,7 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { buildSnapshot } = require('../scripts/build-data');
-const { mergeFiles, mergeSnapshots, splitCompanyFunds } = require('../scripts/merge-parts');
+const { mergeFiles, mergeSnapshots, splitCompanyFunds, preserveUnrequestedPortfolioIdentity } = require('../scripts/merge-parts');
 
 const now = '2026-09-29T12:00:00Z';
 const config = { targetPeriodEnd: '2026-06-30', baselinePeriodEnd: '2026-03-31' };
@@ -227,6 +227,19 @@ test('confirmed same-company share classes retain aliases without adding their p
   assert.equal(result.manifest.coverage.catalogAvailableFundCount, 2);
   assert.equal(result.companySnapshots.co1.funds[0].summary.knownPositionYuan, 500);
   assert.deepEqual(result.companySnapshots.co1.funds[0].shareClassCodes, ['000001', '000002']);
+});
+
+test('source-only recovery preserves an unrelated persisted portfolio identity', () => {
+  const old = { code: '000003', sourcePortfolioCode: '000003',
+    portfolioSourceUrl: 'https://example.org/old.pdf', shareClassCodes: ['000003'],
+    aliases: [{ code: '000003', name: '旧组合' }] };
+  const current = { ...structuredClone(old), portfolioSourceUrl: 'https://example.org/new.pdf',
+    aliases: [{ code: '000003', name: '新组合' }] };
+  preserveUnrequestedPortfolioIdentity([current], new Map([['000003', old]]), new Set(['000001']));
+  assert.equal(current.portfolioSourceUrl, old.portfolioSourceUrl);
+  assert.equal(current.sourcePortfolioCode, old.sourcePortfolioCode);
+  assert.deepEqual(current.shareClassCodes, old.shareClassCodes);
+  assert.deepEqual(current.aliases, old.aliases);
 });
 
 test('no-equities is a valid company observation and is counted separately', () => {
