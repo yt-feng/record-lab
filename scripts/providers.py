@@ -572,9 +572,28 @@ class PublicProvider:
         for attempt in range(attempts):
             try:
                 started = time.monotonic()
+                # Optional price-only journal. Persist the reservation before
+                # invoking either the existing checkpoint or Session.get.
+                # It records invocations, not redirect hops or valid quotes.
+                observer = getattr(self, 'request_observer', None)
+                token = observer.begin(url) if observer is not None else None
                 if callable(getattr(self, 'on_request', None)):
                     self.on_request()
-                response = self.session.get(url, params=params, headers=headers, timeout=(connect_timeout, request_timeout), stream=True)
+                try:
+                    response = self.session.get(url, params=params, headers=headers, timeout=(connect_timeout, request_timeout), stream=True)
+                except requests.exceptions.RequestException as caught:
+                    if observer is not None:
+                        category = ('TLS_FAILED' if isinstance(caught, requests.exceptions.SSLError) else
+                                    'TIMEOUT' if isinstance(caught, requests.exceptions.Timeout) else
+                                    'HTTP_ERROR' if isinstance(caught, requests.exceptions.HTTPError) else 'NETWORK_ERROR')
+                        observer.finish(token, 'failed', category)
+                    raise
+                if observer is not None:
+                    try:
+                        observer.finish(token, 'returned')
+                    except Exception:
+                        response.close()
+                        raise
                 if response.status_code in (403, 404):
                     raise DataError("HTTP_REJECTED")
                 response.raise_for_status()

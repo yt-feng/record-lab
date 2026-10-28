@@ -28,7 +28,7 @@ def plans_for(items, phase):
     return plans
 
 
-def execute(requests, deadline, workers, on_start, on_result, provider_factory=PublicProvider):
+def execute(requests, deadline, workers, on_start, on_result, provider_factory=PublicProvider, request_journal=None):
     """Only the transport callback marks a request started; queued work is free."""
     def fetch(item):
         key, args = item
@@ -43,6 +43,8 @@ def execute(requests, deadline, workers, on_start, on_result, provider_factory=P
         provider = provider_factory()
         provider.on_request = begin
         try:
+            if request_journal is not None:
+                provider.request_observer = request_journal.observer(key, args)
             result = provider.price_bars(*args)
             result['retrievedAt'] = dt.datetime.now(dt.timezone.utc).isoformat()
             return key, result, None, started
@@ -52,9 +54,10 @@ def execute(requests, deadline, workers, on_start, on_result, provider_factory=P
         futures = [pool.submit(fetch, request) for request in requests]
         for future in concurrent.futures.as_completed(futures):
             on_result(*future.result())
+    if request_journal is not None: request_journal.assert_healthy()
 
 
-def collect(config, as_of, checkpoint=None, provider_factory=PublicProvider, deadline=None):
+def collect(config, as_of, checkpoint=None, provider_factory=PublicProvider, deadline=None, request_journal=None):
     """Standalone lightweight entry point used by tests and price-only batches."""
     phase = {key: config[key] for key in ('targetPeriodEnd', 'baselinePeriodEnd')}
     plans = plans_for(config['funds'], phase)
@@ -87,5 +90,5 @@ def collect(config, as_of, checkpoint=None, provider_factory=PublicProvider, dea
             snapshot()
     snapshot()
     execute(list(requests.items())[:int(bounded(config.get('maxPriceSymbols', 1200), 1200, 2000))], deadline,
-            int(bounded(config.get('maxWorkers', 2), 2, 2, 1)), begin, finish, provider_factory)
+            int(bounded(config.get('maxWorkers', 2), 2, 2, 1)), begin, finish, provider_factory, request_journal)
     return snapshot()

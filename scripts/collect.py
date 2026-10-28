@@ -406,7 +406,7 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
     return fund, errors
 
 
-def collect(config, as_of, checkpoint=None):
+def collect(config, as_of, checkpoint=None, request_journal=None):
     items = config["funds"]
     strategy_items = [item for item in items if 'strategyClaimsOnly' in item]
     if strategy_items:
@@ -417,7 +417,7 @@ def collect(config, as_of, checkpoint=None):
     price_items = [item for item in items if 'priceOnly' in item]
     if price_items and len(price_items) == len(items):
         from collect_prices import collect as collect_prices
-        return collect_prices(config, as_of, checkpoint, provider_factory=PublicProvider)
+        return collect_prices(config, as_of, checkpoint, provider_factory=PublicProvider, request_journal=request_journal)
     from collect_prices import plans_for, bounded
     price_patches = plans_for(price_items, config) if price_items else []
     source_items = [item for item in items if 'priceOnly' not in item and 'strategyClaimsOnly' not in item]
@@ -548,11 +548,14 @@ def collect(config, as_of, checkpoint=None):
     snapshot("prices")
     def price(item):
         key, args = item
+        attempted = False
         if time.monotonic() >= price_deadline:
             return key, None, {"code": args[0], "stage": "prices", "errorCode": "PRICE_BUDGET_REACHED"}, False
         try:
             provider = PublicProvider()
             def begin():
+                nonlocal attempted
+                attempted = True
                 if not price_patches: return
                 with patch_lock:
                     changed = False
@@ -563,11 +566,13 @@ def collect(config, as_of, checkpoint=None):
                             changed = True
                     if changed: snapshot('prices')
             provider.on_request = begin
+            if request_journal is not None:
+                provider.request_observer = request_journal.observer(key, args)
             value = provider.price_bars(*args)
             value['retrievedAt'] = dt.datetime.now(dt.timezone.utc).isoformat()
-            return key, value, None, True
+            return key, value, None, attempted
         except Exception as error:
-            return key, None, safe_error(args[0], "prices", error), True
+            return key, None, safe_error(args[0], "prices", error), attempted
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(price, item) for item in selected_prices]
         for count, future in enumerate(concurrent.futures.as_completed(futures), 1):
@@ -582,6 +587,7 @@ def collect(config, as_of, checkpoint=None):
             # failures so a runner timeout never erases completed collection.
                 if value or count % 5 == 0 or count == len(selected_prices):
                     snapshot("prices")
+    if request_journal is not None: request_journal.assert_healthy()
     return snapshot("finished")
 
 
@@ -601,9 +607,13 @@ def main():
     parser.add_argument("--limit", type=int)
     parser.add_argument("--max-seconds", type=float)
     parser.add_argument("--price-seconds", type=float)
+    parser.add_argument("--request-receipts")
     args = parser.parse_args()
     dt.date.fromisoformat(args.as_of)
-    config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    config_bytes = Path(args.config).read_bytes()
+    config = json.loads(config_bytes)
+    if args.request_receipts and any(value is not None for value in (args.limit, args.max_seconds, args.price_seconds)):
+        raise DataError('INVALID_CONFIG')
     if args.max_seconds is not None:
         config["maxBatchSeconds"] = args.max_seconds
     if args.price_seconds is not None:
@@ -614,7 +624,16 @@ def main():
         raise DataError("INVALID_CONFIG")
     if os.environ.get("GITHUB_ACTIONS") != "true" and len(config["funds"]) > 2:
         raise DataError("BATCH_REQUIRES_ACTIONS")
-    payload = collect(config, args.as_of, checkpoint=lambda payload: write_checkpoint(args.output, payload))
+    journal = None
+    if args.request_receipts:
+        from request_receipts import RequestJournal
+        journal = RequestJournal(args.request_receipts, config, config_bytes)
+    completed = False
+    try:
+        payload = collect(config, args.as_of, checkpoint=lambda payload: write_checkpoint(args.output, payload), request_journal=journal)
+        completed = True
+    finally:
+        if journal is not None: journal.close(completed)
     print(json.dumps({"status": payload["coverage"]["status"], "counts": payload["coverage"], "errorCount": len(payload["errors"])}))
 
 
