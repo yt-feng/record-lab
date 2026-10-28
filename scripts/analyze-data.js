@@ -68,6 +68,12 @@ function strategyFor(fund, phase) {
   // These are scan accounting facts, never a certificate of full interpretation.
   const ruleScan = claims ? { method: claims.method, source: claims.source, coverage: claims.coverage,
     ruleScanComplete: true, semanticAnalysisComplete: false, explainsIndividualStockTrades: false } : null;
+  const semanticSidecar = proof && require('../lib/strategy-semantics').retainedStrategySemanticsFor(report,
+    { code: fund.code, now: phase.generation || fund.retrievedAt });
+  const semantic = semanticSidecar ? { status: semanticSidecar.status, ...Object.fromEntries(
+    ['claims', 'coverage', 'sentenceStatuses', 'sidecar', 'candidateDigest'].map(key => [key, semanticSidecar.candidate[key]])),
+    evidencePool: report.strategyEvidencePool, semanticCorrectnessVerified: false, semanticAnalysisComplete: false,
+    managerAttribution: 'fund-report-not-individual-speaker', explainsIndividualStockTrades: false } : null;
   const candidates = [...(Array.isArray(report.strategyExcerpts) ? report.strategyExcerpts : [])];
   if (narrative?.text) candidates.push(narrative);
   const unique = new Map();
@@ -88,7 +94,7 @@ function strategyFor(fund, phase) {
   return { scope: 'report-level-selected-evidence', status: all.length ? proof?.complete ? 'available' : 'partial-source' : 'missing',
     sectionCoverage: proof, sectionStatus: proof?.complete ? 'complete' : all.length || proof ? 'partial' : sourceProof ? 'wrong-period' : 'missing',
     evidenceRetrievedAt: observed ? strategyObserved : null,
-    analysis, analysisCoverage: analysis?.analysisCoverage || 'legacy-excerpts', ruleScan,
+    analysis, analysisCoverage: analysis?.analysisCoverage || 'legacy-excerpts', ruleScan, semantic,
     ruleScanComplete: Boolean(ruleScan), semanticAnalysisComplete: false,
     themes: THEMES.filter(([, pattern]) => pattern.test(combined)).map(([label]) => label),
     excerpts: all.slice(0, limit), availableExcerptCount: all.length, excerptLimit: limit,
@@ -273,6 +279,7 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
   const portfolioCounts = { analyzedRecords: 0, strategySectionCompleteRecords: 0, strategySectionIncompleteRecords: 0,
     strategyRuleScanCompleteRecords: 0, strategyRuleScanPendingRecords: 0, strategySemanticAnalysisCompleteRecords: 0,
     strategySemanticAnalysisPendingRecords: 0,
+    strategyModelInterpretedRecords: 0, strategyModelSelectedClaimCount: 0,
     strategySelectedEvidenceRecords: 0, reportManagerRecords: 0, reportManagerPartialRecords: 0,
     tenureOverlapManagerRecords: 0, managerEvidenceMissingRecords: 0, currentProfileOnlyManagerRecords: 0 };
   let invalidRows = 0, reportOnlyRecords = 0, noEquityRecords = 0, unknownIdentityRecords = 0,
@@ -296,6 +303,8 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
       portfolioCounts.strategyRuleScanCompleteRecords += Number(strategy.ruleScanComplete);
       portfolioCounts.strategyRuleScanPendingRecords += Number(!strategy.ruleScanComplete);
       portfolioCounts.strategySemanticAnalysisPendingRecords++;
+      portfolioCounts.strategyModelInterpretedRecords += Number(Boolean(strategy.semantic));
+      portfolioCounts.strategyModelSelectedClaimCount += strategy.semantic?.claims.length || 0;
       portfolioCounts.strategySelectedEvidenceRecords += Number(Boolean(strategy.analysis?.evidence.length));
       portfolioCounts.reportManagerRecords += Number(managers.managerCoverageStatus === 'complete');
       portfolioCounts.reportManagerPartialRecords += Number(managers.managerCoverageStatus === 'partial');

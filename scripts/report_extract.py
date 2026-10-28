@@ -8,6 +8,7 @@ service cannot complete, the caller receives a conservative pypdf result.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
@@ -326,7 +327,8 @@ def _details_for_pages(pages: list[str], source_url: str, period_end: str, kind:
                       enrich_pages: Callable[[list[str]], Mapping[str, Any]] | None = None,
                       page_numbers: list[int | None] | None = None,
                       total_pages: int | None = None, published_at: str | None = None,
-                      retrieved_at: str | None = None, pdf_sha256: str | None = None) -> dict[str, Any]:
+                      retrieved_at: str | None = None, pdf_sha256: str | None = None,
+                      on_private_sections: Callable[..., None] | None = None) -> dict[str, Any]:
     parsed = dict(parse_pages(pages, source_url, period_end, kind))
     if enrich_pages:
         parsed.update(dict(enrich_pages(pages)))
@@ -386,6 +388,10 @@ def _details_for_pages(pages: list[str], source_url: str, period_end: str, kind:
             parsed["strategyClaimsIdentityEvidence"] = parsed.get("portfolioIdentityEvidence")
     if retrieved_at:
         parsed["strategyEvidenceRetrievedAt"] = retrieved_at
+    if on_private_sections is not None:
+        on_private_sections(pages=tuple(pages),
+            page_numbers=tuple(page_numbers) if page_numbers is not None else tuple(range(1, len(pages) + 1)),
+            sections_result=copy.deepcopy(sections_result), details=copy.deepcopy(parsed))
     return parsed
 
 
@@ -394,11 +400,27 @@ def extract_report(pdf_bytes: bytes, source_url: str, period_end: str, kind: str
                    mineru_client: MinerUClient | None = None, filename: str = "report.pdf",
                    max_pages: int = 300, env: Mapping[str, str] | None = None,
                    enrich_pages: Callable[[list[str]], Mapping[str, Any]] | None = None,
-                   published_at: str | None = None, retrieved_at: str | None = None) -> dict[str, Any]:
+                   published_at: str | None = None, retrieved_at: str | None = None,
+                   on_private_sections: Callable[..., None] | None = None) -> dict[str, Any]:
     """Parse a report with MinerU when configured, falling back to pypdf."""
     tokens = mineru_tokens_from_env(env)
     pdf_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
     mineru_error: str | None = None
+    private_context = {}
+    def capture(**context):
+        private_context.clear()
+        private_context.update(context)
+    def finish(result):
+        # Invoke after the extraction fallback boundary. A mapping/model
+        # callback failure must not trigger another parser or another request.
+        if on_private_sections is not None:
+            try:
+                on_private_sections(**private_context)
+            except Exception:
+                raise ExtractionError("PRIVATE_SECTION_CALLBACK_FAILED") from None
+            finally:
+                private_context.clear()
+        return result
     if tokens:
         client = mineru_client or MinerUClient(
             base_url=(env or os.environ).get("MINERU_BASE_URL", MINERU_BASE_URL),
@@ -412,31 +434,34 @@ def extract_report(pdf_bytes: bytes, source_url: str, period_end: str, kind: str
                 page_numbers = [number for number, _page in records]
                 pages = [page for _number, page in records]
                 result = _details_for_pages(pages, source_url, period_end, kind, parse_pages, enrich_pages, page_numbers,
-                                           published_at=published_at, retrieved_at=retrieved_at, pdf_sha256=pdf_sha256)
+                                           published_at=published_at, retrieved_at=retrieved_at, pdf_sha256=pdf_sha256,
+                                           on_private_sections=capture if on_private_sections is not None else None)
                 result.update({"parseMethod": "mineru", "sourceTextHash": hashlib.sha256(markdown.encode("utf-8")).hexdigest(),
                                "pageStats": {**result["pageStats"], "markdownBytes": len(markdown.encode("utf-8"))},
                                "mineruTokenLabel": label})
-                return result
             except ExtractionError as error:
                 mineru_error = error.code
             except Exception:
                 mineru_error = "MINERU_UNEXPECTED_ERROR"
+            else:
+                return finish(result)
     try:
         pages = _pypdf_pages(pdf_bytes, max_pages)
         result = _details_for_pages(pages, source_url, period_end, kind, parse_pages, enrich_pages,
                                     total_pages=getattr(pages, "total_pages", len(pages)), published_at=published_at,
-                                    retrieved_at=retrieved_at, pdf_sha256=pdf_sha256)
+                                    retrieved_at=retrieved_at, pdf_sha256=pdf_sha256,
+                                    on_private_sections=capture if on_private_sections is not None else None)
         from manager_cells import enrich_manager_details
         enrich_manager_details(result, pdf_bytes,
             {"sourceUrl": source_url, "periodEnd": period_end, "kind": kind, "publishedAt": published_at}, pages)
         result["parseMethod"] = "pypdf-fallback" if mineru_error else "pypdf"
         if mineru_error:
             result["parseErrorCode"] = mineru_error
-        return result
     except ExtractionError as error:
         if mineru_error:
             error = ExtractionError("PDF_PARSE_FAILED")
         raise error
+    return finish(result)
 
 
 __all__ = ["ExtractionError", "MinerUClient", "extract_report", "markdown_pages",

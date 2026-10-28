@@ -282,6 +282,7 @@ function retainReportEvidence(target, source, now = new Date()) {
   if (retainStrategyClaims(to, from, { code: target.code, now, asOf: target.asOf })) {
     target.narrative = clone(to.narrative); changed = true;
   }
+  if (require('../lib/strategy-semantics').retainStrategySemantics(to, from, { code: target.code, now })) changed = true;
   if (!to.narrative?.text && from.narrative?.text) {
     to.narrative = clone(from.narrative); target.narrative = clone(from.narrative); changed = true;
     for (const key of ['parseMethod', 'parseErrorCode', 'sourceTextHash', 'pageStats', 'strategyExcerpts', 'strategyThemes',

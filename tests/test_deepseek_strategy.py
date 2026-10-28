@@ -44,6 +44,43 @@ def synthetic_worker(pipe, _credential, _body):
 
 
 class DeepSeekStrategyTests(unittest.TestCase):
+    def test_private_callback_runs_after_final_checkpoint_and_cannot_mutate_public_result(self):
+        checkpoints, received = [], []
+        def callback(bound, inference):
+            self.assertEqual(checkpoints[-1]['outcome'], 'validated')
+            self.assertIsNotNone(checkpoints[-1]['finishedAt'])
+            self.assertEqual(inference['usage']['total_tokens'], 300)
+            self.assertEqual(inference['bindingDiagnostics']['boundResponseDigest'],
+                hashlib.sha256(adapter.canonical(bound).encode()).hexdigest())
+            received.append(copy.deepcopy(bound))
+            bound['privateSentinel'] = 'PRIVATE_CALLBACK_SENTINEL'
+            inference['analysis'] = 'PRIVATE_CALLBACK_SENTINEL'
+            return {'privateSentinel': 'PRIVATE_CALLBACK_SENTINEL'}
+        result = adapter.run_packet(packet(), 'synthetic', checkpoint=checkpoints.append,
+            transport=lambda _, body: envelope(body), on_validated=callback)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(result['status'], 'validated')
+        self.assertNotIn('PRIVATE_CALLBACK_SENTINEL', json.dumps(result))
+
+    def test_private_callback_is_never_called_for_rejection_unknown_or_failed_final_checkpoint(self):
+        for response in ({'errorCode': 'PROVIDER_TIMEOUT'}, {'errorCode': 'PROVIDER_AUTHENTICATION_FAILED'},
+                         {'httpStatus': 200, 'body': 'malformed'}):
+            adapter.run_packet(packet(), 'synthetic', checkpoint=lambda _: None,
+                transport=lambda *_: response, on_validated=lambda *_: self.fail('unexpected callback'))
+        def final_checkpoint(receipt):
+            if receipt['outcome'] == 'validated': raise ValueError('checkpoint failure')
+        with self.assertRaises(ValueError):
+            adapter.run_packet(packet(), 'synthetic', checkpoint=final_checkpoint,
+                transport=lambda _, body: envelope(body), on_validated=lambda *_: self.fail('unexpected callback'))
+
+    def test_callback_failure_keeps_final_usage_receipt_and_never_exposes_exception_body(self):
+        checkpoints = []
+        with self.assertRaisesRegex(ValueError, '^VALIDATED_CALLBACK_FAILED$'):
+            adapter.run_packet(packet(), 'synthetic', checkpoint=checkpoints.append,
+                transport=lambda _, body: envelope(body),
+                on_validated=lambda *_: (_ for _ in ()).throw(RuntimeError('PRIVATE_CALLBACK_SENTINEL')))
+        self.assertEqual(checkpoints[-1]['outcome'], 'validated')
+
     def test_missing_credential_does_not_enter_transport_or_checkpoint(self):
         calls = []
         result = adapter.run_packet(packet(), None, checkpoint=calls.append,

@@ -402,7 +402,7 @@ def http_transport(credential, body, *, worker_target=_worker):
             if child.is_alive(): child.kill(); child.join(timeout=5)
 
 
-def run_packet(packet, credential, *, checkpoint, transport=http_transport):
+def run_packet(packet, credential, *, checkpoint, transport=http_transport, on_validated=None):
     """Checkpoint before the call; unknown outcomes are never automatically retried."""
     result = {'schemaVersion': 1, 'provider': 'deepseek', 'requestedModel': MODEL,
               'promptVersion': PROMPT_VERSION, 'endpoint': ENDPOINT, 'status': 'pending',
@@ -433,6 +433,7 @@ def run_packet(packet, credential, *, checkpoint, transport=http_transport):
     checkpoint(copy.deepcopy(receipt))
     result.update(attempted=True, requestCount=1, receipt=receipt)
     response_received = False
+    bound = None
     try:
         envelope = transport(credential, body)
         if type(envelope) is not dict:
@@ -497,4 +498,13 @@ def run_packet(packet, credential, *, checkpoint, transport=http_transport):
                       errorCode='PROVIDER_RESPONSE_INVALID', analysis=None)
     receipt.update(finishedAt=stamp(), outcome=result['status'], errorCode=result['errorCode'])
     checkpoint(copy.deepcopy(receipt))
+    # The reusable production adapter must map literal-bound spans while they
+    # still exist in private memory. Final request accounting is checkpointed
+    # first; the callback is never a retry or a second model request. Its return
+    # value is deliberately excluded from this public inference envelope.
+    if result['status'] == 'validated' and bound is not None and on_validated is not None:
+        try:
+            on_validated(copy.deepcopy(bound), copy.deepcopy(result))
+        except Exception:
+            raise ValueError('VALIDATED_CALLBACK_FAILED') from None
     return result

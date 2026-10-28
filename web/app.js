@@ -37,6 +37,33 @@
         : !observed ? '策略公告日期与当前观测时点尚未核对'
         : proof.complete ? '本季度投资策略和运作分析章节已完整提取' : '本季度策略章节仍有缺页、边界或文本待核验' };
   }
+  function modelStrategyEvidence(report) {
+    const lane = report?.strategySemantics, candidate = lane?.candidate, pool = report?.strategyEvidencePool;
+    if (lane?.method !== 'independent-semantic-pool-admission-v1' || lane.status !== 'structure-and-evidence-validated'
+      || lane.poolRef !== 'strategyEvidencePool' || candidate?.resultPoolDigest !== pool?.digest
+      || candidate?.sidecar?.source?.periodEnd !== report?.periodEnd || candidate?.semanticCorrectnessVerified !== false
+      || candidate?.explainsIndividualStockTrades !== false || !Array.isArray(candidate?.claims) || candidate.claims.length > 8
+      || !Array.isArray(pool?.quotes) || pool.quotes.length > 8
+      || !['sentenceCount', 'interpreted', 'unknown'].every(key => countValue(candidate.coverage?.[key]))
+      || !validTimestamp(candidate.sidecar?.source?.retrievedAt)
+      || !validTimestamp(candidate.sidecar?.modelObservation?.observation?.finishedAt)) return null;
+    const labels = { theme: '主题', opinion: '观点', operation: '操作表述', reason: '原文明确因果', unknown: '待判断' };
+    const times = { 'report-period': '报告期', past: '过去', future: '未来意向', conditional: '附条件', mixed: '多个时段', unspecified: '时间未明确' };
+    const claims = [];
+    for (const claim of candidate.claims) {
+      const quote = pool.quotes.find(item => item.id === claim?.evidencePoolId);
+      if (!quote || !textValue(quote.text) || Array.from(quote.text).length > 160 || claim.provesTrade !== false
+        || claim.provesTradeReason !== false || !labels[claim.kind] || !times[claim.time]
+        || !['fund-report', 'market', 'quoted-other', 'unknown'].includes(claim.subject?.scope)
+        || !Array.isArray(quote.pages) || !quote.pages.length || quote.pages.some(page => !Number.isInteger(page) || page < 1)) return null;
+      claims.push({ kind: labels[claim.kind], time: times[claim.time], text: quote.text, pages: quote.pages,
+        sourceUrl: candidate.sidecar.source.sourceUrl, conditional: claim.conditional === true,
+        negated: claim.negation === 'negated', attribution: claim.subject.scope === 'fund-report' ? '报告主体'
+          : claim.subject.scope === 'quoted-other' ? '转述他人观点' : '主体未核实' });
+    }
+    return { claims, coverage: candidate.coverage, sourceObservedAt: candidate.sidecar.source.retrievedAt,
+      modelObservedAt: candidate.sidecar.modelObservation.observation.finishedAt, model: candidate.sidecar.modelObservation.responseModel };
+  }
   const MAX_DATA_BYTES = 80 * 1024 * 1024;
   function safeCompanyPath(path) { return typeof path === 'string' && /^\.\/data\/companies\/[A-Za-z0-9_-]+\.json(?:\.gz)?$/.test(path) ? path : null; }
   function companyPages(manifest, code) { return (manifest?.companyFiles || []).filter(file => file.companyCode === code).slice().sort((a, b) => (a.partIndex || 1) - (b.partIndex || 1)); }
@@ -574,6 +601,7 @@
     }
     function clearQuarterData() {
       win.RecordAnalysis?.reset();
+      win.RecordPriceRepresentations?.reset();
       state.request++; state.companyRequest++; state.directoryRequest++;
       state.data = null; state.manifest = null; state.catalog = null; state.progress = null;
       state.companyCode = ''; state.pageIndex = 0; state.loadingCompany = false;
@@ -980,6 +1008,20 @@
         strategy.append(el('p', 'narrative-note', '以上为报告原文摘录与规则主题归类；不把报告层面的观点自动解释为单只证券的交易动机。'));
         body.append(strategy);
       }
+      const interpreted = modelStrategyEvidence(evidence);
+      if (interpreted) {
+        const section = el('section', 'narrative strategy-evidence');
+        section.append(el('h4', '', '季报观点解读'), el('p', 'narrative-meta',
+          `${interpreted.model} · 原章节 ${interpreted.coverage.sentenceCount} 句 · 已解读 ${interpreted.coverage.interpreted} 句 · 待判断 ${interpreted.coverage.unknown} 句 · 展示 ${interpreted.claims.length} 条有原文支持的表述`));
+        for (const claim of interpreted.claims) {
+          section.append(el('p', 'narrative-meta', `${claim.kind} · ${claim.time} · ${claim.attribution}${claim.negated ? ' · 含否定' : ''}${claim.conditional ? ' · 须结合原文条件' : ''}`));
+          section.append(el('p', 'narrative-text', claim.text));
+          addLink(section, `原报告第 ${claim.pages.join('、')} 页 ↗`, `${claim.sourceUrl}#page=${claim.pages[0]}`);
+        }
+        section.append(el('p', 'narrative-meta', `报告复核 ${interpreted.sourceObservedAt} · 模型解读 ${interpreted.modelObservedAt}`),
+          el('p', 'narrative-note', '模型解读已核对原文字面证据，判断仍需结合完整报告；报告观点不等同于经理个人发言，也不证明单只股票的调仓原因。'));
+        body.append(section);
+      }
       card.append(body); return card;
     }
 
@@ -1093,6 +1135,7 @@
       const request = ++state.request;
       const period = state.period;
       win.RecordAnalysis?.loadQuarter(period);
+      win.RecordPriceRepresentations?.loadQuarter(period);
       loadDirectory();
       const controller = new win.AbortController();
       const timer = win.setTimeout(() => controller.abort(), 20000);
@@ -1174,5 +1217,5 @@
   }
 
   return { validateDataset, validateCatalog, validateProgress, validatePeriods, selectQuarter, periodDataPath, validatePeriodDataset, responseText, researchOverview, notApplicableBreakdown, retryState, formatRetryAt, fundQuality, catalogComplete, catalogFreshness, companyDirectoryLabel, safeCompanyPath, companyPages, companyRecordSummaries, catalogIndex, companyCoverage, coverageOverview, safeHttpUrl, validEmptyStockEvidence, managerNames, managerAttributionLabel, managerTermLabel, reportPeriod, changeGroup, latestFunds, filterFunds,
-    strategyEvidence, universeDescription, formatNumber, formatMoney, signed, holdingValue, priceDescription, priceConflictSources, csvCell, exportCsv, observationState, mount };
+    strategyEvidence, modelStrategyEvidence, universeDescription, formatNumber, formatMoney, signed, holdingValue, priceDescription, priceConflictSources, csvCell, exportCsv, observationState, mount };
 });

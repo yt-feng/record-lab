@@ -1,0 +1,117 @@
+name: Enrich one source-bound strategy
+on:
+  workflow_dispatch:
+    inputs:
+      quarter:
+        description: Report quarter
+        required: true
+        default: 2026Q3
+        type: choice
+        options: [2026Q2, 2026Q3]
+      fund_code:
+        description: Optional code; blank selects one eligible portfolio without prior model history
+        required: false
+        default: ''
+        type: string
+      max_attempts:
+        description: Total preserved model-attempt ceiling for this product
+        required: true
+        default: '1'
+        type: string
+concurrency:
+  group: published-records
+  cancel-in-progress: false
+permissions:
+  contents: write
+  actions: read
+  pages: write
+  id-token: write
+env:
+  NODE_OPTIONS: --max-old-space-size=5120
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      has_work: ${{ steps.plan.outputs.has_work }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Validate synthetic production lane
+        run: |
+          node --test tests/test_strategy_semantic_pipeline.js tests/test_strategy_semantic_production.js
+          python -m unittest discover -s tests -p test_produce_strategy_semantics.py
+      - name: Prepare exactly one product and preserve its existing attempt history
+        id: plan
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          SEMANTIC_QUARTER: ${{ inputs.quarter }}
+          SEMANTIC_CODE: ${{ inputs.fund_code }}
+          SEMANTIC_MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+        run: node scripts/strategy-semantic-production.js prepare
+      - name: Scan and persist reservation before any source or model request
+        if: steps.plan.outputs.has_work == 'true'
+        run: |
+          python scripts/publication_guard.py --root .
+          python scripts/persist-observations.py
+      - name: Parse original PDF and perform at most one explicit model request
+        if: steps.plan.outputs.has_work == 'true'
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: python scripts/produce_strategy_semantics.py
+      - name: Independently admit the candidate and finalize its attempt ledger
+        if: steps.plan.outputs.has_work == 'true'
+        run: node scripts/strategy-semantic-production.js finish
+      - name: Rebuild target-quarter cross-portfolio analysis
+        if: steps.plan.outputs.has_work == 'true'
+        env:
+          SEMANTIC_QUARTER: ${{ inputs.quarter }}
+        run: node scripts/analyze-data.js --data "web/data/periods/$SEMANTIC_QUARTER"
+      - name: Scan and persist actual bounded results
+        if: steps.plan.outputs.has_work == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/publication_guard.py --root . --history
+          python scripts/persist-observations.py
+          node scripts/strategy-semantic-production.js readback
+      - name: Prepare public site from persisted records
+        if: steps.plan.outputs.has_work == 'true'
+        run: python scripts/prepare-site.py
+      - uses: actions/configure-pages@v5
+        if: steps.plan.outputs.has_work == 'true'
+      - uses: actions/upload-pages-artifact@v4
+        if: steps.plan.outputs.has_work == 'true'
+        with:
+          path: .cache/site
+      - name: Retain bounded result and independent producer receipt
+        if: always() && steps.plan.outputs.has_work == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: semantic-production-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .cache/semantic-production/result.json
+            .cache/semantic-production/receipt.json
+            .cache/semantic-production/summary.json
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+  deploy:
+    needs: enrich
+    if: needs.enrich.result == 'success' && needs.enrich.outputs.has_work == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment
