@@ -66,20 +66,20 @@ jobs:
           path: .cache/plan/
           include-hidden-files: true
           if-no-files-found: error
-          retention-days: 2
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         with:
           name: campaign
           path: .cache/campaign/
           include-hidden-files: true
           if-no-files-found: error
-          retention-days: 2
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         with:
           name: directory
           path: web/data/catalog.json
           if-no-files-found: error
-          retention-days: 2
+          retention-days: 14
   batch:
     needs: plan
     if: needs.plan.outputs.has_work == 'true'
@@ -172,7 +172,7 @@ jobs:
             web/data/part.json
             web/data/status.json
           if-no-files-found: error
-          retention-days: 2
+          retention-days: 14
       - name: Preserve technical failure status
         if: always()
         env:
@@ -198,9 +198,9 @@ jobs:
       group: published-records
       cancel-in-progress: false
     runs-on: ubuntu-latest
-    # Merge both quarters and allow a full history scan if no verified proof
-    # exists yet; subsequent unchanged scanner runs can reuse the proof.
-    timeout-minutes: 60
+    # A measured two-quarter merge exceeded 60 minutes before publication.
+    # Include analysis, history validation and deployment in this bound.
+    timeout-minutes: 180
     permissions:
       contents: write
       pages: write

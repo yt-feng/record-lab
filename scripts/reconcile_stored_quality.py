@@ -38,11 +38,32 @@ def fund_map(value):
 
 
 def protected_fund(value):
-    result = copy.deepcopy(value)
+    # Exclude derived proofs before copying: stored price references can be
+    # large, and none of those discarded values participates in this check.
+    result = dict(value)
     for lane, fields in (('quality', QUALITY), ('enrichment', ENRICHMENT)):
         if isinstance(result.get(lane), dict):
-            for field in fields: result[lane].pop(field, None)
-    return result
+            result[lane] = {key: item for key, item in result[lane].items() if key not in fields}
+    return copy.deepcopy(result)
+
+
+def audit_states(rows, runtime_descriptors=None):
+    """Restore transient task inputs only in the read-only runtime audit view."""
+    states = fund_map(rows)
+    if runtime_descriptors is not None and (not isinstance(runtime_descriptors, dict)
+            or set(runtime_descriptors) != set(states)):
+        fail('QUALITY_AUDIT_DESCRIPTORS_INVALID')
+    for code, row in states.items():
+        missing = traversal.missing_stock_objects(row.get('enrichment'))
+        if missing is None:
+            fail('QUALITY_COMPACT_STOCKS_INVALID')
+        descriptors = runtime_descriptors[code] if runtime_descriptors is not None else {}
+        if not isinstance(descriptors, dict) or set(descriptors) - {'reportLocator', 'strategyClaimsTask'}:
+            fail('QUALITY_AUDIT_DESCRIPTORS_INVALID')
+        states[code] = {**row, 'enrichment': {**row['enrichment'], 'missingStocks': missing},
+                       'reportLocator': descriptors.get('reportLocator'),
+                       'strategyClaimsTask': descriptors.get('strategyClaimsTask')}
+    return states
 
 
 def update_existing(target, generated):
@@ -70,7 +91,9 @@ def reconcile(catalog, previous, config, retained, audit, *, now=None):
     # Collector upgrades are separate collection events, never a side effect of
     # a stored-data reclassification. All retry clocks are pinned below too.
     scoped = {**config, 'collectorVersion': traversal.collector_version(previous)}
-    generated = traversal.merge_progress(catalog, copy.deepcopy(previous), scoped, statuses=(), now=current, retained=retained)
+    descriptors = {}
+    generated = traversal.merge_progress(catalog, copy.deepcopy(previous), scoped, statuses=(), now=current,
+                                         retained=retained, runtime_descriptors=descriptors)
     fresh = fund_map(generated.get('funds'))
     if set(old) != set(fresh): fail('QUALITY_DIRECTORY_CHANGED')
     result = copy.deepcopy(previous)
@@ -79,7 +102,8 @@ def reconcile(catalog, previous, config, retained, audit, *, now=None):
         before, candidate = old[row['code']], fresh[row['code']]
         if any(before.get(key) != candidate.get(key) for key in SOURCE_IDENTITY):
             fail('QUALITY_SOURCE_STATE_CHANGED')
-        if encoded(protected_fund(before)) != encoded(protected_fund(candidate)):
+        protected_before = encoded(protected_fund(before))
+        if protected_before != encoded(protected_fund(candidate)):
             preserved += 1
         for lane, fields in (('quality', QUALITY), ('enrichment', ENRICHMENT)):
             if not isinstance(before.get(lane), dict) or not isinstance(candidate.get(lane), dict):
@@ -99,7 +123,7 @@ def reconcile(catalog, previous, config, retained, audit, *, now=None):
         normalized_enrichment = traversal.normalize_enrichment(row['enrichment'], row['status'], current)
         for key in ('status', 'errorCode'):
             row['enrichment'][key] = normalized_enrichment[key]
-        if encoded(protected_fund(row)) != encoded(protected_fund(before)):
+        if encoded(protected_fund(row)) != protected_before:
             fail('QUALITY_HISTORY_CHANGED')
         changed += row != before
 
@@ -138,7 +162,7 @@ def reconcile(catalog, previous, config, retained, audit, *, now=None):
     # must not remain in the compact audit as an executable price task.
     completion = copy.deepcopy(previous.get('completionAudit', {}))
     if not isinstance(completion, dict): fail('QUALITY_AUDIT_INVALID')
-    rebuilt_audit = traversal.completion_audit(fund_map(rows), scoped, current,
+    rebuilt_audit = traversal.completion_audit(audit_states(rows, descriptors), scoped, current,
         completion.get('directoryPending', generated['completionAudit']['directoryPending']),
         previous.get('quarterUniverse') or generated['quarterUniverse'])
     original_as_of = completion.get('asOf')
@@ -189,6 +213,15 @@ def prepare_quarter(root, quarter, *, now=None):
     config = {**base, 'funds': [], 'targetPeriodEnd': target, 'baselinePeriodEnd': baseline,
         'requireReportQuality': previous.get('research', {}).get('enabled') is True,
         'requireHistoricalUniverse': previous.get('quarterUniverse', {}).get('required') is True}
+    if config.get('reportLocatorEnabled') is True:
+        from report_locators import read_registry, registry_locators
+        locator_file = folder / 'report-locators.json'
+        if not locator_file.exists() and previous.get('reportLocators', {}).get('readyFunds', 0):
+            fail('QUALITY_LOCATOR_REGISTRY_MISSING')
+        clock = traversal.instant(previous.get('updatedAt')) if now is None else traversal.utc_now(now)
+        registry = read_registry(locator_file, quarter, now=clock)
+        _, catalog_funds = traversal.catalog_records(catalog)
+        config['reportLocatorCandidates'] = registry_locators(registry, catalog_funds, now=clock)
     result, updated_audit, summary = reconcile(catalog, previous, config,
         traversal.load_retained_funds(folder), audit, now=now)
     outputs = []

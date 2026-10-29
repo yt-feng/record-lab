@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -66,6 +67,18 @@ class TraversalError(Exception):
     def __init__(self, code):
         self.code = code if code in COMMAND_ERRORS else "TRAVERSAL_FAILED"
         super().__init__(self.code)
+
+
+class JsonReadError(TraversalError):
+    """Fixed input categories only; paths and exception messages stay private."""
+    def __init__(self, path, reason, byte_length, maximum):
+        super().__init__("READ_FAILED")
+        name = Path(path).name
+        kinds = {"progress.json": "progress", "merge-receipt.json": "merge-receipt",
+                 "status.json": "batch-status", "latest.json": "manifest", "catalog.json": "catalog"}
+        kind = kinds.get(name, "company-page" if Path(path).parent.name == "companies" else "other")
+        self.diagnostic = {"inputKind": kind, "reason": reason,
+                           "byteLength": byte_length, "maxBytes": maximum}
 
 
 class StatusSnapshotError(TraversalError):
@@ -1954,7 +1967,9 @@ def reconcile_observations(statuses, receipt, config, now=None):
     return reconciled
 
 
-def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()):
+def merge_progress(catalog, previous, config, statuses=(), now=None, retained=(), *, runtime_descriptors=None):
+    if runtime_descriptors is not None and not isinstance(runtime_descriptors, dict):
+        raise TraversalError("INVALID_ARGUMENTS")
     current = utc_now(now)
     phase = phase_for(config)
     companies, records, states = base_states(catalog, previous, phase, current, config)
@@ -2259,6 +2274,13 @@ def merge_progress(catalog, previous, config, statuses=(), now=None, retained=()
     completed = audit["complete"]
     directory_retry = midnight(current.date() + dt.timedelta(days=1)) if directory_incomplete(companies, records) and passes < 12 else None
     next_retry = min((value for value in [directory_retry, *(state.get("nextRetryAt") for state in all_states)] if value), default=None)
+    if runtime_descriptors is not None:
+        # Quality-only reconciliation needs these hydrated task descriptors to
+        # recompute work eligibility. They are not observations or retry ledgers
+        # and never belong in the serialized public progress checkpoint.
+        runtime_descriptors.clear()
+        runtime_descriptors.update({state['code']: copy.deepcopy({
+            key: state.get(key) for key in ('reportLocator', 'strategyClaimsTask')}) for state in all_states})
     return {"schemaVersion": 1, "phase": phase, "updatedAt": current.isoformat(), "collectorVersion": collector_version(config),
             "totalCompanies": len(companies), "totalFunds": len(records), "processedFunds": processed,
             "attemptedFunds": sum(state["attempted"] for state in all_states),
@@ -2308,15 +2330,37 @@ def read_json(path, optional=False):
     path = Path(path)
     if optional and not path.exists():
         return None
+    # Keep the publication bounds: only progress checkpoints have a larger
+    # allowance. A missing input must not be mistaken for an oversized receipt.
+    maximum = 96_000_000 if path.name == "progress.json" else 25_000_000
+    byte_length = None
     try:
-        # Coverage contains one small record per directory code; bounded company
-        # snapshots retain their smaller limit instead of lifting every read.
-        maximum = 96_000_000 if path.name == "progress.json" else 25_000_000
-        if path.is_symlink() or path.stat().st_size > maximum:
-            raise ValueError("bounded-read")
-        return json.loads(path.read_text(encoding="utf-8"))
+        before = path.lstat()
+        byte_length = before.st_size
+        if not stat.S_ISREG(before.st_mode):
+            raise JsonReadError(path, "not-regular", byte_length, maximum)
+        if byte_length > maximum:
+            raise JsonReadError(path, "too-large", byte_length, maximum)
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(descriptor, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode) or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                raise JsonReadError(path, "changed-input", byte_length, maximum)
+            if opened.st_size > maximum:
+                raise JsonReadError(path, "too-large", opened.st_size, maximum)
+            payload = handle.read(maximum + 1)
+        byte_length = len(payload)
+        if byte_length > maximum:
+            raise JsonReadError(path, "too-large", byte_length, maximum)
+        return json.loads(payload.decode("utf-8"))
+    except JsonReadError:
+        raise
+    except FileNotFoundError:
+        raise JsonReadError(path, "missing", byte_length, maximum) from None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise JsonReadError(path, "invalid-json", byte_length, maximum) from None
     except Exception:
-        raise TraversalError("READ_FAILED") from None
+        raise JsonReadError(path, "io-error", byte_length, maximum) from None
 
 
 def read_status_snapshot(path, config):
@@ -2503,5 +2547,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        print(json.dumps({"status": "failed", "errorCode": error.code if isinstance(error, TraversalError) else "TRAVERSAL_FAILED"}))
+        print(json.dumps({"status": "failed", "errorCode": error.code if isinstance(error, TraversalError) else "TRAVERSAL_FAILED",
+                          **({"readDiagnostic": error.diagnostic} if isinstance(error, JsonReadError) else {})}))
         raise SystemExit(1) from None

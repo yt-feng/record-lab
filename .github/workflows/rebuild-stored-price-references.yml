@@ -14,7 +14,7 @@ env:
 jobs:
   rebuild:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

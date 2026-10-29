@@ -101,6 +101,106 @@ class ReconcileStoredQualityTests(unittest.TestCase):
         again, again_audit, _ = reconcile.reconcile(catalog, result, config, [fund], result_audit)
         self.assertEqual(again, result); self.assertEqual(again_audit, result_audit)
 
+    def test_compact_price_only_gap_builds_audit_without_persisting_runtime_fields(self):
+        catalog, previous, config, fund, audit = self.sample()
+        state = previous['funds'][0]
+        state['quality'].update(fields={key: 'missing' if key == 'prices' else 'complete'
+                                       for key in traversal.QUALITY_FIELDS},
+                                attempts=0, status='pending', missingFields=['prices'],
+                                priceConflictOnly=False)
+        stock = fund['rows'][0]
+        state['enrichment'].update(attempts=0, status='pending', holdingCount=1,
+                                   priceAvailable=0, priceComplete=0, priceConflicted=0,
+                                   conflictingStocks=[], referenceResolutions=[],
+                                   missingStockKeys=[traversal.stock_key(stock)])
+        state['enrichment'].pop('missingStocks', None)
+        before = copy.deepcopy((previous, audit))
+        # No source observations are supplied. This exercises the compact
+        # checkpoint with a price-only task that enters eligible_work's branch.
+        result, result_audit, _ = reconcile.reconcile(catalog, previous, config, [], audit)
+        work = result['completionAudit']['work']
+        self.assertEqual(work['priceRepairTasks'], 1)
+        self.assertEqual(work['reportRepairTasks'], 0)
+        after = result['funds'][0]
+        self.assertNotIn('missingStocks', after['enrichment'])
+        self.assertEqual(after['enrichment']['missingStockKeys'], state['enrichment']['missingStockKeys'])
+        self.assertEqual(reconcile.protected_fund(after), reconcile.protected_fund(state))
+        for key in ('updatedAt', 'continuationHold', 'marketAccounting', 'continueRun', 'nextRetryAt'):
+            self.assertEqual(result[key], previous[key])
+            self.assertEqual(result_audit[key], audit[key])
+        self.assertFalse(result['completionAudit']['complete'])
+        self.assertEqual((previous, audit), before)
+        again, again_audit, _ = reconcile.reconcile(catalog, result, config, [], result_audit)
+        self.assertEqual(again, result); self.assertEqual(again_audit, result_audit)
+
+    def test_audit_expansion_rejects_inconsistent_compact_stock_targets(self):
+        row = {'code': '000001', 'enrichment': {'missingStockKeys': ['CN:600519'],
+                                              'missingStocks': []}}
+        with self.assertRaisesRegex(ValueError, '^QUALITY_COMPACT_STOCKS_INVALID$'):
+            reconcile.audit_states([row])
+
+    @staticmethod
+    def audit_for(previous):
+        return {key: copy.deepcopy(previous[key]) for key in
+                ('phase', 'updatedAt', 'research', 'completionAudit', 'completionStatus', 'continueRun')}
+
+    def test_strategy_task_survives_audit_projection_without_becoming_a_stored_descriptor(self):
+        import test_strategy_claim_queue as claims
+        for blocked in (False, True):
+            previous = claims.progress()
+            previous['funds'][0]['strategyClaimsHistoryBlocked'] = blocked
+            audit = self.audit_for(previous)
+            original = copy.deepcopy(previous)
+            retained = iter([claims.fund()])
+            result, _, _ = reconcile.reconcile(claims.CATALOG, previous, claims.CONFIG, retained, audit)
+            self.assertEqual(result['completionAudit']['work']['strategyClaimsTasks'], 0 if blocked else 1)
+            self.assertNotIn('strategyClaimsTask', result['funds'][0])
+            self.assertEqual(reconcile.protected_fund(result['funds'][0]),
+                             reconcile.protected_fund(previous['funds'][0]))
+            self.assertEqual(previous, original)
+
+    def test_locator_task_survives_audit_projection_with_original_exhausted_source_budget(self):
+        import test_report_locator_queue as locators
+        config = locators.config()
+        previous = locators.exhausted(config)
+        audit = self.audit_for(previous)
+        result, _, _ = reconcile.reconcile(locators.CATALOG, previous, config, [], audit)
+        self.assertEqual(result['completionAudit']['work']['reportLocatorTasks'], 1)
+        self.assertEqual(result['completionAudit']['work']['sourceRetryTasks'], 0)
+        self.assertNotIn('reportLocator', result['funds'][0])
+        self.assertEqual(result['funds'][0]['attempts'], 2)
+        self.assertEqual(reconcile.protected_fund(result['funds'][0]),
+                         reconcile.protected_fund(previous['funds'][0]))
+
+    def test_manifest_preparation_reloads_only_the_retained_quarter_locator_registry(self):
+        import test_report_locator_queue as locators
+        from report_locators import empty_registry
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / 'web/data/periods/2026Q3'
+            folder.mkdir(parents=True); (root / 'config').mkdir()
+            config = locators.config()
+            previous = locators.exhausted(config)
+            registry = empty_registry('2026Q3')
+            registry.update(records=config['reportLocatorCandidates']['000001']['candidates'],
+                            asOf='2026-10-26', lastAttemptAt=locators.NOW, refreshStatus='current')
+            documents = {'catalog.json': locators.CATALOG, 'progress.json': previous,
+                         'audit.json': self.audit_for(previous), 'report-locators.json': registry,
+                         'latest.json': {'schemaVersion': 1, **locators.PHASE, 'funds': [], 'companyFiles': []}}
+            for name, document in documents.items():
+                (folder / name).write_text(json.dumps(document))
+            (root / 'config/universe.json').write_text(json.dumps({'reportLocatorEnabled': True}))
+            before = (folder / 'report-locators.json').read_bytes()
+            outputs, _ = reconcile.prepare_quarter(root, '2026Q3')
+            produced = {file.name: json.loads(raw) for file, raw in outputs}
+            progress = produced.get('progress.json', previous)
+            self.assertEqual(progress['completionAudit']['work']['reportLocatorTasks'], 1)
+            self.assertNotIn('reportLocator', progress['funds'][0])
+            self.assertEqual((folder / 'report-locators.json').read_bytes(), before)
+            (folder / 'report-locators.json').unlink()
+            with self.assertRaisesRegex(ValueError, '^QUALITY_LOCATOR_REGISTRY_MISSING$'):
+                reconcile.prepare_quarter(root, '2026Q3')
+
     def test_newer_stored_strategy_evidence_uses_validation_clock_without_redating_progress(self):
         from test_traversal import TraversalTests
         catalog, previous, config, fund, audit = self.sample()
