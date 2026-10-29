@@ -21,7 +21,7 @@ from report_period import document_periods, has_period_reference
 _CJK = r"\u3400-\u9fff"
 _DATE = r"(?:\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日|\d{4}\s*[-/.]\s*\d{1,2}\s*[-/.]\s*\d{1,2})"
 _TITLE = re.compile(
-    r"(?m)^\s*(?P<section>4\s*\.\s*1(?:\s*\.\s*2)?)\s*"
+    r"(?m)^\s*(?P<section>(?:4\s*\.\s*1(?:\s*\.\s*2)?|7\s*\.\s*1\s*\.\s*2))\s*"
     r"基金经理\s*(?:[（(]\s*或\s*基金经理小组\s*[）)])?\s*"
     r"(?:及\s*基金经理助理\s*)?简\s*介[^\n]*"
 )
@@ -33,6 +33,8 @@ _ROW = re.compile(
     r"(?=\s|$)"
 )
 _HEADERS = ("姓名", "职务", "任职日期", "离任日期", "证券从业")
+_REIT_HEADERS = ("姓名", "职务", "任职日期", "离任日期")
+_REIT_EXPERIENCE = re.compile(r"不\s*动\s*产\s*项\s*目\s*运\s*营\s*或\s*投\s*资\s*管\s*理\s*(?:年限\s*/\s*经验|年限|经验)(?!年限)")
 _BIOGRAPHY_WORDS = ("曾", "历任", "担任", "毕业", "加入", "学历", "学位", "硕士", "博士", "学士", "就职", "从事")
 _METHOD = "explicit-report-manager-table"
 _MAX_TABLE_PAGES = 6
@@ -42,7 +44,7 @@ _CANDIDATE = re.compile(
     rf"(?m)^[ \t]*(?!姓名\s|任职日期\s|离任日期\s|证券从业)(?P<name>[{_CJK}]{{1,16}}(?:[·•][{_CJK}]{{1,16}})?|[A-Za-z][A-Za-z .'-]{{1,60}})\s+"
     rf"(?P<role>[^\d\n]{{1,90}}(?:\n(?!\s*(?:[{_CJK}]{{1,16}}|[A-Za-z][A-Za-z .'-]{{1,60}})\s+(?:本基金|基金经理))[^\d\n]{{1,90}}){{0,3}})"
 )
-_SECTION_STOP = re.compile(r"(?m)^\s*(?P<section>4\s*\.\s*[1-9](?:\s*\.\s*[1-9])?|[5-9](?:\s*\.\s*\d+)?(?=\s+(?:投资组合|报告期|基金|期末|备查|资产|管理人)))\s+[^\n]*")
+_SECTION_STOP = re.compile(r"(?m)^\s*(?P<section>4\s*\.\s*[1-9](?:\s*\.\s*[1-9])?|[5-9](?:\s*\.\s*\d+){0,2}(?=\s+(?:投资组合|报告期|基金|期末|备查|资产|管理人)))\s+[^\n]*")
 _COUNT_FIELDS = ("candidateRows", "parsedRows", "ignoredKnownRoleRows", "excludedRows", "outsidePeriodRows", "duplicateRows")
 
 
@@ -103,7 +105,7 @@ def normalize_manager_table_coverage(raw, managers=None, period_end=None):
         return None
     cleaned, table_complete = [], []
     for table in tables:
-        if (not isinstance(table, Mapping) or not re.fullmatch(r"4\.1(?:\.2)?", str(table.get("section", "")))
+        if (not isinstance(table, Mapping) or not re.fullmatch(r"(?:4\.1(?:\.2)?|7\.1\.2)", str(table.get("section", "")))
                 or any(type(table.get(key)) is not int or not 0 <= table[key] <= 10000 for key in _COUNT_FIELDS)):
             return None
         section, following = table["section"], table.get("endSection")
@@ -288,10 +290,18 @@ def parse_report_managers(
             body = scope[:note.start()] if note else scope
             header_matches = [re.search(r"\s*".join(re.escape(char) for char in header), body[:1200])
                               for header in _HEADERS]
+            reit_header_matches = [re.search(r"\s*".join(re.escape(char) for char in header), body[:1200])
+                                   for header in _REIT_HEADERS]
+            reit_experience = _REIT_EXPERIENCE.search(body[:1600])
             tenure_header = re.search(r"任\s*本\s*基\s*金\s*的\s*基\s*金\s*经\s*理\s*(?:[（(]\s*助\s*理\s*[）)]\s*)?期\s*限", body[:1200])
-            if not all(header_matches) or not tenure_header:
+            standard_headers = all(header_matches) and bool(tenure_header)
+            reit_headers = section == '7.1.2' and all(reit_header_matches) and bool(reit_experience)
+            if not all(header_matches) and not reit_headers:
                 continue
-            header_end = max(match.end() for match in [*header_matches, tenure_header])
+            if not reit_headers and not tenure_header:
+                continue
+            header_end = max(match.end() for match in ([*header_matches, tenure_header] if standard_headers
+                                                        else [*reit_header_matches, reit_experience]))
             offsets = []
             offset = 0
             for index, fragment in enumerate(fragments):

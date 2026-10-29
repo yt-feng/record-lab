@@ -22,6 +22,11 @@ METHOD = 'pdf-clipping-manager-table'
 EMPTY_HASH = hashlib.sha256(b'').hexdigest()
 
 
+def _reit_experience_label(value):
+    """Recognize only observed REIT experience-column labels."""
+    return bool(re.fullmatch(r'不动产项目运营或投资管理(?:年限|经验|年限/经验)', compact(value)))
+
+
 def digest(value):
     return hashlib.sha256(compact(value).encode()).hexdigest()
 
@@ -53,7 +58,8 @@ def _unique_cell(matches):
 def _header(page):
     labels = {'name': lambda x: x == '姓名', 'role': lambda x: x == '职务',
               'start': lambda x: x == '任职日期', 'end': lambda x: x == '离任日期',
-              'experience': lambda x: x.startswith('证券从业') and '年限' in x,
+              'experience': lambda x: (x.startswith('证券从业') and '年限' in x)
+                  or _reit_experience_label(x),
               'description': lambda x: x == '说明'}
     for anchor in page.cells:
         if compact(anchor.text) != '姓名': continue
@@ -288,7 +294,8 @@ def normalize_geometry_evidence(raw, coverage):
         for field in FIELDS:
             text = header['cellText'][field]; bounds = header['cells'][field]
             if not isinstance(text, str) or len(text) > 30 or digest(text) != header['cellTextHashes'][field]: return None
-            if field in labels and text != labels[field] or field == 'experience' and not (text.startswith('证券从业') and '年限' in text): return None
+            if field in labels and text != labels[field] or field == 'experience' and not ((text.startswith('证券从业') and '年限' in text)
+                    or _reit_experience_label(text)): return None
             if not isinstance(bounds, list) or len(bounds) != 4 or any(type(n) not in (int, float) or not math.isfinite(n) for n in bounds) or bounds[0] >= bounds[2] or bounds[1] >= bounds[3]: return None
             if abs(bounds[0] - columns[field][0]) > TOLERANCE or abs(bounds[2] - columns[field][1]) > TOLERANCE: return None
         header_name = header['cells']['name']

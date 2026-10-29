@@ -137,6 +137,19 @@ class ReportManagerTests(unittest.TestCase):
         self.assertEqual(parse_report_managers([header + "张明 本基金基金经理 2020-01-01 2026-02-01 20年"],
                          {**report, "kind": "semiannual"})[0]["periodStart"], "2026-01-01")
 
+    def test_reit_manager_header_uses_real_estate_experience_column(self):
+        report = {"sourceUrl": "https://example.org/reit.pdf", "periodEnd": "2026-06-30",
+                  "kind": "semiannual", "publishedAt": "2026-08-28"}
+        text = ('中金基础设施基金 2026年中期报告\n'
+                '7.1.2 基金经理（或基金经理小组）简介\n'
+                '姓名 职务 任职期限 不动产项目运营或投资管理年限/经验 说明 任职日期 离任日期\n'
+                '张明 本基金的基金经理 2023年10月16日 - 5年 合成说明\n'
+                '7.1.3 报告期末兼任私募资产管理计划投资经理的不动产基金经理同时管理的产品情况')
+        result = parse_report_managers([text], report)
+        self.assertEqual([(row['name'], row['startDate'], row['periodStart']) for row in result],
+                         [('张明', '2023-10-16', '2026-01-01')])
+        self.assertTrue(result.coverage['complete'])
+
     def test_markdown_and_html_rows_keep_same_contract(self):
         markdown = "## 4.1 基金经理（或基金经理小组）简介\n|姓名|职务|任本基金的基金经理期限|证券从业年限|说明|\n|任职日期|离任日期|\n|张明|本基金基金经理|2020年1月1日|-|20年|合成履历|"
         html_table = "<h3>4.1 基金经理（或基金经理小组）简介</h3>\n<table><tr><th>姓名</th><th>职务</th><th>任本基金的基金经理期限</th><th>证券从业年限</th></tr><tr><th>任职日期</th><th>离任日期</th></tr><tr><td>张明</td><td>本基金基金经理</td><td>2020年1月1日</td><td>-</td><td>20年</td></tr></table>"
