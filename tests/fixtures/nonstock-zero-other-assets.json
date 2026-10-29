@@ -1,0 +1,23 @@
+{
+  "description": "Bounded public source excerpts; report-period label and following headings are retained as a parser fixture, not complete PDF pages.",
+  "report": {
+    "sourceUrl": "https://pdf.dfcfw.com/pdf/H2_AN202607211827189276_1.pdf",
+    "periodEnd": "2026-06-30",
+    "publishedAt": "2026-07-21",
+    "kind": "quarterly"
+  },
+  "sourceObservation": {
+    "runId": "40796236742",
+    "pdfSha256": "d2275d91b087875fbaf3c6cdd78fc142cf5a4736a9d6e1e29d0ca99c483756b1",
+    "sourceTextHash": "30c1af787ee5cd6d78ba4fb2a16ce115920809fa6963d8eb1693456615f445d8",
+    "observedAt": "2026-10-29T00:48:25.727404+00:00"
+  },
+  "pageNumbers": [
+    9,
+    12
+  ],
+  "pages": [
+    "2026年第2季度报告\n5.1 报告期末基金资产组合情况\n序号  项目  金额（元）  占基金总资产的比例（%）\n1  固定收益投资  6,917,853,276.51  57.46\n其中：债券  6,917,853,276.51  57.46\n资产支持证券  -  -\n2  买入返售金融资产  3,220,521,256.84  26.75\n其中： 买断式回购的买入返售金融资产  -  -\n3  银 行存 款和结 算备付金合计  1,901,396,038.79  15.79\n4  其他资产  -  -\n5  合计  12,039,770,572.14  100.00\n5.2 报告期债券回购融资情况",
+    "2026年第2季度报告\n5.9.3 其他资产构成\n本基金本报告期末未持有其他资产。\n5.9.4 投资组合报告附注的其他文字描述部分"
+  ]
+}

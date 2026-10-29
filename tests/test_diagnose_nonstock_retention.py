@@ -44,7 +44,7 @@ def anchors():
 
 
 class NonstockRetentionTests(unittest.TestCase):
-    def test_real_collector_and_builder_expose_proof_loss_without_source_transplant(self):
+    def test_real_collector_and_builder_retain_quarter_proof_without_source_transplant(self):
         sample = diag.SAMPLES[0]
         observed = anchors()[sample['code']]
         before = copy.deepcopy(observed)
@@ -54,10 +54,13 @@ class NonstockRetentionTests(unittest.TestCase):
         self.assertEqual(direct['fundStatus'], 'no-equities')
         self.assertTrue(direct['selectedReport']['noEquitiesEvidence']['sourceMatchesDocument'])
         self.assertEqual(direct['selectedReport']['sourceUrl'], sample['sourceUrl'])
-        self.assertNotEqual(mixed['fundStatus'], 'no-equities')
-        self.assertEqual(mixed['selectedReport']['sourceUrl'], sample['interimUrl'])
+        self.assertEqual(mixed['fundStatus'], 'no-equities')
+        self.assertEqual(mixed['selectedReport']['sourceUrl'], sample['sourceUrl'])
         self.assertEqual(mixed['selectedReport']['reportPdfSourceUrl'], sample['sourceUrl'])
-        self.assertFalse(mixed['selectedReport']['noEquitiesEvidence']['present'])
+        self.assertTrue(mixed['selectedReport']['noEquitiesEvidence']['sourceMatchesDocument'])
+        self.assertEqual(len(mixed['collectorReports']), 2)
+        self.assertEqual(mixed['collectorReports'][0]['sourceUrl'], sample['interimUrl'])
+        self.assertFalse(mixed['collectorReports'][0]['noEquitiesEvidence']['present'])
         self.assertIn('HOLDINGS_UNRESOLVED', mixed['collectorErrorCodes'])
         self.assertEqual(mixed['detailsReadOrder'], [sample['interimUrl'], sample['sourceUrl']])
         self.assertFalse(mixed['independentInterimReparse'])
@@ -100,7 +103,7 @@ class NonstockRetentionTests(unittest.TestCase):
         self.assertEqual(result['marketRequests'], 0)
         self.assertEqual(result['modelRequests'], 0)
         for row in result['results']:
-            self.assertEqual(row['classification'], 'QUARTER_PROOF_DROPPED_BY_COLLECT')
+            self.assertEqual(row['classification'], 'QUARTER_PROOF_RETAINED_SEPARATELY')
             self.assertFalse(row['quarterDetails']['identityVerified'])
             self.assertEqual(row['retainedAnchor']['originalEvidenceRetrievedAt'], '2026-10-28T12:34:56.123456Z')
             self.assertEqual(row['retainedAnchor']['quarterPublicationMetadata'],

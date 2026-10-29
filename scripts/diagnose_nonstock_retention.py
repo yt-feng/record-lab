@@ -315,7 +315,11 @@ def run_diagnosis(provider, anchors, *, now=None, extract=extract_quarter):
                     and direct['selectedReport']['sourceUrl'] == sample['sourceUrl']
                     and direct['selectedReport']['kind'] == sample['kind']
                     and not any(r['noEquitiesEvidence']['present'] for r in mixed['collectorReports']))
+            retained = (proof['sourceMatchesDocument'] and mixed['fundStatus'] == 'no-equities'
+                        and mixed['selectedReport']['sourceUrl'] == sample['sourceUrl']
+                        and mixed['selectedReport']['kind'] == sample['kind'])
             item.update(status='diagnosed', classification='QUARTER_PROOF_DROPPED_BY_COLLECT' if drop else
+                'QUARTER_PROOF_RETAINED_SEPARATELY' if retained else
                 'QUARTER_PROOF_UNAVAILABLE' if not proof['present'] else 'REVIEW_RETAINED_PATH',
                 quarterDetails={'noEquitiesEvidence': proof, 'parseMethod': details.get('parseMethod'),
                     'sourceTextHash': details.get('sourceTextHash'), 'pageStats': details.get('pageStats'),

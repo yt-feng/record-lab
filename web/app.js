@@ -934,13 +934,15 @@
         const bookZero = ['zero-stock-balance-sheet', 'exhaustive-nonstock-assets'].includes(evidence?.evidenceType);
         const note = emptyState(bookZero ? '报告期末股票投资账面金额为零' : '报告确认本期期末未持有股票',
           evidence?.evidenceType === 'exhaustive-nonstock-assets'
-            ? '期末资产组合和其他资产明细逐项按分核对至合计，非股票项目解释全部资产；结论仅对应本期期末股票投资账面金额。'
+            ? evidence.otherAssetsStatement
+              ? '期末资产组合逐项按分核对至合计，其他资产金额为零，且原报告明确期末未持有其他资产；结论仅对应本期期末股票投资账面金额。'
+              : '期末资产组合和其他资产明细逐项按分核对至合计，非股票项目解释全部资产；结论仅对应本期期末股票投资账面金额。'
             : evidence?.text || '按报告证据记录本期期末无股票持仓，不按基金类型推断。', true);
         if (evidence?.evidenceType === 'exhaustive-nonstock-assets') {
-          for (const table of [evidence.assetTable, evidence.otherAssetsTable]) {
+          for (const table of [evidence.assetTable, evidence.otherAssetsTable || evidence.otherAssetsStatement]) {
             note.append(el('p', 'narrative-meta', `原 PDF 第 ${table.pageNumbers.join('、')} 页 · ${table.heading}`),
               el('p', 'narrative-text', table.text));
-            addLink(note, '查看原表 ↗', `${evidence.sourceUrl}#page=${table.startPage}`);
+            addLink(note, table.statementType ? '查看原声明 ↗' : '查看原表 ↗', `${evidence.sourceUrl}#page=${table.startPage}`);
           }
         } else if (evidence?.evidenceType === 'empty-stock-detail-section') {
           note.append(el('p', 'narrative-meta', `同一物理页第 ${evidence.page} 页 · 股票明细原文与资产组合表共同核验`),

@@ -599,8 +599,13 @@ function buildSnapshot(raw, { previous = null, config = {}, now = new Date(), pr
     let reason = null;
     if (old?.selectedReport && current.selectedReport.periodEnd < old.selectedReport.periodEnd) reason = 'OLDER_REPORT';
     if (old?.selectedReport && current.selectedReport.periodEnd === old.selectedReport.periodEnd) {
+      const resolvesUnknownHoldings = old.selectedReport.reportOnly === true
+        && old.selectedReport.holdings.length === 0 && old.selectedReport.noEquitiesConfirmed !== true
+        && current.selectedReport.noEquitiesConfirmed === true && current.selectedReport.holdings.length === 0
+        && current.selectedReport.reportOnly !== true;
       if (current.selectedReport.noEquitiesConfirmed !== old.selectedReport.noEquitiesConfirmed
-        && (current.selectedReport.noEquitiesConfirmed || old.selectedReport.noEquitiesConfirmed)) reason = 'CONTRADICTORY_NO_EQUITIES';
+        && (current.selectedReport.noEquitiesConfirmed || old.selectedReport.noEquitiesConfirmed)
+        && !resolvesUnknownHoldings) reason = 'CONTRADICTORY_NO_EQUITIES';
       else if (current.selectedReport.holdings.length < old.selectedReport.holdings.length) reason = 'HOLDING_COVERAGE_REGRESSION';
       else if (old.selectedReport.coverage === 'full' && current.selectedReport.coverage !== 'full') reason = 'REPORT_COVERAGE_REGRESSION';
     }

@@ -1,8 +1,10 @@
-"""Prove zero period-end stock book value from two exhaustive asset tables.
+"""Prove zero stock book value from bounded, exhaustive nonstock asset evidence.
 
 This recognizer does not use fund names, investment mandates, missing stock
 sections, or rounded zero percentages. Unknown rows and unclosed tables fail
-closed. Monetary checks use integer cents; source PDFs stay with the caller.
+closed. Other assets require an exhaustive table or, when the asset table
+shows exactly zero, an explicit closed period-end statement. Monetary checks
+use integer cents; source PDFs stay with the caller.
 """
 from __future__ import annotations
 
@@ -14,6 +16,7 @@ from urllib.parse import urlsplit, parse_qsl
 
 TYPE = "exhaustive-nonstock-assets"
 METHOD = "two-closed-nonstock-asset-tables"
+STATEMENT_METHOD = "closed-nonstock-asset-table-and-zero-other-assets-statement"
 MAX_ASSET_TEXT = 800
 MAX_OTHER_TEXT = 600
 MAX_TABLE_PAGES = 3
@@ -162,7 +165,7 @@ def _same(left, right):
     return left == right
 
 
-def _table(raw, other=False):
+def _bounded_region(raw, other=False):
     if not isinstance(raw, dict) or raw.get("sectionBounded") is not True or raw.get("pageNumbersVerified") is not True:
         return None
     start, end, numbers = raw.get("startPage"), raw.get("endPage"), raw.get("pageNumbers")
@@ -187,9 +190,16 @@ def _table(raw, other=False):
     chapter = other and following == (current[0] + 1,) and closing["number"].startswith("§")
     if not (adjacent or chapter):
         return None
-    result = {"section": section, "endSection": end_section, "heading": heading, "endHeading": ending,
+    return {"section": section, "endSection": end_section, "heading": heading, "endHeading": ending,
               "startPage": start, "endPage": end, "pageNumbers": list(numbers), "sectionBounded": True,
-              "pageNumbersVerified": True, "text": text, "amountUnit": "元"}
+              "pageNumbersVerified": True, "text": text}
+
+
+def _table(raw, other=False):
+    result = _bounded_region(raw, other)
+    if not result:
+        return None
+    result["amountUnit"] = "元"
     values = _other_values(result) if other else _asset_values(result)
     if values is None:
         return None
@@ -204,11 +214,21 @@ def _table(raw, other=False):
     return result if raw.get("amountUnit") == "元" else None
 
 
+def _other_statement(raw):
+    result = _bounded_region(raw, True)
+    if (not result or len(result["text"]) > 300
+            or raw.get("statementType") != "explicit-no-period-end-other-assets"
+            or not _body_match(result, _phrase("本基金本报告期末未持有其他资产。"))):
+        return None
+    # This is a source statement, not a fabricated seven-row asset table.
+    return {**result, "statementType": "explicit-no-period-end-other-assets"}
+
+
 def normalize_nonstock_assets(evidence):
-    """Validate all short source tables and return only the public schema."""
+    """Validate short source tables/statements and return only their public schema."""
     if not isinstance(evidence, dict) or type(evidence.get("schemaVersion")) is not int or evidence.get("schemaVersion") != 1 or evidence.get("evidenceType") != TYPE:
         return None
-    if (evidence.get("confirmed") is not True or evidence.get("method") != METHOD
+    if (evidence.get("confirmed") is not True or evidence.get("method") not in {METHOD, STATEMENT_METHOD}
             or evidence.get("scope") != "period-end-stock-book-value" or evidence.get("stockBookValue") != "0.00"
             or evidence.get("amountUnit") != "元" or not _source(evidence.get("sourceUrl"))
             or not _date(evidence.get("periodEnd")) or not _date(evidence.get("publishedAt"))
@@ -217,19 +237,24 @@ def normalize_nonstock_assets(evidence):
             or not re.fullmatch(r"[a-f0-9]{64}", str(evidence.get("sourceTextHash", "")))):
         return None
     asset = _table(evidence.get("assetTable"))
-    other = _table(evidence.get("otherAssetsTable"), True)
+    statement = evidence.get("method") == STATEMENT_METHOD
+    other = _other_statement(evidence.get("otherAssetsStatement")) if statement else _table(evidence.get("otherAssetsTable"), True)
+    if (statement and evidence.get("otherAssetsTable") is not None
+            or not statement and evidence.get("otherAssetsStatement") is not None):
+        return None
     if (not asset or not other or other["startPage"] < asset["endPage"]
             or _number(other["section"])[0] != _number(asset["section"])[0]
             or _number(other["section"]) <= _number(asset["endSection"])
-            or asset["rows"][-1]["amount"] != other["total"]["amount"]):
+            or asset["rows"][-1]["amount"] != ("0.00" if statement else other["total"]["amount"])):
         return None
     pages = sorted(set(asset["pageNumbers"] + other["pageNumbers"]))
     if type(evidence.get("page")) is not int or evidence.get("page") != asset["startPage"] or not _same(evidence.get("pages"), pages):
         return None
-    return {"schemaVersion": 1, "evidenceType": TYPE, "confirmed": True, "method": METHOD,
+    return {"schemaVersion": 1, "evidenceType": TYPE, "confirmed": True, "method": evidence["method"],
             "scope": "period-end-stock-book-value", "stockBookValue": "0.00", "amountUnit": "元",
             **{key: evidence[key] for key in ("sourceUrl", "periodEnd", "publishedAt", "kind", "reportPeriodText", "sourceTextHash")},
-            "page": asset["startPage"], "pages": pages, "assetTable": asset, "otherAssetsTable": other}
+            "page": asset["startPage"], "pages": pages, "assetTable": asset,
+            ("otherAssetsStatement" if statement else "otherAssetsTable"): other}
 
 
 def valid_nonstock_assets(evidence):
@@ -248,7 +273,7 @@ def _clean_page(page):
     return "\n".join(lines)
 
 
-def _regions(pages, numbers, other=False):
+def _regions(pages, numbers, other=False, *, statement=False):
     for index, page in enumerate(pages):
         for heading in SECTION.finditer(page):
             if not (OTHER_TITLE if other else ASSET_TITLE).fullmatch(re.sub(r"\s+", "", heading["heading"])):
@@ -276,6 +301,12 @@ def _regions(pages, numbers, other=False):
                 raw["ratioBasis"] = "fund-total-assets"
             if len(raw["text"]) > (MAX_OTHER_TEXT if other else MAX_ASSET_TEXT):
                 continue
+            if statement:
+                raw["statementType"] = "explicit-no-period-end-other-assets"
+                result = _other_statement(raw)
+                if result:
+                    yield result
+                continue
             values = _other_values(raw) if other else _asset_values(raw)
             if values:
                 raw.update(values)
@@ -285,7 +316,7 @@ def _regions(pages, numbers, other=False):
 
 
 def parse_nonstock_assets(pages, report, *, page_numbers=None):
-    """Recognize one unambiguous pair of closed, exhaustive source tables.
+    """Recognize one unambiguous asset table and closed other-assets evidence.
 
     Without ``page_numbers``, input must be physical PDF pages in order. For
     MinerU pass the verified mapping; unknown or missing table pages reject the
@@ -301,17 +332,19 @@ def parse_nonstock_assets(pages, report, *, page_numbers=None):
     if not period_texts or any(_period(value) != expected for value in period_texts):
         return None
     cleaned = [_clean_page(page) for page in pages]
-    assets, others = list(_regions(cleaned, numbers)), list(_regions(cleaned, numbers, True))
+    assets = list(_regions(cleaned, numbers))
+    others = [(METHOD, "otherAssetsTable", value) for value in _regions(cleaned, numbers, True)]
+    others.extend((STATEMENT_METHOD, "otherAssetsStatement", value) for value in _regions(cleaned, numbers, True, statement=True))
     results = []
     for asset in assets:
-        for other in others:
-            proof = {"schemaVersion": 1, "evidenceType": TYPE, "confirmed": True, "method": METHOD,
+        for method, field, other in others:
+            proof = {"schemaVersion": 1, "evidenceType": TYPE, "confirmed": True, "method": method,
                      "scope": "period-end-stock-book-value", "stockBookValue": "0.00", "amountUnit": "元",
                      **{key: report.get(key) for key in ("sourceUrl", "periodEnd", "publishedAt", "kind")},
                      "reportPeriodText": sorted(period_texts)[0],
                      "sourceTextHash": hashlib.sha256("\n\n".join(str(page or "") for page in pages).encode()).hexdigest(),
                      "page": asset["startPage"], "pages": sorted(set(asset["pageNumbers"] + other["pageNumbers"])),
-                     "assetTable": asset, "otherAssetsTable": other}
+                     "assetTable": asset, field: other}
             result = normalize_nonstock_assets(proof)
             if result:
                 results.append(result)

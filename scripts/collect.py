@@ -270,6 +270,7 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
     # A missing structured table must not prevent reading the product's PDF.
     selected_periods = sorted({r["periodEnd"] for r in reports}, reverse=True)[:max(2, min(max_reports, 4))]
     selections = []
+    report_details_cache = dict(supplemental_details)
     for period in selected_periods:
         alternatives = [r for r in reports if r['periodEnd'] == period]
         selected = supplemental_report if item.get('reportLocatorOnly') is True and period == target_period and supplemental_report else max(alternatives, key=lambda r: r['publishedAt'])
@@ -297,7 +298,10 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
                        "holdingsIncompleteReason": "UNSUPPORTED_OR_INVALID_SECURITY_ROWS" if getattr(holdings, "excluded_rows", 0) else None})
         details = {}
         try:
-            details = supplemental_details.get(selected['sourceUrl']) or source.report_details(selected)
+            details = report_details_cache.get(selected['sourceUrl'])
+            if details is None:
+                details = source.report_details(selected)
+                report_details_cache[selected['sourceUrl']] = details
             locator_identity = normalize_portfolio_identity(details.get('portfolioIdentityEvidence'), {**selected, 'fundCode': code}) if selected.get('sourceLocatorEvidence') else None
             if selected.get('sourceLocatorEvidence') and not locator_identity or not selected.get('sourceLocatorEvidence') and not identity_matches(details):
                 errors.append({"code": code, "stage": "report", "errorCode": "REPORT_IDENTITY_MISMATCH"})
@@ -347,10 +351,23 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
         quarterly = next((r for r in alternatives if r["kind"] == "quarterly" and r != selected), None)
         if quarterly and not (deadline is not None and time.monotonic() >= deadline):
             try:
-                quarter_details = supplemental_details.get(quarterly['sourceUrl']) or source.report_details(quarterly)
+                quarter_details = report_details_cache.get(quarterly['sourceUrl'])
+                if quarter_details is None:
+                    quarter_details = source.report_details(quarterly)
+                    report_details_cache[quarterly['sourceUrl']] = quarter_details
                 quarter_identity = normalize_portfolio_identity(quarter_details.get('portfolioIdentityEvidence'), {**quarterly, 'fundCode': code}) if quarterly.get('sourceLocatorEvidence') else None
                 if quarterly.get('sourceLocatorEvidence') and not quarter_identity or not quarterly.get('sourceLocatorEvidence') and not identity_matches(quarter_details):
                     raise DataError("REPORT_IDENTITY_MISMATCH")
+                # A validated zero-stock conclusion belongs to this quarterly
+                # PDF, not to the later interim selected for the same date.
+                # Reuse the fetched details and run the ordinary report path,
+                # including its contradictory-holdings check, exactly once.
+                from traversal import no_equities_report_matches
+                quarter_proof = quarter_details.get('noEquitiesEvidence')
+                if (no_equities_report_matches(quarterly, quarter_proof)
+                        and quarter_proof.get('kind') == quarterly.get('kind')
+                        and not any(doc.get('sourceUrl') == quarterly['sourceUrl'] for _, _, doc in selections)):
+                    selections.append((period, [], quarterly))
                 report["narrative"] = quarter_details.get("narrative")
                 if quarter_details.get("reportManagers") and (not report.get("managers")
                         or not (report.get("managerTableCoverage") or {}).get("complete")

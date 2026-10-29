@@ -6,6 +6,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
   const TYPE = 'exhaustive-nonstock-assets', METHOD = 'two-closed-nonstock-asset-tables';
+  const STATEMENT_METHOD = 'closed-nonstock-asset-table-and-zero-other-assets-statement';
   const MONEY = '(?:[-—－–]|(?:0|[1-9]\\d{0,17}|[1-9]\\d{0,2}(?:,\\d{3}){1,5})(?:\\.\\d{1,2})?)';
   const RATIO = '(?:[-—－–]|(?:0|[1-9]\\d{0,2})(?:\\.\\d{1,2})?)';
   const PERIOD = /^(\d{4})年(?:第([1-4一二三四])季度|(中期|半年度|年度))报告$/;
@@ -95,7 +96,7 @@
     return a === b;
   }
   const number = value => typeof value === 'string' && /^\d{1,2}(?:\.\d{1,2}){0,2}$/.test(value) ? value.split('.').map(Number) : null;
-  function table(raw, other = false) {
+  function boundedRegion(raw, other = false) {
     if (!object(raw) || raw.sectionBounded !== true || raw.pageNumbersVerified !== true) return null;
     const { startPage: start, endPage: end, pageNumbers: numbers, text, heading, endHeading: ending } = raw;
     if (!Number.isInteger(start) || !Number.isInteger(end) || !(1 <= start && start <= end && end <= 10000) || end - start >= 3
@@ -110,30 +111,44 @@
     const adjacent = same(following, [...current.slice(0, -1), current.at(-1) + 1]);
     const chapter = other && same(following, [current[0] + 1]) && closing.number.startsWith('§');
     if (!adjacent && !chapter) return null;
-    const result = { section, endSection, heading, endHeading: ending, startPage: start, endPage: end, pageNumbers: [...numbers],
-      sectionBounded: true, pageNumbersVerified: true, text, amountUnit: '元' };
+    return { section, endSection, heading, endHeading: ending, startPage: start, endPage: end, pageNumbers: [...numbers],
+      sectionBounded: true, pageNumbersVerified: true, text };
+  }
+  function table(raw, other = false) {
+    const result = boundedRegion(raw, other);
+    if (!result) return null;
+    result.amountUnit = '元';
     const values = other ? otherValues(result) : assetValues(result);
     if (!values || Object.entries(values).some(([key, value]) => !same(raw[key], value))) return null;
     Object.assign(result, values);
     if (!other) { result.ratioBasis = 'fund-total-assets'; if (raw.ratioBasis !== result.ratioBasis) return null; }
     return raw.amountUnit === '元' ? result : null;
   }
+  function otherStatement(raw) {
+    const result = boundedRegion(raw, true);
+    if (!result || result.text.length > 300 || raw.statementType !== 'explicit-no-period-end-other-assets'
+      || !new RegExp('^\\s*' + esc(result.heading) + '\\s*' + phrase('本基金本报告期末未持有其他资产。')
+        + '\\s*' + esc(result.endHeading) + '\\s*$', 'u').test(result.text)) return null;
+    return { ...result, statementType: 'explicit-no-period-end-other-assets' };
+  }
   function normalizeNonstockAssets(evidence) {
     if (!object(evidence) || evidence.schemaVersion !== 1 || evidence.evidenceType !== TYPE || evidence.confirmed !== true
-      || evidence.method !== METHOD || evidence.scope !== 'period-end-stock-book-value' || evidence.stockBookValue !== '0.00'
+      || ![METHOD, STATEMENT_METHOD].includes(evidence.method) || evidence.scope !== 'period-end-stock-book-value' || evidence.stockBookValue !== '0.00'
       || evidence.amountUnit !== '元' || !source(evidence.sourceUrl) || !date(evidence.periodEnd) || !date(evidence.publishedAt)
       || evidence.publishedAt < evidence.periodEnd || !same(period(evidence.reportPeriodText), [evidence.kind, evidence.periodEnd])
       || !/^[a-f0-9]{64}$/.test(evidence.sourceTextHash || '')) return null;
-    const asset = table(evidence.assetTable), other = table(evidence.otherAssetsTable, true);
+    const statement = evidence.method === STATEMENT_METHOD;
+    if (statement && evidence.otherAssetsTable != null || !statement && evidence.otherAssetsStatement != null) return null;
+    const asset = table(evidence.assetTable), other = statement ? otherStatement(evidence.otherAssetsStatement) : table(evidence.otherAssetsTable, true);
     if (!asset || !other || other.startPage < asset.endPage || number(other.section)[0] !== number(asset.section)[0]
       || number(other.section)[1] < number(asset.endSection)[1]
-      || asset.rows.at(-1).amount !== other.total.amount) return null;
+      || asset.rows.at(-1).amount !== (statement ? '0.00' : other.total.amount)) return null;
     const pages = [...new Set([...asset.pageNumbers, ...other.pageNumbers])].sort((a, b) => a - b);
     if (evidence.page !== asset.startPage || !same(evidence.pages, pages)) return null;
-    return { schemaVersion: 1, evidenceType: TYPE, confirmed: true, method: METHOD, scope: 'period-end-stock-book-value',
+    return { schemaVersion: 1, evidenceType: TYPE, confirmed: true, method: evidence.method, scope: 'period-end-stock-book-value',
       stockBookValue: '0.00', amountUnit: '元', sourceUrl: evidence.sourceUrl, periodEnd: evidence.periodEnd,
       publishedAt: evidence.publishedAt, kind: evidence.kind, reportPeriodText: evidence.reportPeriodText, sourceTextHash: evidence.sourceTextHash,
-      page: asset.startPage, pages, assetTable: asset, otherAssetsTable: other };
+      page: asset.startPage, pages, assetTable: asset, [statement ? 'otherAssetsStatement' : 'otherAssetsTable']: other };
   }
   return { TYPE, normalizeNonstockAssets, validNonstockAssets: evidence => normalizeNonstockAssets(evidence) !== null };
 });
