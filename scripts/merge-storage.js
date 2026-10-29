@@ -18,6 +18,15 @@ const LIMIT = 128_000_000;
 const sha = value => crypto.createHash('sha256').update(value).digest('hex');
 const failure = code => Object.assign(new Error(code), { code });
 
+function receiptRelevant(fund, requested, publicUrl) {
+  // Match finalObservation's share-class projection before doing its holdings,
+  // calendar and conflict work. The engine already validates every component.
+  const codes = fund.notApplicableEvidence && !fund.selectedReport ? [fund.code]
+    : fund.sourcePortfolioCode && publicUrl(fund.portfolioSourceUrl) ? fund.shareClassCodes : [fund.code];
+  // Preserve the original validation/error path for unexpected legacy shapes.
+  return !Array.isArray(codes) || codes.some(code => requested.has(code));
+}
+
 function partFiles(root) {
   const files = [];
   const visit = (directory, depth) => {
@@ -200,7 +209,7 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
     // examined; a late conflicting source blocks reuse in every component.
     const dates = [], available = new Set(), companies = new Map();
     const totalCoverage = coverageFor([], directory, config);
-    const companyFiles = [];
+    const companyFiles = [], receiptPages = new Set();
     let currentCompany = null, page = [], bytes = 0, makeEnvelope;
     const flush = () => {
       if (!page.length) return;
@@ -208,6 +217,7 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
       if (Buffer.byteLength(serialized) > maxBytes) throw failure('COMPANY_FUND_TOO_LARGE');
       const key = currentCompany + '-r' + sha(serialized).slice(0, 20);
       fs.writeFileSync(path.join(outputRoot, key + '.json'), serialized);
+      if (page.some(fund => receiptRelevant(fund, requested, publicUrl))) receiptPages.add(key + '.json');
       const info = companies.get(currentCompany);
       companyFiles.push({ companyCode: currentCompany, companyName: info.name, path: './data/companies/' + key + '.json',
         partIndex: ++info.partCount, partCount: 0, companyFundCount: 0, companyHoldingCount: 0,
@@ -276,8 +286,10 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
     const observations = new Map();
     mergeCheckpoint('receipts', 0);
     for (const file of companyFiles) {
+      if (!receiptPages.has(path.basename(file.path))) continue;
       const envelope = readJson(path.join(outputRoot, path.basename(file.path)));
       for (const fund of envelope.funds) {
+        if (!receiptRelevant(fund, requested, publicUrl)) continue;
         const item = helpers.finalObservation(fund);
         for (const code of item.shareClassCodes) if (requested.has(code)) observations.set(code, { code, ...item });
       }
@@ -334,4 +346,4 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
   }
 }
 
-module.exports = { mergeOnDisk, partFiles };
+module.exports = { mergeOnDisk, partFiles, receiptRelevant };

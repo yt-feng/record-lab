@@ -1,4 +1,4 @@
-name: Enrich one source-bound strategy
+name: Enrich bounded source-bound strategies
 on:
   workflow_dispatch:
     inputs:
@@ -9,7 +9,7 @@ on:
         type: choice
         options: [2026Q2, 2026Q3]
       fund_code:
-        description: Optional code; blank selects one eligible portfolio without prior model history
+        description: Optional single code; blank selects an independent portfolio batch
         required: false
         default: ''
         type: string
@@ -17,6 +17,11 @@ on:
         description: Total preserved model-attempt ceiling for this product
         required: true
         default: '1'
+        type: string
+      batch_size:
+        description: Independent products per run (1 to 10); no automatic continuation
+        required: true
+        default: '10'
         type: string
 concurrency:
   group: published-records
@@ -50,26 +55,31 @@ jobs:
         run: |
           node --test tests/test_strategy_semantic_pipeline.js tests/test_strategy_semantic_production.js
           python -m unittest discover -s tests -p test_produce_strategy_semantics.py
-      - name: Prepare exactly one product and preserve its existing attempt history
+      - name: Prepare bounded independent products and preserve their attempt histories
         id: plan
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           SEMANTIC_QUARTER: ${{ inputs.quarter }}
           SEMANTIC_CODE: ${{ inputs.fund_code }}
           SEMANTIC_MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          SEMANTIC_BATCH_SIZE: ${{ inputs.batch_size }}
         run: node scripts/strategy-semantic-production.js prepare
       - name: Scan and persist reservation before any source or model request
+        id: reserve
         if: steps.plan.outputs.has_work == 'true'
         run: |
           python scripts/publication_guard.py --root .
           python scripts/persist-observations.py
-      - name: Parse original PDF and perform at most one explicit model request
+      - name: Parse source PDFs with two workers and one model request per product
+        id: produce
         if: steps.plan.outputs.has_work == 'true'
+        timeout-minutes: 30
+        continue-on-error: true
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: python scripts/produce_strategy_semantics.py
-      - name: Independently admit the candidate and finalize its attempt ledger
-        if: steps.plan.outputs.has_work == 'true'
+      - name: Independently admit available candidates and retain every known or unknown attempt
+        if: always() && steps.plan.outputs.has_work == 'true' && steps.reserve.outcome == 'success'
         run: node scripts/strategy-semantic-production.js finish
       - name: Rebuild target-quarter cross-portfolio analysis
         if: steps.plan.outputs.has_work == 'true'
@@ -99,8 +109,11 @@ jobs:
         with:
           name: semantic-production-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            .cache/semantic-production/result.json
-            .cache/semantic-production/receipt.json
+            .cache/semantic-production/batch.json
+            .cache/semantic-production/execution.json
+            .cache/semantic-production/tasks/*/task.json
+            .cache/semantic-production/tasks/*/result.json
+            .cache/semantic-production/tasks/*/receipt.json
             .cache/semantic-production/summary.json
           include-hidden-files: true
           if-no-files-found: warn

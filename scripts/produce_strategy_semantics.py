@@ -1,11 +1,13 @@
 """One reserved production PDF/model attempt; private input stays in memory."""
 from __future__ import annotations
 import datetime as dt
+import concurrent.futures
 import json
 import os
 from pathlib import Path
 import re
 import requests
+import time
 
 from deepseek_strategy import http_transport
 from publication_guard import inspect_content
@@ -18,6 +20,16 @@ MAX_BYTES = 2_000_000
 
 def stamp():
     return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def receipt_for(task, result):
+    adapter_result = result.get('adapter') or {'usageHistory': task['usageHistory']}
+    candidate = adapter_result.get('candidate')
+    return {'schemaVersion': 1, 'kind': 'validated-semantic-producer-receipt', 'taskDigest': task['taskDigest'],
+            'reservationId': task['reservationId'], 'resultDigest': canonical_digest(result),
+            'inputDigest': candidate['inputDigest'] if candidate else None,
+            'candidateDigest': candidate['candidateDigest'] if candidate else None,
+            'usageHistoryDigest': canonical_digest(adapter_result['usageHistory']), 'finishedAt': result['finishedAt']}
 
 
 def write_public(path, value):
@@ -98,26 +110,95 @@ def execute(task, *, credential, checkpoint, pdf_fetch=fetch_pdf, transport=http
                              'usageHistory': task['usageHistory'], 'candidate': None}
     result['finishedAt'] = stamp()
     emit()
-    adapter_result = result['adapter'] or {'usageHistory': task['usageHistory']}
-    candidate = adapter_result.get('candidate')
-    receipt = {'schemaVersion': 1, 'kind': 'validated-semantic-producer-receipt', 'taskDigest': task['taskDigest'],
-               'reservationId': task['reservationId'], 'resultDigest': canonical_digest(result),
-               'inputDigest': candidate['inputDigest'] if candidate else None,
-               'candidateDigest': candidate['candidateDigest'] if candidate else None,
-               'usageHistoryDigest': canonical_digest(adapter_result['usageHistory']), 'finishedAt': result['finishedAt']}
-    return result, receipt
+    return result, receipt_for(task, result)
+
+
+def read_public(path, maximum=MAX_BYTES):
+    path = Path(path)
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > maximum:
+        raise ValueError('SEMANTIC_TASK_CHANGED')
+    return json.loads(path.read_bytes())
+
+
+def reserved(task, root):
+    match = re.fullmatch(r'(2026Q[23]):([0-9]{6})', task['ledgerKey'])
+    if not match: raise ValueError('SEMANTIC_RESERVATION_MISMATCH')
+    expected = f'web/data/periods/{match[1]}/semantic-model-ledgers/{match[2][:2]}.json'
+    relative = task.get('ledgerPath', 'web/data/semantic-model-ledger.json')
+    if relative not in (expected, 'web/data/semantic-model-ledger.json'):
+        raise ValueError('SEMANTIC_RESERVATION_MISMATCH')
+    ledger = read_public(Path(root) / relative, 10_000_000)
+    entry = ledger['products'][task['ledgerKey']]; attempt = entry['attempts'][-1]
+    if (attempt['reservationId'] != task['reservationId'] or attempt['status'] != 'reserved'
+            or entry['usageHistory'] != task['usageHistory']
+            or entry['usageHistoryDigest'] != task['expectedUsageHistoryDigest']):
+        raise ValueError('SEMANTIC_RESERVATION_MISMATCH')
+
+
+def execute_batch(batch, *, root='.', credential, executor=execute, clock=time.monotonic):
+    """Two independent workers; every checkpoint has a bound usage receipt."""
+    value = dict(batch); expected = value.pop('batchDigest', None)
+    items = batch.get('tasks')
+    if (canonical_digest(value) != expected or not isinstance(items, list) or not 1 <= len(items) <= 10
+            or type(batch.get('maxWorkers')) is not int or not 1 <= batch['maxWorkers'] <= 2
+            or type(batch.get('maxSeconds')) is not int or not 1 <= batch['maxSeconds'] <= 1500
+            or len({item.get('code') for item in items}) != len(items)
+            or len({item.get('ledgerKey') for item in items}) != len(items)):
+        raise ValueError('SEMANTIC_TASK_CHANGED')
+    tasks = []
+    for item in items:
+        if not re.fullmatch(r'[0-9]{6}', item.get('code', '')) or item.get('path') != f"tasks/{item['code']}":
+            raise ValueError('SEMANTIC_TASK_CHANGED')
+        directory = Path(root) / CACHE / item['path']; task = read_public(directory / 'task.json')
+        unsigned = dict(task); unsigned.pop('taskDigest', None)
+        if (task['taskDigest'] != item['taskDigest'] or canonical_digest(unsigned) != item['taskDigest']
+                or any(task[field] != batch[field] for field in ('quarter', 'runId', 'runAttempt'))
+                or task['code'] != item['code'] or task['ledgerKey'] != item['ledgerKey']):
+            raise ValueError('SEMANTIC_TASK_CHANGED')
+        reserved(task, root); tasks.append((directory, task))
+    deadline = clock() + batch['maxSeconds']
+
+    def process(item):
+        directory, task = item
+        def checkpoint(result):
+            write_public(directory / 'result.json', result)
+            write_public(directory / 'receipt.json', receipt_for(task, result))
+        try:
+            if clock() >= deadline:
+                result = {'schemaVersion': 1, 'kind': 'strategy-semantic-production-output', 'taskDigest': task['taskDigest'],
+                    'reservationId': task['reservationId'], 'status': 'deferred', 'errorCode': 'SEMANTIC_BATCH_DEADLINE',
+                    'pdfRequests': 0, 'pdfReceipt': None, 'finishedAt': stamp(),
+                    'adapter': {'status': 'deferred', 'errorCode': 'SEMANTIC_BATCH_DEADLINE', 'modelRequests': 0,
+                                'usageHistory': task['usageHistory'], 'candidate': None}}
+                checkpoint(result)
+            else:
+                result, receipt = executor(task, credential=credential, checkpoint=checkpoint)
+                checkpoint(result)
+                if receipt != receipt_for(task, result): raise ValueError('SEMANTIC_PRODUCER_RECEIPT_INVALID')
+            return {'code': task['code'], 'status': result['status']}
+        except Exception:
+            # Keep the last written start/final receipt. A broken task does not
+            # erase another product or cause an unrecorded retry.
+            return {'code': task['code'], 'status': 'unknown', 'errorCode': 'SEMANTIC_PRODUCER_CHECKPOINT_FAILED'}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=batch['maxWorkers']) as pool:
+        outcomes = list(pool.map(process, tasks))
+    result = {'schemaVersion': 1, 'kind': 'strategy-semantic-batch-execution', 'batchDigest': expected,
+              'products': outcomes, 'continueRun': False}
+    write_public(Path(root) / CACHE / 'execution.json', result)
+    return result
 
 
 def main():
     try:
         if os.environ.get('GITHUB_ACTIONS') != 'true':
             raise ValueError('SEMANTIC_ACTIONS_REQUIRED')
+        if (CACHE / 'batch.json').exists():
+            result = execute_batch(read_public(CACHE / 'batch.json', 100_000), credential=os.environ.get('DEEPSEEK_API_KEY', ''))
+            print(json.dumps(result)); return 0
         task = json.loads((CACHE / 'task.json').read_bytes())
         # A remote reservation was persisted by the preceding workflow step.
-        ledger = json.loads(Path('web/data/semantic-model-ledger.json').read_bytes())
-        attempt = ledger['products'][task['ledgerKey']]['attempts'][-1]
-        if attempt['reservationId'] != task['reservationId'] or attempt['status'] != 'reserved':
-            raise ValueError('SEMANTIC_RESERVATION_MISMATCH')
+        reserved(task, '.')
         result, receipt = execute(task, credential=os.environ.get('DEEPSEEK_API_KEY', ''),
             checkpoint=lambda value: write_public(CACHE / 'result.json', value))
         write_public(CACHE / 'receipt.json', receipt)

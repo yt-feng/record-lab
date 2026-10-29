@@ -174,6 +174,44 @@ test('source-only disk merge never constructs an unused cross-component price in
   assert.equal(result.counts.eligiblePriceKeyCount, 0);
 });
 
+test('disk receipts read only requested portfolio pages and preserve the exact retained observation', t => {
+  const state = setup(t);
+  input(state, [snapshot('000001'), snapshot('000003'), snapshot('000004')]);
+  const first = run(state, { reuseAcrossComponents: false });
+  const previousCompanies = saved(state, first.manifest), before = fs.readFileSync(path.join(state.data, 'latest.json'));
+  input(state, []);
+  const expected = mergeSnapshots({ config, catalog, now, previousManifest: first.manifest, previousCompanies,
+    snapshots: [], receiptCodes: ['000001'], reusePrices: false });
+  let observations = 0, stagedPagesRead = 0;
+  t.mock.method(require('../scripts/merge-storage'), 'mergeOnDisk', options => mergeOnDisk({ ...options,
+    helpers: { ...options.helpers,
+      finalObservation: fund => { observations++; return options.helpers.finalObservation(fund); },
+      readJson: file => {
+        if (file.includes('record-merge-stage-') && path.dirname(file).endsWith(path.sep + 'companies')) stagedPagesRead++;
+        return options.helpers.readJson(file);
+      } } }));
+  const result = run(state, { reuseAcrossComponents: false, receiptCodes: ['000001'] });
+  assert.equal(result.changed, false);
+  assert.equal(observations, 1);
+  assert.equal(stagedPagesRead, 1);
+  assert.equal(first.manifest.companyFiles.length, 3);
+  assert.deepEqual(result.receipt, expected.receipt);
+  assert.deepEqual(fs.readFileSync(path.join(state.data, 'latest.json')), before);
+  assert.deepEqual(saved(state, first.manifest), previousCompanies);
+});
+
+test('receipt prefilter includes a requested verified alias and preserves non-applicable code scope', () => {
+  const { receiptRelevant } = require('../scripts/merge-storage');
+  const fund = { code: '000001', sourcePortfolioCode: '000001', portfolioSourceUrl: 'https://example.org/identity',
+    shareClassCodes: ['000001', '000002'], selectedReport: {} };
+  const publicUrl = value => value === 'https://example.org/identity';
+  assert.equal(receiptRelevant(fund, new Set(['000002']), publicUrl), true);
+  assert.equal(receiptRelevant(fund, new Set(['000003']), publicUrl), false);
+  assert.equal(receiptRelevant({ ...fund, portfolioSourceUrl: null }, new Set(['000002']), publicUrl), false);
+  assert.equal(receiptRelevant({ ...fund, selectedReport: null, notApplicableEvidence: {} }, new Set(['000002']), publicUrl), false);
+  assert.equal(receiptRelevant({ ...fund, selectedReport: null, notApplicableEvidence: {} }, new Set(['000001']), publicUrl), true);
+});
+
 test('conflict-only metadata is published atomically without any new report, quote request, or timestamps', t => {
   const state = setup(t);
   const old = mergeSnapshots({ snapshots: [snapshot('000001', { kind: 'complete' }), snapshot('000003', { kind: 'complete', low: 9 })],

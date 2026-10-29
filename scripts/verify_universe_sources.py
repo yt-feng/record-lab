@@ -15,17 +15,21 @@ import xml.etree.ElementTree as ET
 
 import historical_universe as history
 import verify_universe as verify
+import universe_source_diff as source_diff
 from publication_guard import inspect_content
 
 OUTPUT = Path('.cache/universe-source-verification/result.json')
 MAX_CORE_BYTES = 64 * 1024
-MAX_OUTPUT_BYTES = 32 * 1024
+MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 CORE_NS = 'http://schemas.openxmlformats.org/package/2006/metadata/core-properties'
 AGGREGATE_OBSERVED_ON = '2026-10-29'
 AGGREGATES = (
     {'asOf': '2026-06-30', 'publishedAt': '2026-07-23', 'fundProducts': 14353,
      'fundManagers': 165,
      'sourceUrl': 'https://www.amac.org.cn/sjtj/tjbg/gmjj/202607/P020260723642575271747.pdf'},
+    {'asOf': '2026-08-31', 'publishedAt': '2026-09-18', 'fundProducts': 14585,
+     'fundManagers': 165,
+     'sourceUrl': 'https://www.amac.org.cn/sjtj/tjbg/gmjj/202609/P020260918624509873296.pdf'},
     {'asOf': '2026-09-30', 'publishedAt': '2026-10-28', 'fundProducts': 14760,
      'fundManagers': 165,
      'sourceUrl': 'https://www.amac.org.cn/sjtj/tjbg/gmjj/202610/P020261028612999638714.pdf'},
@@ -106,7 +110,7 @@ def compare_aggregate(parsed_count, expected_count):
             'status': 'unresolved', 'aggregateSourceUrl': benchmark['sourceUrl']}
 
 
-def run_diagnostic(fetch=verify.download_official, now=None):
+def run_diagnostic(fetch=verify.download_official, now=None, comparison_fetch=None, catalog_root='web/data'):
     observed = history.observation_time(now or dt.datetime.now(dt.timezone.utc))
     result = {'schemaVersion': 1, 'status': 'failed', 'diagnosticComplete': False,
               'errorCode': None, 'retrievedAt': observed, 'sourceUrl': history.SOURCE_URL,
@@ -164,6 +168,9 @@ def run_diagnostic(fetch=verify.download_official, now=None):
             result['pinnedParser'] = {'parseStatus': 'not-run', 'errorCode': 'SOURCE_HASH_MISMATCH'}
             reasons.append('SOURCE_HASH_MISMATCH')
         result.update(status='partial', diagnosticComplete=True, unresolvedReasons=reasons)
+        if comparison_fetch is not None:
+            result['twoPeriodComparison'] = source_diff.compare_sources(data, dates=explicit_period_dates,
+                core_properties=core_properties, fetch=comparison_fetch, catalog_root=catalog_root)
     except (verify.VerificationError, history.HistoricalUniverseError) as error:
         result['errorCode'] = error.code
     except Exception:
@@ -186,7 +193,7 @@ def main():
     if os.environ.get('GITHUB_ACTIONS') != 'true':
         print(json.dumps({'status': 'failed', 'errorCode': 'ACTIONS_REQUIRED'}))
         return 2
-    result, data = encode_result(run_diagnostic())
+    result, data = encode_result(run_diagnostic(comparison_fetch=source_diff.download_source))
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     temporary = OUTPUT.with_suffix('.tmp')
     temporary.write_bytes(data)

@@ -17,20 +17,27 @@ jobs:
           sparse-checkout-cone-mode: false
           sparse-checkout: |
             /scripts/verify_universe_sources.py
+            /scripts/universe_source_diff.py
             /scripts/verify_universe.py
             /scripts/historical_universe.py
             /scripts/source_dates.py
             /scripts/publication_guard.py
             /scripts/publication_cache.py
             /tests/test_verify_universe_sources.py
+            /tests/test_universe_source_diff.py
             /tests/test_historical_universe.py
+            /web/data/catalog.json
+            /web/data/periods/2026Q2/catalog.json
+            /web/data/periods/2026Q3/catalog.json
             /.github/workflows/verify-universe-sources.yml
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Test source diagnostics with synthetic archives
-        run: python -m unittest discover -s tests -p 'test_verify_universe_sources.py'
-      - name: Inspect pinned source metadata and unresolved aggregate discrepancy
+        run: |
+          python -m unittest discover -s tests -p 'test_verify_universe_sources.py'
+          python -m unittest discover -s tests -p 'test_universe_source_diff.py'
+      - name: Compare official June and August product codes and fixed public samples
         run: python scripts/verify_universe_sources.py
       - name: Retain guarded diagnostic without publishing corpus data
         if: always()
