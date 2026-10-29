@@ -199,6 +199,8 @@ class NonstockRetentionTests(unittest.TestCase):
                 current, meta = diag.extract_quarter(provider, sample, NOW)
                 self.assertEqual(current['reportPdfSourceUrl'], sample['sourceUrl'])
                 self.assertEqual(len(meta['windows']), 1)
+                self.assertEqual(meta['documentStructure']['identityRecognizer']['branch'], 'PERIOD_TITLE_NOT_FOUND')
+                self.assertTrue(meta['documentStructure']['diagnosticOnly'])
         self.assertEqual([url for url, _ in provider.calls], [s['sourceUrl'] for s in diag.SAMPLES])
         self.assertTrue(all(kw == {'binary': True, 'attempts_override': 1} for _, kw in provider.calls))
 
@@ -209,6 +211,63 @@ class NonstockRetentionTests(unittest.TestCase):
         self.assertEqual(counts['otherAssetsHeadingCount'], 1)
         self.assertEqual(counts['recognizedClosedAssetTables'], 1)
         self.assertEqual(counts['recognizedClosedOtherAssetsTables'], 1)
+
+    def test_reit_structure_exposes_actual_heading_rejection_without_proving_no_stocks(self):
+        sample = diag.SAMPLES[1]
+        pages = ['合成高速公路封闭式基础设施证券投资基金\n2026年第2季度报告',
+                 '2 基金产品概况\n基金代码\n508007\n基金名称 合成基金\n'
+                 '3 主要财务指标\n3.1 基础设施项目情况\n4 基金管理情况']
+        result = diag.document_structure(pages, [1, 2], diag.document(sample), pdf_sha256='a' * 64, now=NOW)
+        self.assertEqual(result['identityRecognizer']['branch'], 'IDENTITY_SECTION_START_COUNT')
+        self.assertFalse(result['identityRecognizer']['requestedCodeMatched'])
+        self.assertEqual(result['titleWindow']['text'], pages[0])
+        self.assertEqual(result['periodTitles'][0]['periodEnd'], '2026-06-30')
+        self.assertTrue(result['periodTitles'][0]['matchesExpected'])
+        self.assertEqual(result['headings'][0]['text'], '2 基金产品概况')
+        self.assertEqual(result['codeRows'][0]['codes'], ['508007'])
+        self.assertTrue(result['codeRows'][0]['requestedCodeMentioned'])
+        self.assertFalse(result['codeRows'][0]['provesIdentity'])
+        self.assertGreater(result['formatSignals']['infrastructureFundMentions'], 0)
+        self.assertGreater(result['formatSignals']['infrastructureProjectHeadings'], 0)
+        self.assertTrue(result['diagnosticOnly'])
+        self.assertNotIn('noEquitiesConfirmed', result)
+
+    def test_structure_distinguishes_wrong_document_code_label_and_period(self):
+        sample = diag.SAMPLES[1]
+        pages = ['合成基金2026年第2季度报告', '§2 基金产品概况\n基金主代码 000001',
+                 '§3 主要财务指标和基金净值表现']
+        def inspect(values):
+            return diag.document_structure(values, [1, 2, 3], diag.document(sample), pdf_sha256='a' * 64, now=NOW)
+        result = inspect(pages)
+        self.assertEqual(result['identityRecognizer']['branch'], 'VERIFIED')
+        self.assertEqual(result['identityRecognizer']['parsedPortfolioCode'], '000001')
+        self.assertFalse(result['identityRecognizer']['requestedCodeMatched'])
+        label = inspect([pages[0], pages[1].replace('基金主代码', '基金代码'), pages[2]])
+        self.assertEqual(label['identityRecognizer']['branch'], 'MAIN_CODE_LABEL_NOT_FOUND')
+        self.assertEqual(label['codeRows'][0]['text'], '基金代码 000001')
+        period = inspect([pages[0].replace('第2', '第3'), *pages[1:]])
+        self.assertEqual(period['identityRecognizer']['branch'], 'PERIOD_TITLE_MISMATCH')
+        self.assertFalse(period['periodTitles'][0]['matchesExpected'])
+        self.assertEqual(period['periodTitles'][0]['periodEnd'], '2026-09-30')
+
+    def test_structure_excerpts_are_bounded_and_omit_contact_or_free_prose(self):
+        email = 'private' + '@' + 'example.org'
+        text = ('联系人 不输出\n' + email + '\n2026年第2季度报告\n'
+                '2 基金产品概况\n基金代码 508007 私人备注\n'
+                '基金主代码 508007\n联系方式 不输出\n'
+                '3.1 基础设施项目管理情况\n' + '项目正文不得输出\n' * 80)
+        pages = [text] * 40
+        result = diag.document_structure(pages, list(range(1, 41)), diag.document(diag.SAMPLES[1]),
+            pdf_sha256='a' * 64, now=NOW)
+        encoded = json.dumps(result, ensure_ascii=False)
+        for private in ('联系人', email, '私人备注', '联系方式', '项目正文不得输出'):
+            self.assertNotIn(private, encoded)
+        self.assertIsNone(result['titleWindow'])
+        self.assertLessEqual(len(result['headings']), 16)
+        self.assertLessEqual(sum(len(row['text']) for row in result['headings']), 640)
+        self.assertLessEqual(len(result['codeRows']), 4)
+        self.assertTrue(all(len(row['text']) <= 100 for row in result['codeRows']))
+        self.assertEqual(diag.inspect_content(encoded.encode()), [])
 
     def test_one_source_failure_keeps_other_diagnosis_without_raw_error(self):
         def extract(_provider, sample, _now):

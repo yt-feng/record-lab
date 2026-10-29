@@ -16,7 +16,7 @@ const { normalizeManagers, verifiedReportManagers, managerCoverageFor, completeM
 const { chinaDate } = require('../web/source-dates');
 const { calendar } = require('../lib/price-coverage');
 const { createPriceIndex, addPriceSources, applyPriceIndex } = require('../lib/reuse-prices');
-const { effectivePriceRange, effectiveReference } = require('../lib/price-range-reference');
+const { effectiveReference } = require('../lib/price-range-reference');
 
 const CODE = /^\d{6}$/;
 const COMPANY_PATH = /^\.\/data\/companies\/[A-Za-z0-9_-]{1,64}\.json$/;
@@ -366,9 +366,11 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
         const priceKey = [row.market, row.stockCode, row.currency, 'unadjusted', phase.start, phase.target, calendar.id].join('|');
         const entry = prices.entries.get(priceKey);
         const candidate = entry?.reference ? { ...row.priceRange, rangeReference: entry.reference } : row.priceRange;
+        // Both decisions use the same immutable candidate and generation clock.
+        const reference = effectiveReference(candidate, priceIdentity, currentTime);
         if (entry?.conflict || candidate && Object.hasOwn(candidate, 'globalPriceConflict')
-          && !effectiveReference(candidate, priceIdentity, currentTime)) stock._completePriceConflict = true;
-        const effective = effectivePriceRange(candidate, priceIdentity, currentTime) || row.priceRange;
+          && !reference) stock._completePriceConflict = true;
+        const effective = reference || (candidate && !Object.hasOwn(candidate, 'globalPriceConflict') ? candidate : null) || row.priceRange;
         const price = priceFor(effective, row, phase);
         if (price) {
           priceRows++; stock._priceSources.add(price.sourceUrl); stock._prices.add(`${price.low}:${price.high}`);

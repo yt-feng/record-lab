@@ -18,7 +18,7 @@ import re
 import subprocess
 
 from collect import collect_fund
-from portfolio_identity import normalize_portfolio_identity
+from portfolio_identity import normalize_portfolio_identity, parse_portfolio_identity
 from providers import DataError, PublicProvider, parse_no_equities, parse_pdf_holdings, parse_pdf_pages
 from publication_guard import inspect_content
 from report_extract import extract_report
@@ -195,6 +195,90 @@ def table_recognition(pages, numbers):
             'reportPeriodTitleCount': sum(len(list(PERIOD.finditer(re.sub(r'\s+', '', str(page)[:500])))) for page in pages)}
 
 
+_IDENTITY_BRANCHES = {'VERIFIED', 'INVALID_INPUT', 'PAGE_MAPPING_LENGTH_MISMATCH', 'PERIOD_TITLE_NOT_FOUND',
+    'PERIOD_TITLE_MISMATCH', 'PERIOD_TITLE_PAGE_UNKNOWN', 'IDENTITY_SECTION_START_COUNT',
+    'IDENTITY_SECTION_END_NOT_FOUND', 'IDENTITY_SECTION_PAGE_MAPPING_INVALID', 'DUPLICATE_CODE_LABEL',
+    'MAIN_CODE_LABEL_NOT_FOUND', 'CODE_ROWS_EXCEED_BOUND', 'CODE_ROW_INVALID', 'PROOF_VALIDATION_REJECTED'}
+_STRUCTURE_HEADING = re.compile(r'^\s*(?:§\s*)?\d{1,2}(?:[.．]\d{1,2}){0,3}\s*[^\d\n]{2,100}$')
+_STRUCTURE_TOPIC = re.compile(r'基金|基础设施|项目|资产|投资|财务|管理|净值|运营')
+_CODE_LABEL = re.compile(r'^(?:基金主代码|基金代码|场内代码|交易代码|下属(?:分级|分类)基金的交易代码)[：:|]*')
+
+
+def document_structure(pages, numbers, doc, *, pdf_sha256, now):
+    """Expose bounded rejection evidence, never treat format signals as proof.
+
+    The normal table diagnosis misses REIT-specific headings entirely. These
+    excerpts identify the actual title, code labels and section boundaries so
+    a later repair can target the observed format instead of assuming that a
+    REIT holds no stocks. The existing identity recognizer remains unchanged.
+    """
+    from portfolio_identity import PERIOD, _period
+    pages, numbers = list(pages), list(numbers)
+    branch = {}
+    identity = parse_portfolio_identity(pages, {k: v for k, v in doc.items() if k != 'fundCode'},
+        page_numbers=numbers, retrieved_at=now.isoformat(), pdf_sha256=pdf_sha256, now=now, diagnostics=branch)
+    result = {'identityRecognizer': {
+        'branch': branch.get('branch') if branch.get('branch') in _IDENTITY_BRANCHES else 'UNKNOWN_BRANCH',
+        'field': branch.get('field') if branch.get('field') in {'mainCode', 'shareClassCodes'} else None,
+        'parsedPortfolioCode': (identity or {}).get('sourcePortfolioCode'),
+        'requestedCodeMatched': bool(identity and doc['fundCode'] in
+            [identity['sourcePortfolioCode'], *identity['shareClassCodes']])},
+        'titleWindow': None, 'periodTitles': [], 'headings': [], 'codeRows': [],
+        'formatSignals': {'infrastructureFundMentions': 0, 'infrastructureProjectHeadings': 0,
+                          'standardProductOverviewHeadings': 0},
+        'diagnosticOnly': True}
+    heading_budget, title_seen, code_seen = 640, set(), set()
+    for page, number in zip(pages, numbers):
+        if type(number) is not int or not 1 <= number <= 300:
+            continue
+        lines = [line.strip() for line in str(page).splitlines()]
+        compact_page = re.sub(r'\s+', '', str(page))
+        result['formatSignals']['infrastructureFundMentions'] += len(re.findall(r'基础设施(?:证券投资)?基金|基础设施证券投资', compact_page))
+        for index, line in enumerate(lines):
+            compact = re.sub(r'\s+', '', line)
+            if not line or _PRIVATE.search(compact) or inspect_content(line.encode()):
+                continue
+            for match in PERIOD.finditer(line):
+                normalized = _period(match[0])
+                if normalized and normalized not in title_seen and len(result['periodTitles']) < 4:
+                    title_seen.add(normalized)
+                    result['periodTitles'].append({'page': number, 'text': match[0][:80],
+                        'kind': normalized[0], 'periodEnd': normalized[1],
+                        'matchesExpected': normalized == (doc['kind'], doc['periodEnd'])})
+                if result['titleWindow'] is None and number <= 2 and index < 50:
+                    preceding = [v for v in lines[max(0, index - 6):index + 1] if v]
+                    title = '\n'.join(preceding)
+                    if len(title) <= 180 and not _PRIVATE.search(re.sub(r'\s+', '', title)) and not inspect_content(title.encode()):
+                        result['titleWindow'] = {'page': number, 'text': title,
+                            'textSha256': hashlib.sha256(title.encode()).hexdigest()}
+            if len(line) <= 120 and _STRUCTURE_HEADING.fullmatch(line) and _STRUCTURE_TOPIC.search(compact):
+                result['formatSignals']['infrastructureProjectHeadings'] += bool(re.search(r'基础设施|项目', compact))
+                result['formatSignals']['standardProductOverviewHeadings'] += '基金产品概况' in compact
+                if len(result['headings']) < 16 and len(line) <= heading_budget:
+                    result['headings'].append({'page': number, 'text': line})
+                    heading_budget -= len(line)
+            label = _CODE_LABEL.match(compact)
+            if label and len(result['codeRows']) < 4:
+                # Only exact labels followed solely by six-digit codes are
+                # retained; surrounding product or contact prose is omitted.
+                pieces = [line]
+                for following in lines[index + 1:index + 4]:
+                    if not following:
+                        continue
+                    if not re.fullmatch(r'\d{6}(?:[\s|]+\d{6})*', following):
+                        break
+                    pieces.append(following)
+                excerpt = '\n'.join(pieces)
+                compact_tail = re.sub(r'\s+', '', excerpt)[label.end():]
+                codes = re.findall(r'\d{6}', excerpt)
+                if (len(excerpt) <= 100 and 1 <= len(codes) <= 6 and
+                        re.fullmatch(r'(?:\d{6}[|]*)+', compact_tail) and excerpt not in code_seen):
+                    code_seen.add(excerpt)
+                    result['codeRows'].append({'page': number, 'text': excerpt, 'codes': codes,
+                        'requestedCodeMentioned': doc['fundCode'] in codes, 'provesIdentity': False})
+    return result
+
+
 def extract_quarter(provider, sample, now):
     """One source request and the same pypdf extractor/enrichment as collection."""
     doc, private = document(sample), {}
@@ -209,7 +293,9 @@ def extract_quarter(provider, sample, now):
                 'pdfHoldings': holdings, 'pdfHoldingsMetadata': holdings.metadata}
     def capture(**context):
         private.update(windows=bounded_table_windows(context['pages'], context['page_numbers']),
-                       tableRecognition=table_recognition(context['pages'], context['page_numbers']))
+                       tableRecognition=table_recognition(context['pages'], context['page_numbers']),
+                       documentStructure=document_structure(context['pages'], context['page_numbers'], doc,
+                           pdf_sha256=hashlib.sha256(data).hexdigest(), now=now))
     details = extract_report(data, doc['sourceUrl'], doc['periodEnd'], doc['kind'], parse_pages=parse_pdf_pages,
         filename=doc['title'], max_pages=300, env={}, enrich_pages=enrich, published_at=doc['publishedAt'],
         retrieved_at=now.isoformat(), on_private_sections=capture)
