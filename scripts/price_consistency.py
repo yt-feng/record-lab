@@ -109,7 +109,16 @@ def _fact(value, row, now):
     if (price is None or not isinstance(urls, list) or not 1 <= len(urls) <= 8 or not observed
             or not dt.datetime.fromisoformat(row['rangeEnd']).replace(tzinfo=dt.timezone.utc) <= observed <= now + dt.timedelta(minutes=5)):
         return None
-    identities = sorted(set(source_identity(source) for source in [value.get('sourceUrl'), *urls]))
+    identities, normalized_sources = set(), {}
+    for source in [value.get('sourceUrl'), *urls]:
+        # Reuse only exact strings within this fact; retain every raw source below.
+        if type(source) is str and source in normalized_sources:
+            identity = normalized_sources[source]
+        else:
+            identity = source_identity(source)
+            if type(source) is str: normalized_sources[source] = identity
+        identities.add(identity)
+    identities = sorted(identities)
     return {'factId': canonical_digest({'sourceIdentity': identities, 'price': price}), 'price': price,
             'sourceUrl': value['sourceUrl'], 'sourceUrls': list(urls), 'fetchedAt': value['fetchedAt']}
 
