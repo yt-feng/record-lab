@@ -11,9 +11,9 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    # A cold proof must scan every historical blob; 12 minutes covered only
-    # 55 of 132 commits in the measured run. Leave time to save the proof.
-    timeout-minutes: 60
+    # A changed scanner/workflow requires a full historical content scan.
+    # Keep every check and allow time to save the verified proof afterward.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:

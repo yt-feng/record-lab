@@ -4,10 +4,10 @@ from pathlib import Path
 
 try:
     from scripts.traversal import (atomic_json, build_status, read_json, valid_status, read_status_snapshot,
-                                   StatusSnapshotError, status_input_diagnostic, valid_status_input_diagnostic)
+                                   StatusSnapshotError, status_input_diagnostic, valid_status_input_diagnostic, source_repair_mode)
 except ModuleNotFoundError:
     from traversal import (atomic_json, build_status, read_json, valid_status, read_status_snapshot,
-                           StatusSnapshotError, status_input_diagnostic, valid_status_input_diagnostic)
+                           StatusSnapshotError, status_input_diagnostic, valid_status_input_diagnostic, source_repair_mode)
 
 
 class BatchStatusInputError(Exception):
@@ -20,8 +20,15 @@ def reconcile(plan_root=".cache/plan", parts_root=".cache/parts", now=None):
     plan = Path(plan_root)
     parts = Path(parts_root)
     matrix = read_json(plan / "matrix.json")
-    if not isinstance(matrix, list) or len(matrix) > 32:
+    if not isinstance(matrix, list) or len(matrix) > 64:
         raise ValueError("INVALID_PLAN")
+    if len(matrix) > 32:
+        # Verify every enlarged-plan lane before creating any status artifact.
+        for item in matrix:
+            if (not isinstance(item, dict) or not isinstance(item.get('id'), str)
+                    or not item['id'].isdigit() or item.get('config') != f"batch-{item['id']}.json"
+                    or not source_repair_mode(read_json(plan / item['config']))):
+                raise ValueError("INVALID_PLAN")
     repaired = 0
     preserved = 0
     input_errors = 0

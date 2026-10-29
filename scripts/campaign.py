@@ -236,8 +236,8 @@ def deployed_continuation_state(root, quarter):
             or hold['reason'] != 'BATCH_ARTIFACTS_UNVERIFIED' or hold['requestAccounting'] != 'unverified'
             or hold['quarter'] != quarter
             or hold['sourceRunId'] is not None and (not isinstance(hold['sourceRunId'], str) or not re.fullmatch(r'[0-9]{1,20}', hold['sourceRunId']))
-            or not isinstance(hold['batchIds'], list) or not 1 <= len(hold['batchIds']) <= 32
-            or any(not isinstance(value, str) or not re.fullmatch(r'[0-9]{1,2}', value) or int(value) > 31 for value in hold['batchIds'])
+            or not isinstance(hold['batchIds'], list) or not 1 <= len(hold['batchIds']) <= 64
+            or any(not isinstance(value, str) or not re.fullmatch(r'[0-9]{1,2}', value) or int(value) > 63 for value in hold['batchIds'])
             or len(set(hold['batchIds'])) != len(hold['batchIds'])):
         raise ValueError('INVALID_CONTINUATION_HOLD')
     errors = audit.get('batchInputErrors')
@@ -258,8 +258,9 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
     selected = selected_periods(quarter)
     # Planning, Actions output and missing-part reconciliation share one bound.
     # Reject unsupported configurations before fetching or changing any files.
-    if (type(shards) is not int or not 1 <= shards <= 32
-            or shards * len(selected) > 32
+    max_batches = 64 if source_repair else 32
+    if (type(shards) is not int or not 1 <= shards <= max_batches
+            or shards * len(selected) > max_batches
             or type(batch_size) is not int or not 1 <= batch_size <= 100):
         raise ValueError('INVALID_BATCH_CAPACITY')
     overlays = historical_overlays if historical_overlays is not None else {}

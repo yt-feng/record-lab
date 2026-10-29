@@ -182,27 +182,145 @@ class NonstockRetentionTests(unittest.TestCase):
         self.assertTrue(windows[0]['truncated'])
         self.assertEqual(windows[0]['followingHeading'], '5.2 其他投资')
 
-    def test_fetch_adapter_requests_only_each_fixed_pdf_once_no_mineru(self):
+    def test_fetch_adapter_requests_only_three_fixed_pdfs_once_no_mineru(self):
         class Provider:
             def __init__(self): self.calls = []
             def get(self, url, **kwargs):
                 self.calls.append((url, kwargs))
                 return b'%PDF-synthetic-not-parsed'
         provider = Provider()
+        samples = [*diag.SAMPLES, diag.interim_sample(anchors()['508007'], NOW)]
         def synthetic_extract(_bytes, url, period, kind, **kwargs):
             self.assertEqual(kwargs['env'], {})
             self.assertEqual(kwargs['max_pages'], 300)
             kwargs['on_private_sections'](pages=['5.1 报告期末基金资产组合情况\n1 债券 100\n5.2 后续情况'], page_numbers=[2])
-            return details(next(s for s in diag.SAMPLES if s['sourceUrl'] == url))
+            return details(next(s for s in samples if s['sourceUrl'] == url))
         with patch.object(diag, 'extract_report', side_effect=synthetic_extract):
-            for sample in diag.SAMPLES:
+            for sample in samples:
                 current, meta = diag.extract_quarter(provider, sample, NOW)
                 self.assertEqual(current['reportPdfSourceUrl'], sample['sourceUrl'])
                 self.assertEqual(len(meta['windows']), 1)
                 self.assertEqual(meta['documentStructure']['identityRecognizer']['branch'], 'PERIOD_TITLE_NOT_FOUND')
                 self.assertTrue(meta['documentStructure']['diagnosticOnly'])
-        self.assertEqual([url for url, _ in provider.calls], [s['sourceUrl'] for s in diag.SAMPLES])
+        self.assertEqual([url for url, _ in provider.calls], [s['sourceUrl'] for s in samples])
         self.assertTrue(all(kw == {'binary': True, 'attempts_override': 1} for _, kw in provider.calls))
+
+    def test_independent_interim_uses_own_source_metadata_hash_and_nav_without_anchor_refresh(self):
+        original = anchors(); before = copy.deepcopy(original); calls = []
+        def extract(_provider, sample, _now):
+            calls.append((sample['sourceUrl'], sample['kind'], sample['publishedAt']))
+            current = details(sample, proof=sample['kind'] == 'quarterly')
+            current['sourceTextHash'] = hashlib.sha256(sample['sourceUrl'].encode()).hexdigest()
+            if sample['kind'] == 'semiannual':
+                current['navYuan'] = 2388000000.00
+            return current, {'pdfSha256': hashlib.sha256(sample['sourceUrl'].encode()).hexdigest(), 'windows': []}
+        result = diag.run_diagnosis(object(), original, now=NOW, extract=extract)
+        self.assertEqual(len(calls), 3)
+        interim = result['results'][1]['independentInterim']
+        self.assertEqual(calls[-1], (diag.SAMPLES[1]['interimUrl'], 'semiannual', '2026-08-31'))
+        self.assertTrue(result['independentInterimReparse'])
+        self.assertTrue(interim['independentlyParsed'])
+        self.assertFalse(interim['quarterTextReused'])
+        self.assertNotEqual(interim['sourceTextHash'], result['results'][1]['quarterDetails']['sourceTextHash'])
+        nav = interim['fieldCompleteness']['nav']
+        self.assertEqual(nav['valueYuan'], 2388000000.00)
+        self.assertEqual(nav['periodEnd'], '2026-06-30')
+        self.assertEqual(nav['sourceUrl'], diag.SAMPLES[1]['interimUrl'])
+        self.assertTrue(nav['acceptedInSnapshot'])
+        self.assertFalse(nav['portfolioSubtotalUsed'])
+        self.assertFalse(interim['fieldCompleteness']['strategy']['complete'])
+        self.assertFalse(interim['fieldCompleteness']['managers']['complete'])
+        self.assertFalse(interim['noEquitiesEvidence']['present'])
+        self.assertTrue(interim['snapshot']['independentInterimReparse'])
+        self.assertEqual(interim['snapshot']['mode'], 'independently-parsed-interim-only')
+        self.assertEqual(original, before)
+
+    def test_interim_missing_or_conflicting_metadata_rejected_before_fetch(self):
+        for edit in [lambda x: x['selectedReport'].pop('publishedAt'),
+                     lambda x: x['selectedReport'].update(sourceUrl=diag.SAMPLES[1]['sourceUrl']),
+                     lambda x: x['selectedReport'].update(publishedAt='2026-10-30'),
+                     lambda x: x.update(reports=[{**x['selectedReport'], 'publishedAt': '2026-08-28'}])]:
+            anchor = anchors()['508007']; edit(anchor)
+            with self.subTest(edit=edit), patch.object(diag, 'extract_quarter') as extract:
+                with self.assertRaisesRegex(DataError, 'INTERIM_BINDING_INVALID'):
+                    diag.diagnose_interim(object(), anchor, NOW, extract)
+                extract.assert_not_called()
+        with patch.object(diag.PublicProvider, 'get') as fetch:
+            for change in ({'sourceUrl': 'https://example.org/unapproved.pdf'}, {'kind': 'annual'}):
+                with self.assertRaisesRegex(DataError, 'SOURCE_NOT_ALLOWED'):
+                    diag.extract_quarter(diag.PublicProvider(), {**diag.SAMPLES[1], **change}, NOW)
+            fetch.assert_not_called()
+
+    def test_interim_failure_preserves_quarter_result_and_never_reuses_its_text(self):
+        def extract(_provider, sample, _now):
+            if sample['kind'] == 'semiannual': raise DataError('HTTP_ERROR')
+            return details(sample), {'windows': []}
+        result = diag.run_diagnosis(object(), anchors(), now=NOW, extract=extract)
+        self.assertEqual(result['status'], 'failed')
+        self.assertFalse(result['independentInterimReparse'])
+        self.assertEqual(result['results'][1]['status'], 'diagnosed')
+        self.assertEqual(result['results'][1]['independentInterim']['errorCode'], 'HTTP_ERROR')
+        self.assertFalse(result['results'][1]['independentInterim']['quarterTextReused'])
+
+    def test_independent_interim_common_extraction_and_builder_accept_same_date_total_nav(self):
+        pages = ['合成基金2026年中期报告',
+                 '2.1 基金基本情况\n基金主代码 508007\n2.2 基金产品说明',
+                 '4.1 基金经理简介\n姓名 职务 任职日期 离任日期 证券从业年限\n4.2 管理人报告',
+                 '4.4 报告期内基金的投资策略和运作分析\n'
+                 '本基金在报告期内维持审慎配置，并根据市场变化调整组合，重视现金流管理和长期投资价值。\n'
+                 '4.5 报告期内基金的业绩表现',
+                 '8.1 资产负债表\n单位：人民币元\n本期末 2026年6月30日 上年度末 2025年12月31日\n'
+                 '净资产合计 2,388,000,000.00 2,400,000,000.00\n8.2 利润表']
+        class Provider:
+            def __init__(self): self.calls = []
+            def get(self, url, **kwargs):
+                self.calls.append((url, kwargs)); return b'%PDF independent synthetic interim'
+        provider = Provider()
+        with patch('report_extract._pypdf_pages', return_value=pages):
+            result = diag.diagnose_interim(provider, anchors()['508007'], NOW, diag.extract_quarter)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(provider.calls[0][0], diag.SAMPLES[1]['interimUrl'])
+        self.assertTrue(result['identityVerified'])
+        self.assertEqual(result['sourcePortfolioCode'], '508007')
+        self.assertEqual(result['fieldCompleteness']['nav']['valueYuan'], 2388000000.0)
+        self.assertTrue(result['fieldCompleteness']['nav']['acceptedInSnapshot'])
+        self.assertTrue(result['fieldCompleteness']['strategy']['complete'])
+        self.assertFalse(result['fieldCompleteness']['strategy']['semanticComplete'])
+        self.assertFalse(result['fieldCompleteness']['managers']['complete'])
+        self.assertTrue(result['fieldCompleteness']['pdf']['allPagesProcessed'])
+        self.assertFalse(result['noEquitiesEvidence']['present'])
+        self.assertEqual(result['snapshot']['selectedReport']['navSourceUrl'], diag.SAMPLES[1]['interimUrl'])
+        self.assertLessEqual(sum(len(row['text']) for row in result['windows']), 1800)
+
+    def test_late_balance_sheet_and_nav_windows_survive_opening_metrics_without_full_text(self):
+        pages = ['3.1 主要财务指标\n' + '本期收入 100.00\n' * 80 + '\n3.2 其他财务指标\n无。\n3.3 后续情况',
+                 '8.1 资产负债表\n单位：人民币元\n本期末 2026年6月30日 上年度末 2025年12月31日\n'
+                 + '其他资产 100.00\n' * 80 + '净资产合计 123,456,789.00 100,000,000.00\n8.2 利润表',
+                 '4.1 基金经理简介\n姓名 职务 任职日期 离任日期 证券从业年限\n姓名 张某\n'
+                 '4.2 其他报告\n5.2 其他投资情况说明\n本节是合成的其他投资说明。\n5.3 后续情况']
+        windows = diag.bounded_table_windows(pages, [4, 40, 12])
+        selections = [row['selection'] for row in windows]
+        self.assertIn('nav-row-context', selections)
+        self.assertIn('balance-sheet-header', selections)
+        self.assertIn('manager-header-only', selections)
+        self.assertIn('other-investment', selections)
+        self.assertTrue(any('2026年6月30日' in row['text'] for row in windows))
+        self.assertTrue(any('净资产合计 123,456,789.00' in row['text'] for row in windows))
+        self.assertNotIn('张某', json.dumps(windows, ensure_ascii=False))
+        self.assertLessEqual(sum(len(row['text']) for row in windows), 1800)
+        self.assertLessEqual(len(windows), 6)
+        self.assertTrue(all(len(row['text']) <= 500 for row in windows))
+
+    def test_completeness_summary_does_not_accept_unbound_flags_or_portfolio_subtotals(self):
+        sample = diag.interim_sample(anchors()['508007'], NOW)
+        raw = details(sample, False)
+        raw.update(navYuan=float('nan'), portfolioSubtotalYuan=39582826.55,
+            strategySectionCoverage={'complete': True}, managerTableCoverage={'complete': True})
+        result = diag.field_summary(raw, diag.document(sample))
+        self.assertIsNone(result['nav']['valueYuan'])
+        self.assertFalse(result['nav']['portfolioSubtotalUsed'])
+        self.assertFalse(result['strategy']['complete'])
+        self.assertFalse(result['managers']['complete'])
 
     def test_strict_table_recognizer_counts_use_actual_shared_parser(self):
         fixture = json.loads((Path(__file__).parent / 'fixtures/nonstock-assets.json').read_text())

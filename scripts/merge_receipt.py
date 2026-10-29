@@ -10,7 +10,7 @@ import stat
 MAX_PAGE_BYTES = 8_000_000
 MAX_PAGES = 64
 MAX_TOTAL_BYTES = MAX_PAGE_BYTES * MAX_PAGES
-MAX_FUNDS = 4096
+MAX_FUNDS = 8192
 
 
 def read_merge_receipt(path, *, read_json, error_type=ValueError):

@@ -57,9 +57,10 @@ jobs:
         run: |
           ARGS=()
           if [ "$SOURCE_REPAIR" = 'true' ]; then ARGS+=(--source-repair); fi
-          # Use the existing 32-job allowance for one quarter, or split it evenly.
+          # Amortize full-data validation across more source-only batches.
           SHARDS=16
           if [ "$QUARTER" != 'both' ]; then SHARDS=32; fi
+          if [ "$SOURCE_REPAIR" = 'true' ]; then SHARDS=$((SHARDS * 2)); fi
           python scripts/campaign.py plan --quarter "$QUARTER" --shards "$SHARDS" --batch-size 75 "${ARGS[@]}"
           node scripts/workflow-outputs.js .cache/plan >> "$GITHUB_OUTPUT"
       - run: python scripts/publication_guard.py --root . --plan-dir .cache/plan

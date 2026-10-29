@@ -40,7 +40,7 @@ class ActionsAPI:
         self.deadline = time.monotonic() + 900
 
     def get(self, suffix, binary=False):
-        if not re.fullmatch(r'actions/(?:runs/\d+(?:/(?:artifacts|jobs)\?per_page=100)?|artifacts/\d+/zip)', suffix):
+        if not re.fullmatch(r'actions/(?:runs/\d+(?:/(?:artifacts|jobs)\?per_page=100(?:&page=2)?)?|artifacts/\d+/zip)', suffix):
             fail('RESUME_ENDPOINT_INVALID')
         try:
             raw = read_bounded_command(['gh', 'api', '--hostname', 'github.com',
@@ -106,7 +106,7 @@ def members(raw, metadata, run, allowed):
 def verify_matrix(plan, campaign):
     matrix = parse(plan.get('matrix.json', b'null'))
     selection = parse(campaign.get('selection.json', b'null'))
-    if (not isinstance(matrix, list) or not 1 <= len(matrix) <= 32 or not isinstance(selection, dict)
+    if (not isinstance(matrix, list) or not 1 <= len(matrix) <= 64 or not isinstance(selection, dict)
             or not isinstance(selection.get('quarters'), list) or not selection['quarters']
             or len(set(selection['quarters'])) != len(selection['quarters'])
             or not set(selection['quarters']).issubset(QUARTERS)):
@@ -114,17 +114,48 @@ def verify_matrix(plan, campaign):
     seen = set()
     for row in matrix:
         index = row.get('id') if isinstance(row, dict) else None
-        if (not isinstance(index, str) or not re.fullmatch(r'\d{1,2}', index) or index in seen
+        if (not isinstance(index, str) or not re.fullmatch(r'\d{1,2}', index) or int(index) > 63 or index in seen
                 or row.get('config') != f'batch-{index}.json' or row.get('quarter') not in selection['quarters']):
             fail('RESUME_PLAN_INVALID')
         config = parse(plan.get(row['config'], b'null'))
         if (not isinstance(config, dict) or config.get('quarter') != row['quarter']
                 or config.get('traversal', {}).get('batchId') != index):
             fail('RESUME_PLAN_INVALID')
+        if len(matrix) > 32:
+            from traversal import source_repair_mode
+            try:
+                source_only = source_repair_mode(config)
+            except Exception:
+                fail('RESUME_PLAN_INVALID')
+            if selection.get('sourceRepair') is not True or not source_only:
+                fail('RESUME_PLAN_INVALID')
         seen.add(index)
     if set(plan) != {'matrix.json', 'meta.json', *(row['config'] for row in matrix)}:
         fail('RESUME_PLAN_INVALID')
     return matrix
+
+
+def artifact_inventory(api, run_id):
+    """A 64-batch run needs 131 artifacts; read at most two bounded pages."""
+    endpoint = f'actions/runs/{run_id}/artifacts?per_page=100'
+    first = api.get(endpoint)
+    total = first.get('total_count') if isinstance(first, dict) else None
+    if type(total) is not int or not 0 <= total <= 200:
+        fail('RESUME_ARTIFACT_LIST_INVALID')
+    artifacts = []
+    for page in range(1, 3 if total > 100 else 2):
+        listing = first if page == 1 else api.get(endpoint + '&page=2')
+        rows = listing.get('artifacts') if isinstance(listing, dict) else None
+        if (not isinstance(rows, list) or listing.get('total_count') != total
+                or len(rows) != min(100, total - (page - 1) * 100)):
+            fail('RESUME_ARTIFACT_LIST_INVALID')
+        artifacts.extend(rows)
+    if (any(not isinstance(row, dict) or not isinstance(row.get('name'), str) or not row['name']
+            or type(row.get('id')) is not int or row['id'] <= 0 for row in artifacts)
+            or len({row['name'] for row in artifacts}) != total
+            or len({row['id'] for row in artifacts}) != total):
+        fail('RESUME_ARTIFACT_LIST_INVALID')
+    return {row['name']: row for row in artifacts}
 
 
 def stage(root, files):
@@ -300,13 +331,7 @@ def resume(run_id, source_commit, *, root='.', api=None, env=None, execute=None,
                 or previous.get('status') != 'merged' or not isinstance(previous.get('artifacts'), list)):
             fail('RESUME_MARKER_INVALID')
         return {**identity, 'status': 'already-published', 'sourceRequests': 0, 'marketDataRequests': 0}
-    listing = api.get(f'actions/runs/{run_id}/artifacts?per_page=100')
-    artifacts = listing.get('artifacts')
-    if (not isinstance(artifacts, list) or len(artifacts) > 100
-            or listing.get('total_count') != len(artifacts)
-            or len({x.get('name') for x in artifacts}) != len(artifacts)):
-        fail('RESUME_ARTIFACT_LIST_INVALID')
-    by_name = {x['name']: x for x in artifacts}
+    by_name = artifact_inventory(api, run_id)
     proofs = []
 
     def download(name, allowed):

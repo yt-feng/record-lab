@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Fail closed on unexpected public files or credential-shaped content."""
 import argparse
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
+import multiprocessing
 import re
 import subprocess
 import time
@@ -131,16 +134,89 @@ def history_blobs(root, max_bytes=None):
         process.stdin.close(); process.stdout.close()
 
 
-def scan_history(root, stats=None, progress=None, cached_blobs=frozenset(), verified_blobs=None):
+class HistoryContentChecks:
+    """At most two immutable blobs and one progress-blob budget in flight.
+
+    Metadata/path findings drain preceding content first, preserving the serial
+    finding order. Workers use the same detector; no verdict is accepted until
+    its future completes, and failed workers cannot produce a cache proof.
+    """
+    def __init__(self, findings, workers=1, max_pending_bytes=None):
+        if type(workers) is not int or workers not in (1, 2):
+            raise ValueError('Invalid history content worker count')
+        self.limit = MAX_PROGRESS_BYTES if max_pending_bytes is None else max_pending_bytes
+        if type(self.limit) is not int or not 1 <= self.limit <= MAX_PROGRESS_BYTES:
+            raise ValueError('Invalid history content buffer limit')
+        self.findings, self.workers = findings, workers
+        self.pool = None
+        self.pending = deque()
+        self.pending_bytes = self.peak_pending_bytes = self.peak_pending_blobs = 0
+
+    def __enter__(self):
+        return self
+
+    def drain_one(self):
+        future, size = self.pending.popleft()
+        result = future.result()  # A worker exception is a publication failure.
+        if (type(result) is not list or len(result) != len(set(result))
+                or any(type(item) is not str or item not in {*PATTERNS, 'unsupported_content', 'unsupported_encoding'}
+                       for item in result)):
+            raise RuntimeError('Invalid history content verdict')
+        self.findings.extend(result)
+        self.pending_bytes -= size
+
+    def drain(self):
+        while self.pending:
+            self.drain_one()
+
+    def add_findings(self, findings):
+        if findings:
+            self.drain()
+            self.findings.extend(findings)
+
+    def reserve(self, size):
+        if type(size) is not int or not 0 <= size <= self.limit:
+            raise RuntimeError('Invalid history content buffer')
+        while self.pending and (len(self.pending) >= self.workers or self.pending_bytes + size > self.limit):
+            self.drain_one()
+
+    def submit(self, data):
+        if type(data) is not bytes or len(data) > self.limit:
+            raise RuntimeError('Invalid history content buffer')
+        if self.workers == 1:
+            self.findings.extend(inspect_content(data, MAX_PROGRESS_BYTES))
+            return
+        self.reserve(len(data))
+        if self.pool is None:
+            self.pool = ProcessPoolExecutor(max_workers=self.workers,
+                                           mp_context=multiprocessing.get_context('spawn'))
+        future = self.pool.submit(inspect_content, data, MAX_PROGRESS_BYTES)
+        self.pending.append((future, len(data)))
+        self.pending_bytes += len(data)
+        self.peak_pending_bytes = max(self.peak_pending_bytes, self.pending_bytes)
+        self.peak_pending_blobs = max(self.peak_pending_blobs, len(self.pending))
+
+    def __exit__(self, error_type, error, traceback):
+        try:
+            if error_type is None:
+                self.drain()
+        finally:
+            for future, _ in self.pending:
+                future.cancel()
+            if self.pool is not None:
+                self.pool.shutdown(wait=True, cancel_futures=True)
+
+
+def scan_history(root, stats=None, progress=None, cached_blobs=frozenset(), verified_blobs=None, *, workers=1):
     findings = []
     seen_blobs = set()
     started = time.monotonic()
     last_progress = started
     commit_count = entry_count = cached_count = 0
-    with history_blobs(root, max_bytes=MAX_PROGRESS_BYTES) as read_blob:
+    with HistoryContentChecks(findings, workers) as checks, history_blobs(root, max_bytes=MAX_PROGRESS_BYTES) as read_blob:
         for commit in git(root, 'rev-list', '--all').decode().splitlines():
             commit_count += 1
-            findings.extend(inspect_commit_metadata(git(root, 'show', '-s',
+            checks.add_findings(inspect_commit_metadata(git(root, 'show', '-s',
                 '--format=%B%x00%an <%ae>%x00%cn%x00%ce', commit)))
             for entry in git(root, 'ls-tree', '-rlz', commit).split(b'\0'):
                 if not entry:
@@ -151,16 +227,21 @@ def scan_history(root, stats=None, progress=None, cached_blobs=frozenset(), veri
                 # Every path/mode is checked in every reachable tree, even if
                 # the same bytes were previously allowed at another path.
                 if mode in (b'120000', b'160000') or not allowed_path(name.decode()):
-                    findings.append('unexpected_history_file')
+                    checks.add_findings(['unexpected_history_file'])
                 elif kind == b'blob' and int(size) > content_limit(name.decode()):
-                    findings.append('unsupported_content')
+                    checks.add_findings(['unsupported_content'])
                 elif kind == b'blob' and oid not in seen_blobs:
                     seen_blobs.add(oid)
                     if oid in cached_blobs:
                         cached_count += 1
                     else:
+                        checks.reserve(int(size))
                         raw = read_blob(oid)
-                        findings.extend(['unsupported_content'] if raw is None else inspect_content(raw, MAX_PROGRESS_BYTES))
+                        if raw is None:
+                            checks.add_findings(['unsupported_content'])
+                        else:
+                            checks.submit(raw)
+                        del raw
                     now = time.monotonic()
                     if progress is not None and now-last_progress >= 30:
                         progress(f'history_scan_progress: commits={commit_count} tree_entries={entry_count} '
@@ -171,13 +252,16 @@ def scan_history(root, stats=None, progress=None, cached_blobs=frozenset(), veri
     if stats is not None:
         stats.update(commits=commit_count, tree_entries=entry_count, unique_blobs=len(seen_blobs),
                      cached_blobs=cached_count, fresh_blobs=len(seen_blobs)-cached_count,
-                     bytes=read_blob.bytes_read, elapsed_seconds=round(time.monotonic()-started, 3))
+                     bytes=read_blob.bytes_read, elapsed_seconds=round(time.monotonic()-started, 3),
+                     content_workers=workers, peak_pending_blobs=checks.peak_pending_blobs,
+                     peak_pending_bytes=checks.peak_pending_bytes)
     if verified_blobs is not None and not findings:
         verified_blobs.update(seen_blobs)
     return findings
 
 
-def scan(root, history=False, history_stats=None, history_progress=None, cached_blobs=frozenset(), verified_blobs=None):
+def scan(root, history=False, history_stats=None, history_progress=None, cached_blobs=frozenset(), verified_blobs=None,
+         *, history_workers=1):
     findings = []
     count = 0
     for file in root.rglob('*'):
@@ -197,7 +281,8 @@ def scan(root, history=False, history_stats=None, history_progress=None, cached_
             if name and not allowed_path(name):
                 findings.append('unexpected_tracked_file')
     if history:
-        findings.extend(scan_history(root, history_stats, history_progress, cached_blobs, verified_blobs))
+        findings.extend(scan_history(root, history_stats, history_progress, cached_blobs, verified_blobs,
+                                     workers=history_workers))
     return count, findings
 
 
@@ -230,9 +315,10 @@ def main():
     verified_blobs = set()
     cached_blobs = load_verified(root) if args.history else frozenset()
     if args.history:
-        print(f'history_cache_verified: blobs={len(cached_blobs)}')
+        print(f'history_cache_verified: blobs={len(cached_blobs)}', flush=True)
     try:
-        count, findings = scan(root, args.history, history_stats, print, cached_blobs, verified_blobs)
+        count, findings = scan(root, args.history, history_stats, print, cached_blobs, verified_blobs,
+                               history_workers=2)
         if args.plan_dir:
             extra_count, extra_findings = scan_plan(Path(args.plan_dir))
             count += extra_count

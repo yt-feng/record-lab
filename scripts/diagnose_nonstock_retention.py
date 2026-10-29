@@ -1,6 +1,6 @@
 """Read-only Actions diagnosis of two fixed report-retention cases.
 
-Only two quarterly PDFs are fetched. A digest-bound prior part is an observed
+Two quarterly PDFs and one fixed interim PDF are fetched. A digest-bound prior part is an observed
 mixed-report anchor, not an independently reparsed interim PDF. The replay
 never supplies the quarter's zero-stock proof as interim evidence. No campaign,
 market-price, model, or production-data writes are performed.
@@ -12,6 +12,7 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -43,6 +44,7 @@ SAMPLES = (
      'interimUrl': 'https://pdf.dfcfw.com/pdf/H2_AN202608271828542519_1.pdf'},
 )
 ERRORS = {'ANCHOR_DIGEST_MISMATCH', 'ANCHOR_INVALID', 'ANCHOR_PUBLICATION_MISMATCH', 'ANCHOR_PUBLICATION_MISSING',
+          'INTERIM_BINDING_INVALID', 'SOURCE_NOT_ALLOWED',
           'HTTP_REJECTED', 'HTTP_ERROR', 'TLS_FAILED',
           'TIMEOUT', 'NETWORK_ERROR', 'INVALID_PDF', 'EMPTY_RESPONSE', 'RESPONSE_TOO_LARGE',
           'PDF_PARSE_FAILED', 'PDF_TEXT_EMPTY', 'SNAPSHOT_BRIDGE_FAILED', 'DIAGNOSTIC_FAILED'}
@@ -148,18 +150,50 @@ def proof_summary(raw, doc):
 
 _HEADING = re.compile(r'^\s*(?:§\s*\d+|\d{1,2}(?:\.\d{1,2}){1,3})\s*[^\d\n]{2,120}$')
 _ASSET = re.compile(r'期末(?:不动产)?基金资产组合|其他(?:各项)?资产构成|资产负债表|股票投资明细|基础设施(?:基金)?投资组合|'
-                    r'(?:主要|其他)财务指标|其他(?:证券|金融资产)投资|投资组合(?:报告|情况)')
+                    r'(?:主要|其他)财务指标|其他(?:证券|金融资产)投资|其他投资情况说明|投资组合(?:报告|情况)|投资策略|运作分析|投资运作')
 _PRIVATE = re.compile(r'基金经理|联系人|联系方式|电话号码|身份证|邮箱|电子邮件|@|https?://')
+_NAV_ROW = re.compile(r'净资产合计|所有者权益合计|期末(?:基金)?资产净值|基金资产净值')
+_MONEY_CELL = re.compile(r'(?<![\d.])(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2,6}(?![\d.])')
+_MANAGER_HEADER_ROW = re.compile(r'^(?:姓名|职务|任职日期|离任日期|证券从业年限|证券从业|说明|任本基金的基金经理期限|任本基金的基金经理|期限|年限)+$')
 
 
 def bounded_table_windows(pages, numbers):
-    """Retain at most six short table regions, never a report or manager section."""
-    windows, budget = [], 1800
+    """Select at most six necessary fragments within one 1800-character budget.
+
+    Interim NAV rows can occur far beyond the opening indicators. Selection
+    prioritizes those rows and their balance-sheet headers without claiming
+    that any unvalidated number is a NAV. Manager output is header labels only.
+    """
+    candidates = []
+    def candidate(number, raw, following, selection, priority, limit):
+        raw = raw.strip()
+        excerpt = raw[:limit]
+        if not excerpt or inspect_content(excerpt.encode()):
+            return
+        candidates.append((priority, {'page': number, 'text': excerpt,
+            'textSha256': hashlib.sha256(excerpt.encode()).hexdigest(), 'truncated': len(excerpt) < len(raw),
+            'followingHeading': following, 'boundaryOnSamePage': following is not None,
+            'selection': selection}))
     for page, number in zip(pages, numbers):
         if type(number) is not int or not 1 <= number <= 300:
             continue
         lines = str(page).splitlines()
         for index, line in enumerate(lines):
+            compact = re.sub(r'\s+', '', line)
+            if (_NAV_ROW.search(compact) and _MONEY_CELL.search('\n'.join(lines[index:index + 2]))
+                    and not _PRIVATE.search(compact)):
+                region = lines[max(0, index - 1):index + 2]
+                if not any(_PRIVATE.search(re.sub(r'\s+', '', item)) for item in region):
+                    candidate(number, '\n'.join(region), None, 'nav-row-context', 0, 240)
+            if (_HEADING.fullmatch(line.strip()) and '基金经理' in compact
+                    and not _HEADING_PRIVATE.search(compact)):
+                headers = [line.strip()]
+                for following in lines[index + 1:index + 21]:
+                    if _HEADING.fullmatch(following.strip()): break
+                    if _MANAGER_HEADER_ROW.fullmatch(re.sub(r'[\s|]+', '', following)):
+                        headers.append(following.strip())
+                if len(headers) > 1:
+                    candidate(number, '\n'.join(headers), None, 'manager-header-only', 2, 180)
             if (_PRIVATE.search(line) or not _ASSET.search(re.sub(r'\s+', '', line))
                     or not _HEADING.fullmatch(line.strip())):
                 continue
@@ -172,15 +206,30 @@ def bounded_table_windows(pages, numbers):
                     break
                 region.append(item.strip())
             raw = '\n'.join(region).strip()
-            excerpt = raw[:min(500, budget)]
-            if not excerpt or inspect_content(excerpt.encode()):
+            if not any(item for item in region[1:]):
                 continue
-            windows.append({'page': number, 'text': excerpt, 'textSha256': hashlib.sha256(excerpt.encode()).hexdigest(),
-                            'truncated': len(excerpt) < len(raw), 'followingHeading': following,
-                            'boundaryOnSamePage': following is not None})
-            budget -= len(excerpt)
-            if len(windows) >= 6 or budget <= 0:
-                return windows
+            if '资产负债表' in compact: selection, priority, limit = 'balance-sheet-header', 1, 400
+            elif re.search(r'投资策略|运作分析|投资运作', compact): selection, priority, limit = 'strategy-opening', 3, 240
+            elif re.search(r'其他(?:证券|金融资产)?投资', compact): selection, priority, limit = 'other-investment', 4, 300
+            elif '资产组合' in compact: selection, priority, limit = 'asset-allocation', 5, 500
+            elif '其他财务指标' in compact: selection, priority, limit = 'other-financial', 6, 250
+            elif '主要财务指标' in compact: selection, priority, limit = 'financial-indicators', 7, 300
+            else: selection, priority, limit = 'other-table', 8, 400
+            candidate(number, raw, following, selection, priority, limit)
+    windows, budget, used = [], 1800, {}
+    for _, item in sorted(candidates, key=lambda row: row[0]):
+        selection = item['selection']
+        if used.get(selection, 0) >= (2 if selection == 'nav-row-context' else 1):
+            continue
+        if len(item['text']) > budget:
+            item = {**item, 'text': item['text'][:budget], 'truncated': True}
+            item['textSha256'] = hashlib.sha256(item['text'].encode()).hexdigest()
+        if not item['text']:
+            break
+        windows.append(item); used[selection] = used.get(selection, 0) + 1
+        budget -= len(item['text'])
+        if len(windows) >= 6 or budget <= 0:
+            break
     return windows
 
 
@@ -302,8 +351,12 @@ def document_structure(pages, numbers, doc, *, pdf_sha256, now):
 
 
 def extract_quarter(provider, sample, now):
-    """One source request and the same pypdf extractor/enrichment as collection."""
+    """One fixed-document request and the same extraction as collection."""
     doc, private = document(sample), {}
+    allowed = {(s['sourceUrl'], s['kind'], s['periodEnd']) for s in SAMPLES}
+    allowed.add((SAMPLES[1]['interimUrl'], 'semiannual', SAMPLES[1]['periodEnd']))
+    if (doc['sourceUrl'], doc['kind'], doc['periodEnd']) not in allowed:
+        raise DataError('SOURCE_NOT_ALLOWED')
     data = provider.get(doc['sourceUrl'], binary=True, attempts_override=1)
     if not isinstance(data, bytes) or not data.startswith(b'%PDF'):
         raise DataError('INVALID_PDF')
@@ -323,6 +376,58 @@ def extract_quarter(provider, sample, now):
         retrieved_at=now.isoformat(), on_private_sections=capture)
     details.update(reportPdfSourceUrl=doc['sourceUrl'], reportPdfPeriodEnd=doc['periodEnd'], reportPdfKind=doc['kind'])
     return details, {'pdfSha256': hashlib.sha256(data).hexdigest(), 'pdfBytes': len(data), **private}
+
+
+def interim_sample(anchor, now):
+    """Bind the sole independent interim request to its own retained metadata."""
+    sample = SAMPLES[1]
+    report = anchor.get('selectedReport') or {}
+    if (report.get('sourceUrl') != sample['interimUrl'] or report.get('kind') != 'semiannual'
+            or report.get('periodEnd') != sample['periodEnd']):
+        raise DataError('INTERIM_BINDING_INVALID')
+    published = report.get('publishedAt')
+    try:
+        if (not isinstance(published, str) or dt.date.fromisoformat(published).isoformat() != published
+                or not sample['periodEnd'] <= published <= china_today(now)):
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise DataError('INTERIM_BINDING_INVALID') from None
+    for other in anchor.get('reports') or []:
+        if other.get('sourceUrl') == sample['interimUrl'] and any(other.get(k) != report[k]
+                for k in ('publishedAt', 'periodEnd', 'kind')):
+            raise DataError('INTERIM_BINDING_INVALID')
+    return {**sample, 'sourceUrl': sample['interimUrl'], 'kind': 'semiannual', 'publishedAt': published,
+            'title': '中金山高集团高速公路封闭式基础设施证券投资基金2026年中期报告'}
+
+
+def field_summary(details, doc):
+    """Structured extractor results; absence remains unresolved, not inferred."""
+    from strategy_sections import normalize_strategy_section_coverage
+    from report_managers import normalize_manager_table_coverage
+    def bound(raw):
+        return isinstance(raw, dict) and all(raw.get(key) == doc[key] for key in
+            ('sourceUrl', 'periodEnd', 'publishedAt', 'kind'))
+    strategy_raw, manager_raw = details.get('strategySectionCoverage'), details.get('managerTableCoverage')
+    strategy = normalize_strategy_section_coverage(strategy_raw, doc['periodEnd']) if bound(strategy_raw) else None
+    managers = normalize_manager_table_coverage(manager_raw, details.get('reportManagers') or [], doc['periodEnd']) if bound(manager_raw) else None
+    nav = details.get('navYuan')
+    nav = nav if type(nav) in (int, float) and math.isfinite(nav) and nav >= 0 else None
+    stats = details.get('pageStats') or {}
+    return {'nav': {'status': 'extracted' if nav is not None else 'unresolved', 'valueYuan': nav,
+                    'sourceUrl': doc['sourceUrl'], 'periodEnd': doc['periodEnd'],
+                    'portfolioSubtotalUsed': False, 'requiresSourceRowReview': True},
+            'strategy': {'status': (strategy or {}).get('status', 'unresolved'),
+                'complete': bool(strategy and strategy.get('complete')), 'sectionCount': (strategy or {}).get('sectionCount', 0),
+                'sentenceCount': (strategy or {}).get('sentenceCount', 0),
+                'reasonCodes': (strategy or {}).get('reasonCodes', []), 'semanticComplete': False},
+            'managers': {'status': (managers or {}).get('status', 'unresolved'),
+                'complete': bool(managers and managers.get('complete')),
+                **{key: (managers or {}).get(key, 0) for key in
+                   ('candidateRows', 'parsedRows', 'excludedRows', 'outputManagerCount')}},
+            'pdf': {'allPagesProcessed': bool(stats.get('truncated') is False and
+                type(stats.get('totalPages')) is int and stats['totalPages'] > 0
+                and stats.get('processedPages') == stats['totalPages']),
+                'pageNumbersVerified': stats.get('pageNumbersVerified') is True}}
 
 
 class ReplayProvider:
@@ -388,24 +493,46 @@ def build_fund(fund, now):
 
 def report_summary(report):
     report = report or {}
-    return {key: report.get(key) for key in ('sourceUrl', 'kind', 'periodEnd', 'reportPdfSourceUrl', 'reportPdfKind',
-            'sourceTextHash', 'reportOnly', 'noEquitiesConfirmed')} | {
+    return {key: report.get(key) for key in ('sourceUrl', 'kind', 'periodEnd', 'publishedAt', 'reportPdfSourceUrl', 'reportPdfKind',
+            'sourceTextHash', 'reportOnly', 'noEquitiesConfirmed', 'navYuan', 'navSourceUrl')} | {
             'holdingsCount': len(report.get('holdings') or []),
             'noEquitiesEvidence': proof_summary(report.get('noEquitiesEvidence'), report)}
 
 
-def replay(sample, details, anchor, now, mixed):
+def replay(sample, details, anchor, now, mixed, *, independent_interim=False):
     provider = ReplayProvider(sample, details, anchor, mixed)
     fund, errors = collect_fund({'code': sample['code'], 'companyId': anchor.get('companyId')}, china_today(now),
         provider=provider, target_period='2026-06-30', baseline_period='2026-03-31')
     result = build_fund(fund, now)
-    return {'mode': 'retained-mixed-anchor-replay' if mixed else 'fresh-quarter-only',
-            'independentInterimReparse': False, 'sourceHttpRequests': 0, 'priceRequests': provider.price_calls,
+    return {'mode': 'independently-parsed-interim-only' if independent_interim else
+                    'retained-mixed-anchor-replay' if mixed else 'fresh-quarter-only',
+            'independentInterimReparse': independent_interim, 'sourceHttpRequests': 0, 'priceRequests': provider.price_calls,
             'detailsReadOrder': provider.calls, 'collectorReports': [report_summary(r) for r in fund['reports']],
             'collectorErrorCodes': sorted(set(e['errorCode'] for e in errors)),
             'buildErrorCount': result['errorCount'], 'buildErrorCodes': result.get('errorCodes', []),
             'fundStatus': result['fund'].get('status'),
             'selectedReport': report_summary(result['fund'].get('selectedReport'))}
+
+
+def diagnose_interim(provider, anchor, now, extract):
+    sample = interim_sample(anchor, now)
+    details, extracted = extract(provider, sample, now)
+    doc = document(sample)
+    identity = normalize_portfolio_identity(details.get('portfolioIdentityEvidence'), doc, now=now)
+    built = replay(sample, details, anchor, now, False, independent_interim=True)
+    fields = field_summary(details, doc)
+    selected = built.get('selectedReport') or {}
+    fields['nav']['acceptedInSnapshot'] = (fields['nav']['valueYuan'] is not None
+        and selected.get('sourceUrl') == doc['sourceUrl'] and selected.get('periodEnd') == doc['periodEnd']
+        and selected.get('navSourceUrl') == doc['sourceUrl'] and selected.get('navYuan') == fields['nav']['valueYuan'])
+    return {'status': 'diagnosed', 'independentlyParsed': True, 'quarterTextReused': False,
+        'sourceUrl': doc['sourceUrl'], 'kind': doc['kind'], 'periodEnd': doc['periodEnd'], 'publishedAt': doc['publishedAt'],
+        'publicationDateBinding': 'digest-bound-interim-announcement-metadata',
+        'identityVerified': bool(identity), 'sourcePortfolioCode': (identity or {}).get('sourcePortfolioCode'),
+        'shareClassCodes': (identity or {}).get('shareClassCodes', []), 'parseMethod': details.get('parseMethod'),
+        'sourceTextHash': details.get('sourceTextHash'), 'pageStats': details.get('pageStats'),
+        'noEquitiesEvidence': proof_summary(details.get('noEquitiesEvidence'), doc), 'fieldCompleteness': fields,
+        'snapshot': built, **extracted}
 
 
 def run_diagnosis(provider, anchors, *, now=None, extract=extract_quarter):
@@ -432,7 +559,8 @@ def run_diagnosis(provider, anchors, *, now=None, extract=extract_quarter):
                 quarterDetails={'noEquitiesEvidence': proof, 'parseMethod': details.get('parseMethod'),
                     'sourceTextHash': details.get('sourceTextHash'), 'pageStats': details.get('pageStats'),
                     'identityVerified': bool(identity), 'sourcePortfolioCode': (identity or {}).get('sourcePortfolioCode'),
-                    'shareClassCodes': (identity or {}).get('shareClassCodes', []), **extracted},
+                    'shareClassCodes': (identity or {}).get('shareClassCodes', []),
+                    'fieldCompleteness': field_summary(details, document(sample)), **extracted},
                 retainedAnchor={'sourceRunId': SOURCE_RUN, 'partSha256': SOURCE_PART_SHA256,
                     'quarterPublicationMetadata': quarter_publication_metadata(anchors[sample['code']], sample),
                     'originalEvidenceRetrievedAt': anchors[sample['code']]['selectedReport'].get('evidenceRetrievedAt'),
@@ -442,11 +570,20 @@ def run_diagnosis(provider, anchors, *, now=None, extract=extract_quarter):
         except Exception as error:
             code = getattr(error, 'code', 'DIAGNOSTIC_FAILED')
             item.update(status='failed', errorCode=code if code in ERRORS else 'DIAGNOSTIC_FAILED')
+        if sample['code'] == '508007':
+            try:
+                item['independentInterim'] = diagnose_interim(provider, anchors[sample['code']], now, extract)
+            except Exception as error:
+                code = getattr(error, 'code', 'DIAGNOSTIC_FAILED')
+                item['independentInterim'] = {'status': 'failed', 'errorCode': code if code in ERRORS else 'DIAGNOSTIC_FAILED',
+                    'independentlyParsed': False, 'quarterTextReused': False}
         results.append(item)
+    interim_ok = results[1].get('independentInterim', {}).get('status') == 'diagnosed'
     return {'schemaVersion': 1, 'observedAt': now.isoformat(), 'sourceRunId': SOURCE_RUN,
-            'productionDataUpdated': False, 'provesFullCollection': False, 'independentInterimReparse': False,
+            'productionDataUpdated': False, 'provesFullCollection': False, 'independentInterimReparse': interim_ok,
+            'independentInterimParseAttempted': True, 'maximumFixedPdfRequests': 3,
             'marketRequests': 0, 'modelRequests': 0, 'sampleCount': len(results),
-            'status': 'diagnosed' if all(r['status'] == 'diagnosed' for r in results) else 'failed', 'results': results}
+            'status': 'diagnosed' if interim_ok and all(r['status'] == 'diagnosed' for r in results) else 'failed', 'results': results}
 
 
 def main():

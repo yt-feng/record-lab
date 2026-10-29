@@ -1491,7 +1491,8 @@ def completion_audit(states, config, now, directory_pending=False, universe=None
 def plan_batches(catalog, previous, config, shards=4, batch_size=25, now=None, retained=()):
     current = utc_now(now)
     phase = phase_for(config)
-    if not isinstance(shards, int) or not isinstance(batch_size, int) or not 1 <= shards <= 32 or not 1 <= batch_size <= 100:
+    max_shards = 64 if source_repair_mode(config) else 32
+    if type(shards) is not int or type(batch_size) is not int or not 1 <= shards <= max_shards or not 1 <= batch_size <= 100:
         raise TraversalError("INVALID_ARGUMENTS")
     companies, records, states = base_states(catalog, previous, phase, current, config)
     from price_patches import binding_for

@@ -41,7 +41,7 @@ jobs:
           run-id: 40790220286
           github-token: ${{ github.token }}
           path: .cache/nonstock-retention-input
-      - name: Diagnose two public quarterly PDFs without market requests
+      - name: Diagnose fixed quarterly reports and one independent interim report
         run: python scripts/diagnose_nonstock_retention.py
       - name: Retain bounded diagnostic only
         if: always()
