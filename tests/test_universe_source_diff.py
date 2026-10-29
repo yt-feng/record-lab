@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from test_historical_universe import workbook, files, product, synthetic_pin, NOW
+from test_historical_universe import workbook, files, product, synthetic_pin, NOW, NS, REL
 import universe_source_diff as diff
 import verify_universe_sources as diagnostic
 
@@ -34,7 +34,81 @@ def comparison(june, august, root, page=None):
     return result, fetched
 
 
+def august_files(primary=None, codes=('508001', '508080', '508603', '890017')):
+    """Mirror the two-sheet layout observed in Actions 40795167383."""
+    entries = files(primary if primary is not None else [product(3, '508001'), product(4, '890017')])
+    entries['xl/worksheets/sheet1.xml'] = entries['xl/worksheets/sheet1.xml'].replace('基金产品索引', '公募基金产品索引')
+    entries['xl/workbook.xml'] = entries['xl/workbook.xml'].replace('</sheets>',
+        '<sheet name="Sheet2" sheetId="2" r:id="r3"/></sheets>')
+    entries['xl/_rels/workbook.xml.rels'] = entries['xl/_rels/workbook.xml.rels'].replace('</Relationships>',
+        f'<Relationship Id="r3" Type="{REL}/worksheet" Target="worksheets/sheet2.xml"/></Relationships>')
+    header = '<row r="1"><c r="A1" t="inlineStr" s="1"><is><t>产品代码</t></is></c></row>'
+    rows = ''.join(f'<row r="{row}"><c r="A{row}" s="1"><v>{int(code)}</v></c></row>'
+                   for row, code in enumerate(codes, 2))
+    entries['xl/worksheets/sheet2.xml'] = f'<worksheet xmlns="{NS}"><sheetData>{header}{rows}</sheetData></worksheet>'
+    return entries
+
+
 class UniverseSourceDiffTests(unittest.TestCase):
+    def test_observed_august_two_sheet_layout_keeps_auxiliary_only_codes_separate(self):
+        data = workbook(august_files())
+        summary, records = diff.parse_product_table(data, diff.SOURCES[1], diagnostic.explicit_period_dates)
+        self.assertTrue(summary['codeRowsComplete']); self.assertEqual(summary['parsedProductCodes'], 2)
+        self.assertEqual(summary['primarySheet'], 'Sheet1'); self.assertEqual(summary['workbookSheetCount'], 2)
+        self.assertEqual(set(records), {'508001', '890017'})
+        auxiliary = summary['auxiliaryCodeTables'][0]
+        self.assertEqual(auxiliary['parseStatus'], 'complete'); self.assertEqual(auxiliary['parsedUniqueCodes'], 4)
+        self.assertEqual(auxiliary['primaryComparison']['auxiliaryOnlyCodes'], ['508080', '508603'])
+        self.assertEqual(auxiliary['primaryComparison']['primaryOnlyCodes'], [])
+        self.assertEqual(auxiliary['primaryComparison']['unionCandidateCodeCount'], 4)
+        self.assertEqual(auxiliary['sampleMembership']['508080'], {'found': True, 'sourceRow': 3})
+        self.assertFalse(auxiliary['sameScopeAsPrimaryVerified']); self.assertFalse(auxiliary['usedAsProductRecords'])
+        self.assertFalse(auxiliary['primaryComparison']['unionIsProductCensus'])
+        with tempfile.TemporaryDirectory() as directory:
+            result, _ = comparison(workbook(), data, directory)
+        self.assertTrue(result['codeSetComparisonReady'])
+        self.assertEqual(result['sources'][1]['aggregateMinusParsedCodes'], 14583)
+        self.assertNotIn('508080', result['comparison']['addedCodes'])
+        sample = next(sample for sample in result['samples'] if sample['code'] == '508080')
+        self.assertFalse(sample['directoryMembership']['2026-08-31']['found'])
+        self.assertFalse(result['historicalUniverseVerified']); self.assertFalse(result['catalogCompletenessVerified'])
+        self.assertFalse(summary['historicalUniverseVerified'])
+
+    def test_auxiliary_invalid_codes_duplicates_and_row_gaps_do_not_become_union_evidence(self):
+        variants = []
+        duplicate = august_files(codes=('508001', '508001')); variants.append(duplicate)
+        for old, new in [('r="A3" s="1"', 'r="A3"'),
+                         ('r="A3" s="1"><v>', 'r="A3" s="1"><f>1</f><v>'),
+                         ('row r="3"><c r="A3"', 'row r="8"><c r="A8"')]:
+            entries = august_files(codes=('508001', '008015'))
+            entries['xl/worksheets/sheet2.xml'] = entries['xl/worksheets/sheet2.xml'].replace(old, new)
+            variants.append(entries)
+        for entries in variants:
+            summary, records = diff.parse_product_table(workbook(entries), diff.SOURCES[1], diagnostic.explicit_period_dates)
+            self.assertTrue(summary['codeRowsComplete']); self.assertEqual(len(records), 2)
+            auxiliary = summary['auxiliaryCodeTables'][0]
+            self.assertEqual(auxiliary['parseStatus'], 'partial')
+            self.assertFalse(auxiliary['codeRowsComplete']); self.assertNotIn('primaryComparison', auxiliary)
+            self.assertFalse(auxiliary['usedAsProductRecords'])
+
+    def test_auxiliary_unrecognized_header_is_reported_without_dropping_primary_rows(self):
+        entries = august_files(); entries['xl/worksheets/sheet2.xml'] = entries['xl/worksheets/sheet2.xml'].replace('产品代码', '其他代码')
+        summary, records = diff.parse_product_table(workbook(entries), diff.SOURCES[1], diagnostic.explicit_period_dates)
+        self.assertEqual(len(records), 2); self.assertTrue(summary['codeRowsComplete'])
+        self.assertEqual(summary['auxiliaryCodeTables'][0]['parseStatus'], 'failed')
+        self.assertEqual(summary['auxiliaryCodeTables'][0]['errorCode'], 'UNSUPPORTED_SCHEMA')
+
+    def test_two_sheet_acceptance_does_not_expand_june_or_unknown_sheet_layouts(self):
+        with self.assertRaises(diff.verify.VerificationError):
+            diff.parse_product_table(workbook(august_files()), diff.SOURCES[0], diagnostic.explicit_period_dates)
+        for old, new in [('name="Sheet2"', 'name="Other"'), ('name="Sheet2"', 'state="hidden" name="Sheet2"'),
+                         ('r:id="r3"', 'r:id="r1"')]:
+            entries = august_files(); entries['xl/workbook.xml'] = entries['xl/workbook.xml'].replace(old, new)
+            with self.assertRaises(diff.verify.VerificationError):
+                diff.parse_product_table(workbook(entries), diff.SOURCES[1], diagnostic.explicit_period_dates)
+        self.assertEqual(diff.history.EXPECTED_PRODUCTS, 14170)
+        self.assertEqual(diff.history.SOURCE_AS_OF, '2026-06-30')
+
     def test_unrecognized_table_preserves_bounded_header_shape_without_inferred_mapping(self):
         data_rows = [product(3, '508001', '公开样本基金甲'), product(4, '890017', '公开样本基金乙')]
         entries = files(data_rows)

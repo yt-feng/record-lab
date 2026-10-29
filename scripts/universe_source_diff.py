@@ -107,8 +107,59 @@ def _inception(cell, as_of):
     return (value, value > as_of)
 
 
+def _sheet_rows(book, sheet, relationships):
+    relation = next((v for k, v in sheet.attrib.items() if verify.local(k) == 'id'), None)
+    target = relationships.get(relation)
+    if not target or target[0] != 'worksheet': raise verify.VerificationError('UNSUPPORTED_SCHEMA')
+    groups = [g for g in book.xml(target[1], 'worksheet') if verify.local(g.tag) == 'sheetData']
+    if len(groups) != 1: raise verify.VerificationError('UNSUPPORTED_SCHEMA')
+    return list(groups[0]), target[1]
+
+
+def _auxiliary_codes(book, sheet, relationships, shared, formats, primary_codes, primary_complete):
+    """The observed August Sheet2 is a code-only list, not product metadata."""
+    rows, _ = _sheet_rows(book, sheet, relationships)
+    if not 2 <= len(rows) <= MAX_PRODUCTS + 1: raise verify.VerificationError('XML_LIMIT')
+    parsed, physical, rejections = [], [], Counter()
+    for index, row in enumerate(rows):
+        if verify.local(row.tag) != 'row' or not re.fullmatch(r'[1-9][0-9]{0,6}', row.get('r', '')):
+            raise verify.VerificationError('UNSUPPORTED_SCHEMA')
+        number = int(row.get('r')); physical.append(number)
+        cells = [book.cell(c, number, shared, formats) for c in row if verify.local(c.tag) == 'c']
+        if index == 0:
+            if (number != 1 or len(cells) != 1 or cells[0]['column'] != 'A'
+                    or cells[0]['hasFormula'] or cells[0]['value'] != '产品代码'):
+                raise verify.VerificationError('UNSUPPORTED_SCHEMA')
+            continue
+        if len(cells) != 1 or cells[0]['column'] != 'A':
+            rejections['COLUMN_MISMATCH'] += 1; continue
+        code = history.product_code(cells[0])
+        if code is None: rejections['CODE_INVALID'] += 1; continue
+        parsed.append((code, number))
+    duplicates = {code for code, count in Counter(code for code, _ in parsed).items() if count > 1}
+    codes = {code: row for code, row in parsed if code not in duplicates}
+    sequence = physical == list(range(1, len(rows) + 1))
+    complete = not duplicates and not rejections and sequence and len(codes) == len(rows) - 1
+    result = {'sheet': sheet.get('name'), 'header': '产品代码',
+        'recordUnit': 'auxiliary-code-without-name-or-inception',
+        'observedCodeRows': len(rows) - 1, 'parsedUniqueCodes': len(codes),
+        'codeRowsComplete': complete, 'duplicateCodeCount': len(duplicates),
+        'rowRejections': dict(rejections), 'physicalSequenceComplete': sequence,
+        'productMetadataAvailable': False, 'sameScopeAsPrimaryVerified': False,
+        'usedAsProductRecords': False, 'historicalUniverseVerified': False,
+        'sampleMembership': {sample['code']: {'found': (sample['code'] in codes if complete or sample['code'] in codes else None),
+            'sourceRow': codes.get(sample['code'])} for sample in SAMPLES}}
+    if complete and primary_complete:
+        result['primaryComparison'] = {'commonCodeCount': len(codes.keys() & primary_codes),
+            'auxiliaryOnlyCodes': sorted(codes.keys() - primary_codes),
+            'primaryOnlyCodes': sorted(primary_codes - codes.keys()),
+            'unionCandidateCodeCount': len(codes.keys() | primary_codes),
+            'unionIsProductCensus': False, 'differencesExplainAggregateGap': False}
+    return result
+
+
 def parse_product_table(data, source, dates):
-    """Inspect exact four-column tables without changing the pinned adapter."""
+    """Inspect observed June/August layouts without changing the pinned adapter."""
     book = verify.Workbook(data)
     try:
         relationships = book.relationship_targets(); shared, formats = book.strings_and_styles(relationships)
@@ -117,13 +168,13 @@ def parse_product_table(data, source, dates):
         if len(properties) > 1 or any(n.get('date1904', '0') not in ('0', 'false') for n in properties):
             raise verify.VerificationError('UNSUPPORTED_SCHEMA')
         sheets = [n for group in workbook if verify.local(group.tag) == 'sheets' for n in group if verify.local(n.tag) == 'sheet']
-        if len(sheets) != 1: raise verify.VerificationError('UNSUPPORTED_SCHEMA')
-        relation = next((v for k, v in sheets[0].attrib.items() if verify.local(k) == 'id'), None)
-        target = relationships.get(relation)
-        if not target or target[0] != 'worksheet': raise verify.VerificationError('UNSUPPORTED_SCHEMA')
-        groups = [g for g in book.xml(target[1], 'worksheet') if verify.local(g.tag) == 'sheetData']
-        if len(groups) != 1: raise verify.VerificationError('UNSUPPORTED_SCHEMA')
-        rows = list(groups[0])
+        august_pair = (source['asOf'] == '2026-08-31' and len(sheets) == 2
+                       and [s.get('name') for s in sheets] == ['Sheet1', 'Sheet2']
+                       and all(s.get('state', 'visible') == 'visible' for s in sheets))
+        if len(sheets) != 1 and not august_pair: raise verify.VerificationError('UNSUPPORTED_SCHEMA')
+        rows, primary_path = _sheet_rows(book, sheets[0], relationships)
+        if august_pair and _sheet_rows(book, sheets[1], relationships)[1] == primary_path:
+            raise verify.VerificationError('UNSUPPORTED_SCHEMA')
         if not 3 <= len(rows) <= MAX_PRODUCTS + 2: raise verify.VerificationError('XML_LIMIT')
         parsed, observed_codes, rejections, headers, serials, physical = [], [], Counter(), [], [], []
         for index, row in enumerate(rows):
@@ -152,8 +203,10 @@ def parse_product_table(data, source, dates):
             if future: rejections['FOUNDATION_AFTER_INDEX_DATE'] += 1; continue
             parsed.append({'code': code, 'name': name, 'nameFromCachedFormula': name_cell['hasFormula'],
                            'inceptionDate': inception, 'row': number})
+        valid_title = headers[0][0].startswith('基金产品索引') or (
+            source['asOf'] == '2026-08-31' and headers[0][0].startswith('公募基金产品索引'))
         if (headers[1] != ['序号', '基金代码', '基金简称', '设立日期'] or headers[0][1:] != ['', '', '']
-                or not headers[0][0].startswith('基金产品索引')):
+                or not valid_title):
             raise verify.VerificationError('UNSUPPORTED_SCHEMA')
         duplicates = {code for code, count in Counter(observed_codes).items() if count > 1}
         records = {r['code']: r for r in parsed if r['code'] not in duplicates}
@@ -161,6 +214,7 @@ def parse_product_table(data, source, dates):
         codes_complete = not rejections and not duplicates and sequence and len(records) == len(rows) - 2
         header_dates = dates(' '.join(headers[0] + headers[1]))
         summary = {**source, 'sourceSha256': hashlib.sha256(data).hexdigest(), 'downloadedBytes': len(data),
+            'primarySheet': sheets[0].get('name'), 'workbookSheetCount': len(sheets),
             'recordUnit': 'product-code-not-share-class-census', 'observedProductRows': len(rows) - 2,
             'parsedProductCodes': len(records), 'codeRowsComplete': codes_complete,
             'namesParsed': len(records), 'cachedFormulaNamesParsed': sum(r['nameFromCachedFormula'] for r in records.values()),
@@ -169,6 +223,14 @@ def parse_product_table(data, source, dates):
             'inceptionDatesParsed': sum(r['inceptionDate'] is not None for r in records.values()),
             'inceptionDatesUnresolved': sum(r['inceptionDate'] is None for r in records.values()),
             'headerExplicitDates': header_dates, 'historicalUniverseVerified': False}
+        if august_pair:
+            try:
+                auxiliary = _auxiliary_codes(book, sheets[1], relationships, shared, formats, records.keys(), codes_complete)
+                auxiliary['parseStatus'] = 'complete' if auxiliary['codeRowsComplete'] else 'partial'
+            except verify.VerificationError as error:
+                auxiliary = {'sheet': 'Sheet2', 'parseStatus': 'failed', 'errorCode': error.code,
+                    'usedAsProductRecords': False, 'historicalUniverseVerified': False}
+            summary['auxiliaryCodeTables'] = [auxiliary]
         return summary, records
     finally:
         book.archive.close()
