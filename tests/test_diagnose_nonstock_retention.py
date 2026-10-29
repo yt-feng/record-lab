@@ -274,6 +274,45 @@ class NonstockRetentionTests(unittest.TestCase):
         self.assertLessEqual(len(windows), 6)
         self.assertTrue(all(len(row['text']) <= 500 for row in windows))
 
+    def test_observed_reit_asset_title_and_other_financial_metrics_are_captured(self):
+        pages = ['3.1 主要财务指标\n本期收入 10.00\n3.2 其他财务指标\n'
+                 '本期末指标 未披露净资产\n3.3 不动产基金收益分配情况',
+                 '§ 5 除不动产资产支持证券之外的投资组合报告\n'
+                 '5.1 报告期末 不动产 基金资产组合情况\n序号 项目 金额 比例\n'
+                 '1 银行存款 100.00 100.00\n2 合计 100.00 100.00\n'
+                 '5.2 其他证券投资情况\n本节为合成诊断内容\n5.3 其他说明']
+        windows = diag.bounded_table_windows(pages, [4, 11])
+        asset = next(row for row in windows if row['text'].startswith('5.1'))
+        self.assertEqual(asset['page'], 11)
+        self.assertIn('1 银行存款', asset['text'])
+        self.assertEqual(asset['followingHeading'], '5.2 其他证券投资情况')
+        self.assertTrue(asset['boundaryOnSamePage'])
+        self.assertTrue(any(row['text'].startswith('3.2') for row in windows))
+        self.assertLessEqual(sum(len(row['text']) for row in windows), 1800)
+        self.assertNotIn('noEquitiesConfirmed', asset)
+        self.assertNotIn('navYuan', asset)
+
+    def test_late_manager_and_investment_headings_replace_early_outline_without_body_leaks(self):
+        pages = ['合成基金2026年第2季度报告\n' + '\n'.join(
+            f'4.{index} 不动产项目运营情况说明' for index in range(1, 26)),
+            '6.1 基金经理简介\n姓名 张某\n任职日期 2020年1月1日\n'
+            '6.2 基金经理联系方式\n不要输出\n'
+            '7.1 投资策略和运作分析\n这里的全文不得输出\n'
+            '7.2 股票投资明细\n股票正文不得输出\n'
+            '1.其他可能的调整项，如不动产基金发行份额募集的']
+        result = diag.document_structure(pages, [1, 12], diag.document(diag.SAMPLES[1]),
+            pdf_sha256='a' * 64, now=NOW)
+        headings = [row['text'] for row in result['headings']]
+        for required in ('6.1 基金经理简介', '7.1 投资策略和运作分析', '7.2 股票投资明细'):
+            self.assertIn(required, headings)
+        self.assertEqual(headings[:4], [f'4.{index} 不动产项目运营情况说明' for index in range(1, 5)])
+        self.assertTrue(result['headingsTruncated'])
+        self.assertLessEqual(len(headings), 16)
+        self.assertLessEqual(sum(map(len, headings)), 640)
+        encoded = json.dumps(result, ensure_ascii=False)
+        for excluded in ('张某', '不要输出', '这里的全文不得输出', '股票正文不得输出', '联系方式', '1.其他可能'):
+            self.assertNotIn(excluded, encoded)
+
     def test_structure_excerpts_are_bounded_and_omit_contact_or_free_prose(self):
         email = 'private' + '@' + 'example.org'
         text = ('联系人 不输出\n' + email + '\n2026年第2季度报告\n'

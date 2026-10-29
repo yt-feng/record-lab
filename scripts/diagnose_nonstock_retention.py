@@ -147,8 +147,8 @@ def proof_summary(raw, doc):
 
 
 _HEADING = re.compile(r'^\s*(?:§\s*\d+|\d{1,2}(?:\.\d{1,2}){1,3})\s*[^\d\n]{2,120}$')
-_ASSET = re.compile(r'期末基金资产组合|其他(?:各项)?资产构成|资产负债表|股票投资明细|基础设施(?:基金)?投资组合|'
-                    r'主要财务指标|其他(?:证券|金融资产)投资|投资组合(?:报告|情况)')
+_ASSET = re.compile(r'期末(?:不动产)?基金资产组合|其他(?:各项)?资产构成|资产负债表|股票投资明细|基础设施(?:基金)?投资组合|'
+                    r'(?:主要|其他)财务指标|其他(?:证券|金融资产)投资|投资组合(?:报告|情况)')
 _PRIVATE = re.compile(r'基金经理|联系人|联系方式|电话号码|身份证|邮箱|电子邮件|@|https?://')
 
 
@@ -201,8 +201,10 @@ _IDENTITY_BRANCHES = {'VERIFIED', 'INVALID_INPUT', 'PAGE_MAPPING_LENGTH_MISMATCH
     'IDENTITY_SECTION_END_NOT_FOUND', 'IDENTITY_SECTION_PAGE_MAPPING_INVALID', 'DUPLICATE_CODE_LABEL',
     'MAIN_CODE_LABEL_NOT_FOUND', 'CODE_ROWS_EXCEED_BOUND', 'CODE_ROW_INVALID', 'PROOF_VALIDATION_REJECTED',
     'TRADING_CODE_LABEL_NOT_FOUND', 'REIT_CODE_MISMATCH', 'REIT_UNEXPECTED_CODE_LABEL'}
-_STRUCTURE_HEADING = re.compile(r'^\s*(?:§\s*)?\d{1,2}(?:[.．]\d{1,2}){0,3}\s*[^\d\n]{2,100}$')
+_STRUCTURE_HEADING = re.compile(r'^\s*(?:§\s*\d{1,2}|\d{1,2}(?:[.．]\d{1,2}){1,3}|\d{1,2}\s+)\s*[^\d\n]{2,100}$')
 _STRUCTURE_TOPIC = re.compile(r'基金|基础设施|项目|资产|投资|财务|管理|净值|运营')
+_HEADING_PRIVATE = re.compile(r'联系人|联系方式|电话号码|身份证|邮箱|电子邮件|@|https?://')
+_PRIORITY_HEADING = re.compile(r'基金经理|投资策略|运作分析|投资组合|证券投资|股票投资|资产组合|其他财务指标')
 _CODE_LABEL = re.compile(r'^(?:基金主代码|基金代码|场内代码|交易代码|下属(?:分级|分类)基金的交易代码)[：:|]*')
 
 
@@ -226,10 +228,11 @@ def document_structure(pages, numbers, doc, *, pdf_sha256, now):
         'requestedCodeMatched': bool(identity and doc['fundCode'] in
             [identity['sourcePortfolioCode'], *identity['shareClassCodes']])},
         'titleWindow': None, 'periodTitles': [], 'headings': [], 'codeRows': [],
+        'headingSelection': 'first-four-and-relevant-then-document-order', 'headingsTruncated': False,
         'formatSignals': {'infrastructureFundMentions': 0, 'infrastructureProjectHeadings': 0,
                           'standardProductOverviewHeadings': 0},
         'diagnosticOnly': True}
-    heading_budget, title_seen, code_seen = 640, set(), set()
+    heading_candidates, title_seen, code_seen = [], set(), set()
     for page, number in zip(pages, numbers):
         if type(number) is not int or not 1 <= number <= 300:
             continue
@@ -238,6 +241,13 @@ def document_structure(pages, numbers, doc, *, pdf_sha256, now):
         result['formatSignals']['infrastructureFundMentions'] += len(re.findall(r'基础设施(?:证券投资)?基金|基础设施证券投资', compact_page))
         for index, line in enumerate(lines):
             compact = re.sub(r'\s+', '', line)
+            # Public heading labels may mention a fund manager; only the
+            # heading is retained, never the appointment/body/contact rows.
+            if (len(line) <= 120 and _STRUCTURE_HEADING.fullmatch(line) and _STRUCTURE_TOPIC.search(compact)
+                    and not _HEADING_PRIVATE.search(compact) and not inspect_content(line.encode())):
+                result['formatSignals']['infrastructureProjectHeadings'] += bool(re.search(r'基础设施|项目', compact))
+                result['formatSignals']['standardProductOverviewHeadings'] += '基金产品概况' in compact
+                heading_candidates.append({'page': number, 'text': line})
             if not line or _PRIVATE.search(compact) or inspect_content(line.encode()):
                 continue
             for match in PERIOD.finditer(line):
@@ -253,12 +263,6 @@ def document_structure(pages, numbers, doc, *, pdf_sha256, now):
                     if len(title) <= 180 and not _PRIVATE.search(re.sub(r'\s+', '', title)) and not inspect_content(title.encode()):
                         result['titleWindow'] = {'page': number, 'text': title,
                             'textSha256': hashlib.sha256(title.encode()).hexdigest()}
-            if len(line) <= 120 and _STRUCTURE_HEADING.fullmatch(line) and _STRUCTURE_TOPIC.search(compact):
-                result['formatSignals']['infrastructureProjectHeadings'] += bool(re.search(r'基础设施|项目', compact))
-                result['formatSignals']['standardProductOverviewHeadings'] += '基金产品概况' in compact
-                if len(result['headings']) < 16 and len(line) <= heading_budget:
-                    result['headings'].append({'page': number, 'text': line})
-                    heading_budget -= len(line)
             label = _CODE_LABEL.match(compact)
             if label and len(result['codeRows']) < 4:
                 # Only exact labels followed solely by six-digit codes are
@@ -278,6 +282,22 @@ def document_structure(pages, numbers, doc, *, pdf_sha256, now):
                     code_seen.add(excerpt)
                     result['codeRows'].append({'page': number, 'text': excerpt, 'codes': codes,
                         'requestedCodeMentioned': doc['fundCode'] in codes, 'provesIdentity': False})
+    # Preserve the opening identity context, but reserve space for manager and
+    # investment headings late in a REIT report. The output keeps its original
+    # document order and the same 16-heading / 640-character total bound.
+    priority = [i for i, row in enumerate(heading_candidates) if _PRIORITY_HEADING.search(re.sub(r'\s+', '', row['text']))]
+    selected, budget = set(), 640
+    for index in [*range(min(4, len(heading_candidates))), *priority, *range(len(heading_candidates))]:
+        if index in selected:
+            continue
+        row = heading_candidates[index]
+        if len(selected) >= 16:
+            break
+        if len(row['text']) <= budget:
+            selected.add(index)
+            budget -= len(row['text'])
+    result['headings'] = [row for i, row in enumerate(heading_candidates) if i in selected]
+    result['headingsTruncated'] = len(selected) < len(heading_candidates)
     return result
 
 
