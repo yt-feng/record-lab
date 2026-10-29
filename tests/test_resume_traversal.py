@@ -146,5 +146,73 @@ class ResumeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'REMOTE_READBACK_FAILED'):
                 resume.verify_persisted('123', 'a' * 40, root=root, execute=changed)
 
+    def test_diagnostic_identity_cannot_enter_publisher_and_reverse(self):
+        run, env = identity()
+        diagnostic = {**env, 'GITHUB_WORKFLOW_REF':
+                      f'{resume.REPOSITORY}/{resume.DIAGNOSTIC_WORKFLOW}@refs/heads/main'}
+        resume.verify_run(run, '123', 'a' * 40, diagnostic, diagnostic=True)
+        with self.assertRaisesRegex(ValueError, 'IDENTITY_INVALID'):
+            resume.verify_run(run, '123', 'a' * 40, diagnostic)
+        with self.assertRaisesRegex(ValueError, 'IDENTITY_INVALID'):
+            resume.verify_run(run, '123', 'a' * 40, env, diagnostic=True)
+
+    def test_diagnostic_failure_only_retains_fixed_classifications_and_receipt_sizes(self):
+        api = API()
+        env = {**api.env, 'GITHUB_WORKFLOW_REF':
+               f'{resume.REPOSITORY}/{resume.DIAGNOSTIC_WORKFLOW}@refs/heads/main'}
+        def failed(command, **kwargs):
+            self.assertEqual(command[-2:], ['scripts/campaign.py', 'publish'])
+            self.assertEqual(kwargs['env']['GITHUB_RUN_ID'], '123')
+            self.assertEqual(kwargs['env']['GITHUB_SHA'], 'a' * 40)
+            receipt = Path(kwargs['cwd']) / '.cache/parts-2026Q2/merge-receipt.json'
+            receipt.parent.mkdir(parents=True)
+            receipt.write_bytes(b'{}\n')
+            kwargs['stdout'].write(b'private exception text, never retain\n')
+            kwargs['stdout'].write(resume.encoded({'status': 'failed', 'errorCode': 'READ_FAILED',
+                'readDiagnostic': {'inputKind': 'merge-receipt', 'reason': 'too-large', 'byteLength': 26000000,
+                                   'maxBytes': 25000000, 'privateException': 'not permitted'}}))
+            kwargs['stdout'].write(resume.encoded({'status': 'failed', 'errorCode': 'CAMPAIGN_FAILED'}))
+            kwargs['stdout'].write(resume.encoded({'errorCode': 'private failure text'}))
+            return subprocess.CompletedProcess(command, 1)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            result = resume.resume('123', 'a' * 40, root=root, api=api, env=env,
+                                   execute=failed, diagnostic=True)
+            self.assertEqual(result['status'], 'diagnosed')
+            self.assertEqual(result['mergeOutcome'], 'failed')
+            self.assertFalse(result['productionDataUpdated'])
+            self.assertFalse(result['rawLogsRetained'])
+            self.assertEqual(result['generatedReceiptSizes'], [{'quarter': '2026Q2', 'byteLength': 3}])
+            self.assertEqual(result['diagnostics'], [{'errorCode': 'READ_FAILED', 'readDiagnostic': {
+                'inputKind': 'merge-receipt', 'reason': 'too-large', 'byteLength': 26000000, 'maxBytes': 25000000}},
+                {'errorCode': 'CAMPAIGN_FAILED'}])
+            self.assertNotIn(b'private', resume.encoded(result))
+            self.assertFalse((root / 'web/data/traversal-resumptions/123-1.json').exists())
+
+    def test_diagnostic_success_does_not_create_or_replace_production_marker(self):
+        api = API()
+        env = {**api.env, 'GITHUB_WORKFLOW_REF':
+               f'{resume.REPOSITORY}/{resume.DIAGNOSTIC_WORKFLOW}@refs/heads/main'}
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            marker = root / 'web/data/traversal-resumptions/123-1.json'
+            original = b'{ "original": "retained" }\n'
+            resume.stage(marker.parent, {marker.name: original})
+            result = resume.resume('123', 'a' * 40, root=root, api=api, env=env, diagnostic=True,
+                execute=lambda command, **kwargs: subprocess.CompletedProcess(command, 0))
+            self.assertEqual(result['mergeOutcome'], 'passed')
+            self.assertEqual(marker.read_bytes(), original)
+
+    def test_diagnostic_workflow_has_read_only_permissions_and_no_publication_steps(self):
+        workflow = (Path(__file__).resolve().parents[1] / resume.DIAGNOSTIC_WORKFLOW).read_text()
+        self.assertIn('contents: read', workflow)
+        self.assertIn('actions: read', workflow)
+        self.assertIn('persist-credentials: false', workflow)
+        self.assertIn('timeout-minutes: 90', workflow)
+        self.assertIn('--diagnostic', workflow)
+        for forbidden in ('contents: write', 'pages: write', 'published-records', 'persist-observations',
+                          'deploy-pages', 'prepare-site', 'secrets.'):
+            self.assertNotIn(forbidden, workflow)
+
 
 if __name__ == '__main__': unittest.main()

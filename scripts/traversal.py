@@ -983,20 +983,20 @@ def valid_report_managers(fund, report, phase):
             and sorted(manager_key(manager) for manager in managers) == sorted(expected))
 
 
-def report_quality(fund, phase, now):
-    """Measure retained source evidence, not a collector's success flag."""
+def _report_quality_with_coverage(fund, phase, now):
+    """Measure one immutable observation and retain its computed coverage."""
     if not isinstance(fund, dict) or not is_code(fund.get("code")):
-        return None
+        return None, None
     report = fund.get("selectedReport")
     observed = instant(fund.get("retrievedAt"))
     if (not isinstance(report, dict) or report.get("periodEnd") != phase["targetPeriodEnd"]
             or not public_url(report.get("sourceUrl")) or not observed or observed > now + dt.timedelta(minutes=5)):
-        return None
+        return None, None
     published = date(report.get("publishedAt"))
     if not published or published < date(report["periodEnd"]) or published > china_date(observed):
-        return None
+        return None, None
     if report.get("fundCode") not in (None, fund["code"]) or report.get("sourceFundCode") not in (None, fund["code"]):
-        return None
+        return None, None
     fields = {key: "missing" for key in QUALITY_FIELDS}
     if valid_report_managers(fund, report, phase):
         fields["managers"] = "complete"
@@ -1076,7 +1076,12 @@ def report_quality(fund, phase, now):
               "pdfRetryable": not report.get("parseMethod") and report.get("parseErrorCode") in (None, *RECOVERABLE_ERRORS)}
     if fields["baseline"] == "not-applicable" and valid_baseline_exemption(baseline_exemption, now):
         result["baselineExemption"] = baseline_exemption
-    return result
+    return result, coverage
+
+
+def report_quality(fund, phase, now):
+    """Measure retained source evidence, not a collector's success flag."""
+    return _report_quality_with_coverage(fund, phase, now)[0]
 
 
 def quality_eligible(states):
@@ -1142,10 +1147,9 @@ def hydrate_quality(states, retained, phase, now):
         finally:
             validator.close()
     for fund in observations():
-        quality = report_quality(fund, phase, now)
+        quality, coverage = _report_quality_with_coverage(fund, phase, now)
         if quality is None:
             continue
-        coverage = price_coverage(fund, now)
         codes = [fund["code"]]
         classes = fund.get("shareClassCodes")
         canonical = fund.get("sourcePortfolioCode")

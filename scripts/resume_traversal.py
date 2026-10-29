@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import zipfile
 
@@ -19,6 +20,7 @@ from recover_batches import parse, encoded, RecoveryError
 
 REPOSITORY = 'yt-feng/record-lab'
 WORKFLOW = '.github/workflows/resume-traversal.yml'
+DIAGNOSTIC_WORKFLOW = '.github/workflows/diagnose-traversal-publication.yml'
 QUARTERS = {'2026Q2', '2026Q3'}
 MAX_ARCHIVE = 64_000_000
 MAX_EXPANDED = 128_000_000
@@ -48,9 +50,10 @@ class ActionsAPI:
             fail('RESUME_API_UNAVAILABLE')
 
 
-def verify_run(run, run_id, source_commit, env):
+def verify_run(run, run_id, source_commit, env, *, diagnostic=False):
+    workflow = DIAGNOSTIC_WORKFLOW if diagnostic else WORKFLOW
     if (env.get('GITHUB_ACTIONS') != 'true' or env.get('GITHUB_REPOSITORY') != REPOSITORY
-            or env.get('GITHUB_WORKFLOW_REF') != f'{REPOSITORY}/{WORKFLOW}@refs/heads/main'
+            or env.get('GITHUB_WORKFLOW_REF') != f'{REPOSITORY}/{workflow}@refs/heads/main'
             or not re.fullmatch(r'[1-9][0-9]{0,19}', str(run_id))
             or not re.fullmatch(r'[a-f0-9]{40}', source_commit)):
         fail('RESUME_IDENTITY_INVALID')
@@ -161,15 +164,60 @@ def verify_persisted(run_id, source_commit, *, root='.', execute=None):
     return {'status': 'remote-verified', 'runId': str(run_id)}
 
 
-def resume(run_id, source_commit, *, root='.', api=None, env=None, execute=None):
+def diagnostic_merge(root, env, *, execute=None):
+    """Keep raw child output ephemeral; return only fixed classifications."""
+    runner = execute or subprocess.run
+    timed_out = False
+    with tempfile.TemporaryFile() as output:
+        try:
+            process = runner([sys.executable, 'scripts/campaign.py', 'publish'], cwd=root,
+                env=env, stdout=output, stderr=subprocess.STDOUT, timeout=4200, check=False)
+            returncode = process.returncode
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            returncode = None
+        output.seek(0, 2)
+        log_bytes = output.tell()
+        output.seek(0)
+        raw = output.read(2_000_001)
+    errors = []
+    if len(raw) <= 2_000_000:
+        for line in raw.splitlines():
+            try: row = json.loads(line)
+            except (ValueError, UnicodeError): continue
+            if not isinstance(row, dict): continue
+            code = row.get('errorCode')
+            if code not in {'READ_FAILED', 'CAMPAIGN_FAILED', 'TRAVERSAL_FAILED'}: continue
+            record = {'errorCode': code}
+            read = row.get('readDiagnostic')
+            if (isinstance(read, dict) and read.get('inputKind') in {
+                    'progress', 'merge-receipt', 'batch-status', 'manifest', 'catalog', 'company-page', 'other'}
+                    and read.get('reason') in {'not-regular', 'too-large', 'changed-input', 'missing', 'invalid-json', 'io-error'}
+                    and all(read.get(k) is None or type(read.get(k)) is int and 0 <= read[k] <= 1_000_000_000
+                            for k in ('byteLength', 'maxBytes'))):
+                record['readDiagnostic'] = {k: read.get(k) for k in ('inputKind', 'reason', 'byteLength', 'maxBytes')}
+            errors.append(record)
+            if len(errors) >= 8: break
+    sizes = []
+    for quarter in sorted(QUARTERS):
+        path = Path(root) / '.cache' / ('parts-' + quarter) / 'merge-receipt.json'
+        if path.is_file() and not path.is_symlink():
+            sizes.append({'quarter': quarter, 'byteLength': path.stat().st_size})
+    return {'status': 'diagnosed', 'mergeOutcome': 'timed-out' if timed_out else
+            'passed' if returncode == 0 else 'failed', 'diagnostics': errors,
+            'generatedReceiptSizes': sizes, 'rawLogBytes': log_bytes,
+            'rawLogsRetained': False, 'productionDataUpdated': False}
+
+
+def resume(run_id, source_commit, *, root='.', api=None, env=None, execute=None, diagnostic=False):
     root = Path(root)
     env = dict(os.environ if env is None else env)
     api = api or ActionsAPI()
     run = api.get(f'actions/runs/{run_id}')
-    verify_run(run, run_id, source_commit, env)
+    verify_run(run, run_id, source_commit, env, diagnostic=diagnostic)
     marker = root / 'web/data/traversal-resumptions' / f'{run_id}-1.json'
     identity = {'schemaVersion': 1, 'runId': str(run_id), 'runAttempt': 1, 'sourceCommit': source_commit}
-    if marker.exists():
+    if marker.exists() and not diagnostic:
         previous = parse(marker.read_bytes())
         if (not isinstance(previous, dict) or any(previous.get(k) != v for k, v in identity.items())
                 or previous.get('status') != 'merged' or not isinstance(previous.get('artifacts'), list)):
@@ -232,6 +280,10 @@ def resume(run_id, source_commit, *, root='.', api=None, env=None, execute=None)
                       'artifactCount': len(proofs), 'sourceRequests': 0, 'marketDataRequests': 0}), flush=True)
     # Existing campaign validators recheck the catalog locks, status/snapshot
     # binding and every receipt before admitting these original bytes.
+    if diagnostic:
+        result = diagnostic_merge(root, source_environment(env, run), execute=execute)
+        return {**identity, **result, 'artifacts': proofs,
+                'sourceRequests': 0, 'marketDataRequests': 0, 'modelRequests': 0}
     runner = execute or subprocess.run
     try:
         runner([sys.executable, 'scripts/campaign.py', 'publish'], cwd=root,
@@ -250,13 +302,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--run-id', required=True)
     parser.add_argument('--source-commit', required=True)
-    parser.add_argument('--verify-persisted', action='store_true')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--verify-persisted', action='store_true')
+    mode.add_argument('--diagnostic', action='store_true')
     args = parser.parse_args()
     if args.verify_persisted:
         print(json.dumps(verify_persisted(args.run_id, args.source_commit)))
         return
-    result = resume(args.run_id, args.source_commit)
-    stage('.cache/resume-traversal', {'result.json': encoded(result)})
+    result = resume(args.run_id, args.source_commit, diagnostic=args.diagnostic)
+    raw = encoded(result)
+    if inspect_content(raw): fail('RESUME_PUBLICATION_REJECTED')
+    folder = '.cache/traversal-publication-diagnostic' if args.diagnostic else '.cache/resume-traversal'
+    stage(folder, {'result.json': raw})
     print(json.dumps({key: result[key] for key in ('runId', 'status', 'sourceRequests', 'marketDataRequests')}))
 
 

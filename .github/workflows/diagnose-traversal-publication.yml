@@ -1,0 +1,50 @@
+name: Diagnose retained traversal publication
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Completed failed traversal with retained artifacts
+        required: true
+        type: string
+      source_commit:
+        description: Exact original traversal source commit
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+env:
+  NODE_OPTIONS: --max-old-space-size=5120
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Verify diagnostic isolation contracts
+        run: python -m unittest discover -s tests -p 'test_resume_traversal.py'
+      - name: Diagnose original publication in the disposable checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORIGINAL_RUN: ${{ inputs.run_id }}
+          ORIGINAL_SOURCE: ${{ inputs.source_commit }}
+        run: python scripts/resume_traversal.py --run-id "$ORIGINAL_RUN" --source-commit "$ORIGINAL_SOURCE" --diagnostic
+      - name: Retain bounded diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: traversal-publication-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .cache/traversal-publication-diagnostic/result.json
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
