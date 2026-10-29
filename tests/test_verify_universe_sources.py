@@ -1,5 +1,6 @@
 """Small synthetic archives only; official data parsing runs on Actions."""
 import contextlib
+import copy
 import io
 import json
 from pathlib import Path
@@ -28,6 +29,85 @@ def diagnose(data):
 
 
 class UniverseSourceDiagnosticTests(unittest.TestCase):
+    def test_exhausted_transient_window_recovers_once_and_preserves_attempt_history(self):
+        data = workbook(); calls, delays, checkpoints = [], [], []
+        def fetch():
+            calls.append(1)
+            if len(calls) == 1: raise sources.verify.VerificationError('TIMEOUT')
+            return data
+        with synthetic_pin(data):
+            result = sources.run_diagnostic(fetch=fetch, now=NOW, sleep=delays.append,
+                checkpoint=lambda value: checkpoints.append(copy.deepcopy(value)))
+        self.assertEqual(len(calls), 2); self.assertEqual(delays, [2])
+        self.assertTrue(result['diagnosticComplete'])
+        self.assertEqual(result['pinnedParser']['parsedRows'], 2)
+        request = result['sourceRequests'][0]
+        self.assertEqual([item['status'] for item in request['attempts']], ['failed', 'observed'])
+        self.assertEqual(request['attempts'][0]['errorCode'], 'TIMEOUT')
+        self.assertTrue(any(item['sourceRequests'][0]['status'] == 'failed' for item in checkpoints))
+
+    def test_june_timeout_does_not_discard_independent_august_table(self):
+        data = workbook(); delays, calls = [], []
+        def primary(): raise sources.verify.VerificationError('TIMEOUT')
+        def other(url):
+            calls.append(url)
+            if url == sources.source_diff.INDEX_URL:
+                return f'<h1>截至20260831</h1><a href="{sources.source_diff.AUGUST_URL}">下载</a>'.encode()
+            if url == sources.source_diff.AUGUST_URL: return data
+            self.fail('unexpected source')
+        with tempfile.TemporaryDirectory() as directory, synthetic_pin(data):
+            result = sources.run_diagnostic(fetch=primary, now=NOW, comparison_fetch=other,
+                catalog_root=directory, sleep=delays.append)
+        self.assertEqual(result['errorCode'], 'TIMEOUT')
+        self.assertEqual(result['status'], 'partial'); self.assertTrue(result['diagnosticComplete'])
+        self.assertEqual(calls, [sources.source_diff.INDEX_URL, sources.source_diff.AUGUST_URL])
+        comparison = result['twoPeriodComparison']
+        self.assertFalse(comparison['codeSetComparisonReady'])
+        self.assertEqual(comparison['sources'][1]['parsedProductCodes'], 2)
+        self.assertEqual(comparison['sources'][1]['parseStatus'], 'complete')
+        self.assertEqual(result['sourceRequests'][0]['status'], 'failed')
+        self.assertFalse(result['historicalUniverseVerified']); self.assertFalse(result['catalogCompletenessVerified'])
+
+    def test_optional_failure_keeps_completed_june_checkpoint_and_does_not_retry_http_rejection(self):
+        data = workbook(); checkpoints, calls, delays = [], [], []
+        def other(url):
+            calls.append(url)
+            raise sources.verify.VerificationError('HTTP_REJECTED' if url == sources.source_diff.INDEX_URL else 'TIMEOUT')
+        with tempfile.TemporaryDirectory() as directory, synthetic_pin(data):
+            result = sources.run_diagnostic(fetch=lambda: data, now=NOW, comparison_fetch=other,
+                catalog_root=directory, sleep=delays.append, checkpoint=lambda value: checkpoints.append(copy.deepcopy(value)))
+        self.assertEqual(result['pinnedParser']['parsedRows'], 2)
+        self.assertEqual(result['status'], 'partial'); self.assertTrue(result['diagnosticComplete'])
+        self.assertEqual(calls.count(sources.source_diff.INDEX_URL), 1)
+        self.assertEqual(calls.count(sources.source_diff.AUGUST_URL), 2)
+        self.assertEqual(delays, [2])
+        june_ready = next(i for i, item in enumerate(checkpoints) if item.get('pinnedParser'))
+        optional_started = next(i for i, item in enumerate(checkpoints) if len(item['sourceRequests']) > 1)
+        self.assertLess(june_ready, optional_started)
+        self.assertIn('SOURCE_REQUESTS_INCOMPLETE', result['unresolvedReasons'])
+        self.assertNotIn('comparison', result['twoPeriodComparison'])
+
+    def test_hard_interruption_leaves_guarded_partial_checkpoint_and_all_failed_stays_failed(self):
+        data = workbook()
+        def interrupted(_url): raise KeyboardInterrupt()
+        with tempfile.TemporaryDirectory() as directory, synthetic_pin(data), \
+                patch.object(sources, 'OUTPUT', Path(directory) / 'result.json'):
+            with self.assertRaises(KeyboardInterrupt):
+                sources.run_diagnostic(fetch=lambda: data, now=NOW, comparison_fetch=interrupted,
+                    checkpoint=sources.save_result, catalog_root=directory)
+            stored = json.loads(sources.OUTPUT.read_text())
+            self.assertEqual(stored['pinnedParser']['parsedRows'], 2)
+            self.assertEqual(stored['sourceRequests'][1]['status'], 'running')
+            self.assertEqual(stored['status'], 'partial')
+            self.assertFalse(stored['historicalUniverseVerified'])
+        def unavailable(*_args): raise sources.verify.VerificationError('TIMEOUT')
+        with tempfile.TemporaryDirectory() as directory:
+            result = sources.run_diagnostic(fetch=unavailable, now=NOW, comparison_fetch=unavailable,
+                sleep=lambda _seconds: None, catalog_root=directory)
+        self.assertEqual(result['status'], 'failed'); self.assertFalse(result['diagnosticComplete'])
+        self.assertEqual(len(result['sourceRequests']), 3)
+        self.assertTrue(all(len(item['attempts']) == 2 for item in result['sourceRequests']))
+
     def test_missing_period_date_and_mismatched_total_remain_partial(self):
         result = diagnose(workbook())
         self.assertEqual(result['status'], 'partial')

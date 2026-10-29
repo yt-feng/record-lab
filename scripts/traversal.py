@@ -18,6 +18,7 @@ from report_managers import normalize_manager_table_coverage, manager_key
 from strategy_sections import normalize_strategy_section_coverage
 from price_coverage import CALENDAR, VERSION as PRICE_COVERAGE_VERSION, valid_usable_complete_price
 from price_consistency import normalize_price_conflict
+from price_range_reference import effective_price_range, unresolved_conflict, resolution_for, valid_resolution
 from price_patches import valid_binding as valid_price_binding, valid_target as valid_price_target, status_for as price_patch_status
 from source_dates import china_date
 
@@ -628,6 +629,7 @@ def valid_price_coverage(value):
     conflicts = value.get('conflictingStocks', [])
     conflict_count = value.get('priceConflicted', 0)
     fingerprint = value.get("holdingsIdentity")
+    resolutions = value.get('referenceResolutions', [])
     return (value.get("coverageVersion") == PRICE_COVERAGE_VERSION and value.get("calendarId") == CALENDAR["id"]
             and isinstance(count, int) and not isinstance(count, bool) and count >= 0
             and isinstance(available, int) and not isinstance(available, bool) and 0 <= available <= count
@@ -639,6 +641,10 @@ def valid_price_coverage(value):
             and all(stock_key(item) for item in missing)
             and len({stock_key(item) for item in missing}) == len(missing)
             and not ({stock_key(item) for item in missing} & {stock_key(item) for item in conflicts})
+            and isinstance(resolutions, list) and len(resolutions) <= count
+            and all(valid_resolution(item) for item in resolutions)
+            and len({stock_key(item) for item in resolutions}) == len(resolutions)
+            and not ({stock_key(item) for item in resolutions} & {stock_key(item) for item in missing + conflicts})
             and isinstance(fingerprint, str) and bool(re.fullmatch(r"[a-f0-9]{64}", fingerprint)))
 
 
@@ -668,13 +674,20 @@ def price_coverage(fund, now=None):
         for row in fund.get("rows", []):
             if isinstance(row, dict) and row.get("previous") is not None and stock_key(row):
                 stocks[stock_key(row)] = {"stockCode": row["stockCode"], "market": row["market"]}
-    observed, complete, conflicts = set(), set(), set()
+    observed, complete, conflicts, resolutions = set(), set(), set(), []
     for row in fund.get("rows", []):
         key = stock_key(row)
         price = row.get("priceRange", {}) if isinstance(row, dict) else {}
-        low, high = price.get("low"), price.get("high")
-        if key in stocks and normalize_price_conflict(price.get('globalPriceConflict'), stocks[key]['market'], stocks[key]['stockCode'], start, end, now=now):
+        identity = {'market': row.get('market'), 'stockCode': row.get('stockCode'),
+                    'currency': CALENDAR['markets'].get(row.get('market'), {}).get('currency'),
+                    'rangeStart': start, 'rangeEnd': end, 'calendarId': CALENDAR['id']}
+        if key in stocks and unresolved_conflict(price, identity, now):
             conflicts.add(key)
+        resolution = resolution_for(price, identity, now) if key in stocks else None
+        if resolution: resolutions.append(resolution)
+        original = price
+        price = effective_price_range(price, identity, now) or price
+        low, high = price.get("low"), price.get("high")
         if (key in stocks and price.get("status") == "observed" and price.get("priceBasis") == "unadjusted"
                 and public_url(price.get("sourceUrl")) and isinstance(low, (int, float)) and not isinstance(low, bool)
                 and isinstance(high, (int, float)) and not isinstance(high, bool) and 0 < low <= high < float('inf')
@@ -684,12 +697,13 @@ def price_coverage(fund, now=None):
                 and date(price.get("observedStart")) and date(price.get("observedEnd"))
                 and start <= price["observedStart"] <= price["observedEnd"] <= end):
             observed.add(key)
-            if valid_usable_complete_price(price, stocks[key]["market"], stocks[key]["stockCode"], start, end):
+            if valid_usable_complete_price(original, stocks[key]["market"], stocks[key]["stockCode"], start, end):
                 complete.add(key)
     missing = [stocks[key] for key in sorted(set(stocks) - complete - conflicts)]
     return {"coverageVersion": PRICE_COVERAGE_VERSION, "calendarId": CALENDAR["id"], 'consistencyVersion': 1,
             "holdingCount": len(stocks), "priceAvailable": len(observed), "priceComplete": len(complete), "missingStocks": missing,
             'priceConflicted': len(conflicts), 'conflictingStocks': [stocks[key] for key in sorted(conflicts)],
+            **({'referenceResolutions': resolutions} if resolutions else {}),
             "holdingsIdentity": hashlib.sha256("|".join(sorted(stocks)).encode()).hexdigest()}
 
 
@@ -731,19 +745,23 @@ def enrichment_eligible(states):
             and state["enrichment"]["attempts"] < 3]
 
 
-def apply_coverage(state, coverage):
+def apply_coverage(state, coverage, *, trusted_current=False):
     current = state["enrichment"]
     if not valid_price_coverage(coverage):
         return
     missing = missing_stock_objects(coverage)
     available = coverage["priceAvailable"]
     conflicts = {stock_key(item): item for item in coverage.get('conflictingStocks', [])}
+    # A receipt can be delayed and state retains only stock keys, not every
+    # conflict fact. Only hydration of the actual current merged snapshot can
+    # clear that sticky state; an incoming self-contained old proof cannot.
+    resolved = {stock_key(item) for item in coverage.get('referenceResolutions', [])} if trusted_current else set()
     if valid_price_coverage(current) and current["holdingsIdentity"] == coverage["holdingsIdentity"]:
         still_missing = {stock_key(item) for item in missing_stock_objects(current)}
         missing = [item for item in missing if stock_key(item) in still_missing]
         available = max(available, current["priceAvailable"])
         # A delayed single-source receipt cannot resolve a witnessed conflict.
-        conflicts.update({stock_key(item): item for item in current.get('conflictingStocks', [])})
+        conflicts.update({stock_key(item): item for item in current.get('conflictingStocks', []) if stock_key(item) not in resolved})
     missing = [item for item in missing if stock_key(item) not in conflicts]
     complete = coverage["holdingCount"] - len(missing) - len(conflicts)
     current.update({key: coverage[key] for key in ("coverageVersion", "calendarId", "holdingCount", "holdingsIdentity")})
@@ -759,6 +777,15 @@ def apply_coverage(state, coverage):
         quality['missingFields'] = [key for key in QUALITY_FIELDS if quality['fields'].get(key) not in QUALITY_ACCEPTED]
         if quality['missingFields'] == ['prices'] and not missing:
             quality['status'] = 'conflict'
+    elif resolved and not missing and isinstance(quality, dict) and isinstance(quality.get('fields'), dict):
+        quality['fields']['prices'] = 'complete'
+        quality['priceConflictOnly'] = False
+        quality['priceConsistencyVersion'] = 1
+        quality['missingFields'] = [key for key in QUALITY_FIELDS if quality['fields'].get(key) not in QUALITY_ACCEPTED]
+        if not quality['missingFields']:
+            quality['status'] = 'complete'
+        elif quality.get('status') == 'conflict':
+            quality['status'] = 'pending' if quality.get('attempts', 0) < QUALITY_MAX_ATTEMPTS else 'exhausted'
 
 
 def normalize_quality(previous, status, now, code=None):
@@ -1123,7 +1150,7 @@ def hydrate_quality(states, retained, phase, now):
             scoped = quality_for_code(quality, code, state["quality"])
             state["quality"] = normalize_quality({**state["quality"], **scoped}, state["status"], now, code=code)
             if state["status"] in SUCCESS and valid_price_coverage(coverage):
-                apply_coverage(state, coverage)
+                apply_coverage(state, coverage, trusted_current=True)
 
 
 def load_retained_funds(data_root):

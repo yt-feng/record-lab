@@ -21,7 +21,7 @@ class SparseBatchTests(unittest.TestCase):
                 shutil.copytree(source / directory, root / directory, ignore=shutil.ignore_patterns('__pycache__'))
             (root / 'web/data').mkdir(parents=True)
             (root / 'web/data/large.json').write_text('{}')
-            for name in ('lifecycle.js', 'zero-stock.js', 'nonstock-assets.js', 'strategy-sections.js', 'source-dates.js'):
+            for name in ('lifecycle.js', 'zero-stock.js', 'nonstock-assets.js', 'strategy-sections.js', 'source-dates.js', 'price-range-reference.js'):
                 shutil.copy2(source / 'web' / name, root / 'web' / name)
             (root / 'requirements.txt').write_text('')
             def git(*args, **kwargs):

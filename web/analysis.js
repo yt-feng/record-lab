@@ -147,7 +147,7 @@
         const priceCoverage = conflictPending ? '存在来源冲突待核验' : prices?.coverageVersion === 2 && prices?.completeness === 'complete'
           ? '交易日完整' : '已观测，完整区间待补全';
         const interval = prices?.status === 'observed' && finite(prices.low) && finite(prices.high)
-          ? `${priceNumber(prices.low)} — ${priceNumber(prices.high)} ${prices.currency} · ${priceCoverage}` : '未取得可比较区间';
+          ? `${priceNumber(prices.low)} — ${priceNumber(prices.high)} ${prices.currency} · ${priceCoverage}${!conflictPending && prices.rangeReferenceSummary?.scope === 'quarter-extrema-only' ? ' · 使用完整东方财富区间；仅已存端点数值兼容，未新增逐日或原响应复验' : ''}` : '未取得可比较区间';
         [`${stock.currentPortfolioCount} / ${stock.identityUnresolvedCount}`, money(stock.disclosedValueYuan), money(stock.navWeightEstimateYuan),
           `${stock.changes.increase || 0} / ${stock.changes.decrease || 0}`, `${stock.changes.enteredDisclosure || 0} / ${stock.changes.leftDisclosure || 0}`, interval].forEach(value => row.append(element('td', value)));
         body.append(row);

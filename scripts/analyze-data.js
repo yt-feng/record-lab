@@ -14,6 +14,9 @@ const { strategyClaimsFor } = require('../lib/strategy-claims');
 const { strategyEvidenceBudgetFor } = require('../lib/strategy-evidence-pool');
 const { normalizeManagers, verifiedReportManagers, managerCoverageFor, completeManagerCoverage, overlaps: managerOverlaps } = require('../lib/report-managers');
 const { chinaDate } = require('../web/source-dates');
+const { calendar } = require('../lib/price-coverage');
+const { createPriceIndex, addPriceSources, applyPriceIndex } = require('../lib/reuse-prices');
+const { effectivePriceRange, effectiveReference } = require('../lib/price-range-reference');
 
 const CODE = /^\d{6}$/;
 const COMPANY_PATH = /^\.\/data\/companies\/[A-Za-z0-9_-]{1,64}\.json$/;
@@ -253,6 +256,7 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
   if (!Number.isInteger(maxPartBytes) || maxPartBytes < 2000 || maxPartBytes > PART_LIMIT) fail('INVALID_ANALYSIS_LIMIT');
   if (progress && (progress.phase?.targetPeriodEnd !== phase.target || progress.phase?.baselinePeriodEnd !== phase.baseline)) fail('ANALYSIS_PROGRESS_PERIOD_MISMATCH');
   const seenFiles = new Set(), records = [];
+  const prices = createPriceIndex({ targetPeriodEnd: phase.target, baselinePeriodEnd: phase.baseline }, currentTime);
   let excludedNotApplicable = 0, inputRecords = 0;
   const readCompany = file => {
     if (!COMPANY_PATH.test(file.path)) fail('INVALID_ANALYSIS_COMPANY_PATH');
@@ -266,6 +270,7 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
     if (seenFiles.has(file.path)) fail('DUPLICATE_ANALYSIS_COMPANY_PATH');
     seenFiles.add(file.path);
     const document = readCompany(file);
+    addPriceSources(prices, document.funds);
     for (const [index, fund] of document.funds.entries()) {
       inputRecords++;
       if (Date.parse(fund.retrievedAt) > Date.parse(manifest.retrievedAt)) fail('ANALYSIS_OBSERVATION_MISMATCH');
@@ -274,6 +279,8 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
     }
   }
   const { selected, conflicts, duplicatesRemoved } = selectRecords(records);
+  // Seal once over every retained source, before portfolio deduplication.
+  applyPriceIndex(prices, [], () => false);
   const selectedByRef = new Map(selected.map(item => [`${item.file}\0${item.index}`, item]));
   const stocks = new Map(), portfolios = spool ? null : [], themes = new Map();
   const portfolioCounts = { analyzedRecords: 0, strategySectionCompleteRecords: 0, strategySectionIncompleteRecords: 0,
@@ -354,10 +361,18 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
         }
         // A global witness can outlive a source removed by portfolio
         // deduplication. Retain its unresolved state even for a missing quote.
-        if (row.priceRange && Object.hasOwn(row.priceRange, 'globalPriceConflict')) stock._completePriceConflict = true;
-        const price = priceFor(row.priceRange, row, phase);
+        const priceIdentity = { market: row.market, stockCode: row.stockCode, currency: row.currency,
+          rangeStart: phase.start, rangeEnd: phase.target, calendarId: calendar.id };
+        const priceKey = [row.market, row.stockCode, row.currency, 'unadjusted', phase.start, phase.target, calendar.id].join('|');
+        const entry = prices.entries.get(priceKey);
+        const candidate = entry?.reference ? { ...row.priceRange, rangeReference: entry.reference } : row.priceRange;
+        if (entry?.conflict || candidate && Object.hasOwn(candidate, 'globalPriceConflict')
+          && !effectiveReference(candidate, priceIdentity, currentTime)) stock._completePriceConflict = true;
+        const effective = effectivePriceRange(candidate, priceIdentity, currentTime) || row.priceRange;
+        const price = priceFor(effective, row, phase);
         if (price) {
           priceRows++; stock._priceSources.add(price.sourceUrl); stock._prices.add(`${price.low}:${price.high}`);
+          for (const url of [row.priceRange?.sourceUrl, ...(row.priceRange?.sourceUrls || [])]) if (publicUrl(url)) stock._priceSources.add(url);
           for (const url of price.sourceUrls || []) if (publicUrl(url)) stock._priceSources.add(url);
           if (validCompletePrice(price, row.market, row.stockCode, phase.start, phase.target)) {
             if (!stock._completePrice) stock._completePrice = price;
@@ -415,6 +430,12 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
         Object.assign(stock.priceRange, retainedCoverage(complete, stock.market, stock.stockCode, phase.start, phase.target), {
           low: complete.low, high: complete.high, observedStart: complete.observedStart, observedEnd: complete.observedEnd,
           observedCount: complete.observedCount, priceBasis: 'unadjusted', sourceUrl: complete.sourceUrl, conflictingObservations: false });
+        if (complete.rangeReference) stock.priceRange.rangeReferenceSummary = {
+          method: complete.rangeReference.method, scope: complete.rangeReference.scope,
+          factSetDigest: complete.rangeReference.factSetDigest, referenceFactId: complete.rangeReference.referenceFactId,
+          storedFactCount: complete.rangeReference.facts.length, marketDataRequests: 0,
+          dailySeriesReverified: false, originalResponsesReverified: false };
+        if (complete.fetchedAt) stock.priceRange.fetchedAt = complete.fetchedAt;
       } else {
         stock.priceRange.conflictingObservations = true;
         stock.priceRange.completeness = 'partial';
@@ -452,7 +473,7 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
     && inputRecords === manifest.coverage?.fundCount) coverage.collectionEvidenceComplete = true;
   if (coverage.collectionEvidenceComplete && coverage.analyzedRecords > 0 && coverage.strategySemanticAnalysisComplete
     && !coverage.strategySemanticAnalysisPendingRecords) { coverage.status = 'complete'; coverage.complete = true; }
-  const output = { schemaVersion: 1, analysisVersion: 8, kind: 'quarter-analysis', targetPeriodEnd: phase.target, baselinePeriodEnd: phase.baseline,
+  const output = { schemaVersion: 1, analysisVersion: 8, priceReferenceVersion: 1, kind: 'quarter-analysis', targetPeriodEnd: phase.target, baselinePeriodEnd: phase.baseline,
     asOf: manifest.asOf, retrievedAt: manifest.retrievedAt, priceUpdatedAt: manifest.priceUpdatedAt || null,
     generatedAt: phase.generation, generation: phase.generation, coverage,
     stocks: ordered, portfolioFiles,

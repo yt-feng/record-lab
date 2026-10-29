@@ -181,9 +181,9 @@ def candidates_from_result(result, *, now=None):
     return records
 
 
-def fetch_results(quarters, as_of, *, now=None):
+def fetch_results(quarters, as_of, *, now=None, max_seconds=600):
     # One shared deadline/request budget covers pagination proof and all quarters.
-    transport = ActionsTransport()
+    transport = ActionsTransport(max_seconds=max_seconds)
     verification = pagination_probe(fetch_page=transport, observed_at=current(now), as_of=as_of, controls=False)
     if not verification['mayEnumerate']: raise DiscoveryError('PAGINATION_NOT_VERIFIED')
     results = {}

@@ -73,7 +73,10 @@ def valid_complete_price(value, market, code, start, end):
 
 def valid_usable_complete_price(value, market, code, start, end):
     """Original complete sessions remain intact, but unresolved sources do not pass acceptance."""
-    return valid_complete_price(value, market, code, start, end) and 'globalPriceConflict' not in value
+    from price_range_reference import effective_price_range
+    identity = {'market': market, 'stockCode': code, 'currency': CALENDAR['markets'].get(market, {}).get('currency'),
+                'rangeStart': start, 'rangeEnd': end, 'calendarId': CALENDAR['id']}
+    return valid_complete_price(effective_price_range(value, identity), market, code, start, end)
 
 
 def price_series(code, market, currency, provider, source_url, rows, start, end):

@@ -22,6 +22,7 @@ jobs:
             /lib/*.js
             /web/strategy-sections.js
             /web/source-dates.js
+            /web/price-range-reference.js
             /tests/test_strategy_claims.py
             /tests/test_verify_strategy_claims.py
             /.github/workflows/verify-strategy-claims.yml

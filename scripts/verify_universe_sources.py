@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 import xml.etree.ElementTree as ET
 
 import historical_universe as history
@@ -21,6 +22,8 @@ from publication_guard import inspect_content
 OUTPUT = Path('.cache/universe-source-verification/result.json')
 MAX_CORE_BYTES = 64 * 1024
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
+SOURCE_WINDOWS = 2
+RETRYABLE_SOURCE_ERRORS = {'NETWORK_ERROR', 'TIMEOUT'}
 CORE_NS = 'http://schemas.openxmlformats.org/package/2006/metadata/core-properties'
 AGGREGATE_OBSERVED_ON = '2026-10-29'
 AGGREGATES = (
@@ -110,7 +113,8 @@ def compare_aggregate(parsed_count, expected_count):
             'status': 'unresolved', 'aggregateSourceUrl': benchmark['sourceUrl']}
 
 
-def run_diagnostic(fetch=verify.download_official, now=None, comparison_fetch=None, catalog_root='web/data'):
+def run_diagnostic(fetch=verify.download_official, now=None, comparison_fetch=None, catalog_root='web/data',
+                   checkpoint=None, sleep=time.sleep):
     observed = history.observation_time(now or dt.datetime.now(dt.timezone.utc))
     result = {'schemaVersion': 1, 'status': 'failed', 'diagnosticComplete': False,
               'errorCode': None, 'retrievedAt': observed, 'sourceUrl': history.SOURCE_URL,
@@ -122,9 +126,41 @@ def run_diagnostic(fetch=verify.download_official, now=None, comparison_fetch=No
                   'verificationMethod': 'published-table-manually-verified-on-observed-date',
                   'fetchedByThisRun': False, 'scope': 'aggregate-only-not-product-list',
                   'excludesFundsReportedForLiquidation': True} for row in AGGREGATES],
-              'comparison': compare_aggregate(None, history.EXPECTED_PRODUCTS)}
+              'comparison': compare_aggregate(None, history.EXPECTED_PRODUCTS), 'sourceRequests': []}
+    def save():
+        if checkpoint is not None: checkpoint(result)
+
+    def source_request(url, operation):
+        # Each underlying official downloader already enforces a 60-second
+        # deadline and three attempts. One fresh bounded window recovers an
+        # exhausted transient window; deterministic rejections are not retried.
+        record = {'sourceUrl': url, 'status': 'pending', 'attempts': []}
+        result['sourceRequests'].append(record)
+        for number in range(1, SOURCE_WINDOWS + 1):
+            attempt = {'window': number, 'status': 'started',
+                       'startedAt': history.observation_time(dt.datetime.now(dt.timezone.utc))}
+            record['status'] = 'running'; record['attempts'].append(attempt); save()
+            try:
+                body = operation()
+            except Exception as error:
+                code = getattr(error, 'code', None)
+                code = code if code in verify.ERRORS else 'UNIVERSE_SOURCE_DIAGNOSTIC_FAILED'
+                attempt.update(status='failed', errorCode=code)
+                record.update(status='failed', errorCode=code); save()
+                if code not in RETRYABLE_SOURCE_ERRORS or number == SOURCE_WINDOWS:
+                    raise verify.VerificationError(code) from None
+                sleep(number * 2)
+            else:
+                attempt.update(status='observed')
+                record.update(status='observed', errorCode=None, downloadedBytes=len(body),
+                              sourceSha256=hashlib.sha256(body).hexdigest())
+                save()
+                return body
+        raise verify.VerificationError('TIMEOUT')
+
+    data = None
     try:
-        data = fetch()
+        data = source_request(history.SOURCE_URL, fetch)
         digest = hashlib.sha256(data).hexdigest()
         result.update(sourceSha256=digest, downloadedBytes=len(data),
                       sourcePinMatches=digest == history.SOURCE_HASH)
@@ -168,13 +204,30 @@ def run_diagnostic(fetch=verify.download_official, now=None, comparison_fetch=No
             result['pinnedParser'] = {'parseStatus': 'not-run', 'errorCode': 'SOURCE_HASH_MISMATCH'}
             reasons.append('SOURCE_HASH_MISMATCH')
         result.update(status='partial', diagnosticComplete=True, unresolvedReasons=reasons)
-        if comparison_fetch is not None:
-            result['twoPeriodComparison'] = source_diff.compare_sources(data, dates=explicit_period_dates,
-                core_properties=core_properties, fetch=comparison_fetch, catalog_root=catalog_root)
     except (verify.VerificationError, history.HistoricalUniverseError) as error:
         result['errorCode'] = error.code
     except Exception:
         result['errorCode'] = 'UNIVERSE_SOURCE_DIAGNOSTIC_FAILED'
+    # Save the completed June inspection before another source can time out.
+    # A June transport failure also must not prevent an independent August or
+    # current landing-page observation from surviving this diagnostic run.
+    save()
+    if comparison_fetch is not None:
+        try:
+            comparison = source_diff.compare_sources(data, dates=explicit_period_dates,
+                core_properties=core_properties,
+                fetch=lambda url: source_request(url, lambda: comparison_fetch(url)), catalog_root=catalog_root)
+            result['twoPeriodComparison'] = comparison
+            successful_source = any(source.get('parseStatus') in {'complete', 'partial'} for source in comparison['sources'])
+            if successful_source or comparison['landingPage']['fetchStatus'] == 'observed':
+                result.update(status='partial', diagnosticComplete=True)
+            failed = [row for row in result['sourceRequests'] if row['status'] == 'failed']
+            if failed:
+                reasons = result.setdefault('unresolvedReasons', [])
+                reasons.extend(reason for reason in ('SOURCE_REQUESTS_INCOMPLETE', 'PRODUCT_SET_NOT_RECONCILED') if reason not in reasons)
+        except Exception as error:
+            result['comparisonErrorCode'] = getattr(error, 'code', 'UNIVERSE_SOURCE_DIAGNOSTIC_FAILED')
+        save()
     return result
 
 
@@ -189,15 +242,20 @@ def encode_result(result):
     return result, data
 
 
-def main():
-    if os.environ.get('GITHUB_ACTIONS') != 'true':
-        print(json.dumps({'status': 'failed', 'errorCode': 'ACTIONS_REQUIRED'}))
-        return 2
-    result, data = encode_result(run_diagnostic(comparison_fetch=source_diff.download_source))
+def save_result(result):
+    guarded, data = encode_result(result)
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     temporary = OUTPUT.with_suffix('.tmp')
     temporary.write_bytes(data)
     temporary.replace(OUTPUT)
+    return guarded
+
+
+def main():
+    if os.environ.get('GITHUB_ACTIONS') != 'true':
+        print(json.dumps({'status': 'failed', 'errorCode': 'ACTIONS_REQUIRED'}))
+        return 2
+    result = save_result(run_diagnostic(comparison_fetch=source_diff.download_source, checkpoint=save_result))
     print(json.dumps({key: result.get(key) for key in ('status', 'diagnosticComplete', 'errorCode')}))
     # Successful diagnostics can document an unresolved discrepancy. They never
     # indicate that a catalog or a quarter has passed completeness acceptance.

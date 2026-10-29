@@ -13,6 +13,7 @@ const { retainStrategyClaims, strategyClaimsFor } = require('../lib/strategy-cla
 const strategyClaimPatches = require('../lib/strategy-claim-patches');
 const { VERSION: PRICE_COVERAGE_VERSION, calendar, validCompletePrice, validUsableCompletePrice, validUsableCompleteQuarterPrice, retainedCoverage } = require('../lib/price-coverage');
 const { normalizeConflict } = require('../lib/price-consistency');
+const { effectivePriceRange, effectiveReference, unresolvedConflict, resolutionFor } = require('../lib/price-range-reference');
 const { bindingFor, validPatch, canReplacePrice, key: priceKey } = require('../lib/price-patches');
 const { reuseCompletePrices } = require('../lib/reuse-prices');
 const { normalizePortfolioIdentity, retainPortfolioIdentity } = require('../lib/portfolio-identity');
@@ -68,7 +69,17 @@ function recoverPrice(row, supplied, retrievedAt, now = new Date()) {
     sourceUrls: Array.isArray(supplied.sourceUrls) ? [...new Set(supplied.sourceUrls)].slice(0, 8) : [supplied.sourceUrl],
     dataStatus: supplied.dataStatus === 'cached' ? 'cached' : 'fresh' };
   if (conflict) row.priceRange.globalPriceConflict = conflict;
+  retainRangeReference(row, supplied, now);
   return true;
+}
+
+function retainRangeReference(row, supplied, now) {
+  if (!supplied?.rangeReference) return;
+  const candidate = { ...row.priceRange, rangeReference: supplied.rangeReference };
+  if (effectiveReference(candidate, { market: row.market, stockCode: row.stockCode, currency: row.currency,
+    rangeStart: candidate.rangeStart, rangeEnd: candidate.rangeEnd, calendarId: calendar.id }, now)) {
+    row.priceRange.rangeReference = clone(supplied.rangeReference);
+  }
 }
 
 function latestPriceTime(current, observed) {
@@ -146,6 +157,7 @@ function sanitizeFund(item, { now, config, envelope }) {
         rangeEnd: row.priceRange.rangeEnd, calendarId: calendar.id }, now);
     // The globally witnessed key may be present on a row with no local quote.
     if (conflict) row.priceRange.globalPriceConflict = conflict;
+    retainRangeReference(row, supplied, now);
   }
   // A PDF refresh is not a price observation. Preserve an explicit spelling
   // only when it matches the latest quote actually retained, to microseconds.
@@ -209,6 +221,7 @@ function retainPrices(candidate, old, now) {
         copiedPriceTime = latestPriceTime(copiedPriceTime, row.priceRange.fetchedAt);
       }
     }
+    retainRangeReference(row, prior, now);
   }
   if (copiedPriceTime) {
     // Preserve the original spelling of the matching clock. Do not inherit a
@@ -316,7 +329,8 @@ function coverageFor(funds, directory, config, expectedCount = directory.fundCou
     scope: '按公开目录逐家处理，展示已取得的有效报告；已披露数据与目录规模分别计数',
     requestedFundCount: expectedCount, catalogFundCount: directory.fundCount, catalogCompanyCount: directory.companyCount,
     holdingCount: funds.reduce((sum, fund) => sum + fund.rows.filter(row => row.current).length, 0),
-    priceAvailable: funds.reduce((sum, fund) => sum + fund.rows.filter(row => row.current && row.priceRange.status === 'observed').length, 0),
+    priceAvailable: funds.reduce((sum, fund) => sum + fund.rows.filter(row => row.current
+      && (row.priceRange.status === 'observed' || effectiveReference(row.priceRange))).length, 0),
     priceComplete: funds.reduce((sum, fund) => sum + fund.rows.filter(row => row.current && validUsableCompleteQuarterPrice(row.priceRange,
       row.market, row.stockCode, config.targetPeriodEnd || fund.selectedReport?.periodEnd)).length, 0),
     narrativeCount: funds.filter(fund => fund.narrative?.text).length,
@@ -372,14 +386,19 @@ function finalObservation(fund) {
   if (fund.previousReport?.periodEnd === baseline && publicUrl(fund.previousReport.sourceUrl)) {
     for (const row of fund.rows) if (row.previous) stocks.set(`${row.market}:${row.stockCode}`, { stockCode: row.stockCode, market: row.market });
   }
-  const observed = new Set(fund.rows.filter(row => stocks.has(`${row.market}:${row.stockCode}`) && row.priceRange.status === 'observed'
+  const priceIdentity = row => ({ market: row.market, stockCode: row.stockCode, currency: row.currency,
+    rangeStart: start, rangeEnd: period, calendarId: calendar.id });
+  const observed = new Set(fund.rows.filter(row => stocks.has(`${row.market}:${row.stockCode}`)
+    && (effectivePriceRange(row.priceRange, priceIdentity(row)) || row.priceRange)?.status === 'observed'
     && row.priceRange.rangeStart === start && row.priceRange.rangeEnd === period)
     .map(row => `${row.market}:${row.stockCode}`));
   const complete = new Set(fund.rows.filter(row => stocks.has(`${row.market}:${row.stockCode}`) && validUsableCompletePrice(row.priceRange, row.market, row.stockCode, start, period))
     .map(row => `${row.market}:${row.stockCode}`));
-  const conflicts = new Set(fund.rows.filter(row => stocks.has(`${row.market}:${row.stockCode}`) && normalizeConflict(row.priceRange.globalPriceConflict,
-    { market: row.market, stockCode: row.stockCode, currency: row.currency, rangeStart: start, rangeEnd: period, calendarId: calendar.id }))
+  const conflicts = new Set(fund.rows.filter(row => stocks.has(`${row.market}:${row.stockCode}`)
+    && unresolvedConflict(row.priceRange, priceIdentity(row)))
     .map(row => `${row.market}:${row.stockCode}`));
+  const referenceResolutions = fund.rows.filter(row => stocks.has(`${row.market}:${row.stockCode}`))
+    .map(row => resolutionFor(row.priceRange, priceIdentity(row))).filter(Boolean);
   const conflictingStocks = [...conflicts].sort().map(key => stocks.get(key));
   const missingStocks = [...stocks.keys()].sort().filter(key => !complete.has(key) && !conflicts.has(key)).map(key => stocks.get(key));
   const reportEvidence = { sourceUrl: fund.selectedReport.sourceUrl, periodEnd: fund.selectedReport.periodEnd,
@@ -390,6 +409,7 @@ function finalObservation(fund) {
     priceCoverage: { coverageVersion: PRICE_COVERAGE_VERSION, calendarId: calendar.id,
       consistencyVersion: 1, holdingCount: stocks.size, priceAvailable: observed.size, priceComplete: complete.size,
       priceConflicted: conflicts.size, conflictingStocks, missingStocks,
+      ...(referenceResolutions.length ? { referenceResolutions } : {}),
       holdingsIdentity: crypto.createHash('sha256').update([...stocks.keys()].sort().join('|')).digest('hex') },
     sourcePortfolioCode: fund.sourcePortfolioCode, portfolioSourceUrl: fund.portfolioSourceUrl,
     shareClassCodes: fund.sourcePortfolioCode && publicUrl(fund.portfolioSourceUrl) ? fund.shareClassCodes : [fund.code] };
@@ -708,7 +728,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
     funds[funds.indexOf(fund)] = rebuilt; result.accepted = true; result.scanned = true;
     acceptedStrategyClaimsPatchCount++;
   }
-  const { mutatedFunds: reusedFunds, ...reuseCounts } = reusePrices ? reuseCompletePrices(funds,
+  const { mutatedFunds: reusedFunds, referenceAnnotatedRowCount, referenceAnnotatedFundCount, ...reuseCounts } = reusePrices ? reuseCompletePrices(funds,
     { phase: config, now: currentTime, recoverPrice, sourceFunds }) : {
       mutatedFunds: [], reusedPriceRowCount: 0, reusedPriceFundCount: 0, eligiblePriceKeyCount: 0,
       conflictingPriceKeyCount: 0, partialConflictRowCount: 0, conflictMarkedRowCount: 0, conflictMarkedFundCount: 0, conflictingPriceRowCount: 0 };
@@ -853,4 +873,4 @@ function main(argv = process.argv.slice(2)) {
 if (require.main === module) process.exitCode = main();
 
 module.exports = { MergeError, main, mergeFiles, mergeSnapshots, preserveUnrequestedPortfolioIdentity,
-  sanitizeFund, splitCompanyFunds };
+  sanitizeFund, splitCompanyFunds, coverageFor, finalObservation };

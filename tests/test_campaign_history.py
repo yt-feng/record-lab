@@ -50,7 +50,7 @@ def workspace():
         for directory in ('scripts', 'lib', 'config'):
             shutil.copytree(source / directory, root / directory, ignore=shutil.ignore_patterns('__pycache__'))
         (root / 'web').mkdir()
-        for name in ('lifecycle.js', 'zero-stock.js', 'nonstock-assets.js', 'strategy-sections.js', 'source-dates.js'):
+        for name in ('lifecycle.js', 'zero-stock.js', 'nonstock-assets.js', 'strategy-sections.js', 'source-dates.js', 'price-range-reference.js'):
             shutil.copy2(source / 'web' / name, root / 'web' / name)
         atomic_json(root / 'web/data/catalog.json', current())
         previous = Path.cwd(); real_run = subprocess.run

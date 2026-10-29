@@ -10,6 +10,8 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+from functools import partial
 
 from traversal import atomic_json, read_json, STATUS_SNAPSHOT_ERRORS, source_repair_mode, SOURCE_REPAIR_LANE
 from publication_guard import inspect_content, content_limit
@@ -17,7 +19,7 @@ from quarter_catalog import (compose_quarter_catalog, freeze_catalog, validate_c
                              normalize_overlay, recover_historical_overlay, combine_historical_overlays,
                              historical_candidate_codes, report_candidate_codes, copy_frozen_catalog)
 from report_identity_catalog import supplement_catalog
-from report_locators import (refresh_registries, registry_locators, freeze_registry, validate_registry_lock,
+from report_locators import (refresh_registries, fetch_results as fetch_locator_results, registry_locators, freeze_registry, validate_registry_lock,
                              normalize_locator, MAX_BYTES as LOCATOR_MAX_BYTES)
 from source_dates import china_today
 from campaign_accounting import collect_batch_accounting, persist_accounting
@@ -26,6 +28,16 @@ PERIODS = {
     '2026Q2': ('2026-06-30', '2026-03-31'),
     '2026Q3': ('2026-09-30', '2026-06-30'),
 }
+# Leave time inside the 40-minute Actions job for checkout/tests, report
+# hydration, freezing, validation and uploads. These cap refresh time, not scope.
+PLAN_REFRESH_SECONDS = 900
+DIRECTORY_REFRESH_SECONDS = 600
+LOCATOR_REFRESH_SECONDS = 240
+HISTORICAL_REFRESH_SECONDS = 60  # The official downloader enforces this bound.
+
+
+def plan_stage(stage, started, **values):
+    print(json.dumps({'stage': stage, 'elapsedSeconds': round(time.monotonic() - started, 3), **values}), flush=True)
 
 
 def selected_periods(value):
@@ -67,8 +79,46 @@ def seed_quarter(data_root, quarter):
     return target
 
 
-def refresh_directory(root, as_of):
+def directory_refresh_checkpoint(root, current, original, as_of, error_code):
+    """Recover only an atomic discovery checkpoint; never invent row attempts."""
+    file = Path(root) / 'catalog.json'
+    try:
+        fresh = read_json(file)
+        if fresh == current:
+            raise ValueError('NO_NEW_CHECKPOINT')
+        from discover import retain_known_catalog, COMPANIES_URL, FUNDS_URL, DIRECTORY_URL
+        if (not isinstance(fresh, dict) or fresh.get('schemaVersion') != 1 or fresh.get('asOf') != as_of
+                or fresh.get('sourceUrls') != {'companies': COMPANIES_URL, 'funds': FUNDS_URL, 'companyIndex': DIRECTORY_URL}
+                or fresh.get('coverage', {}).get('scope') != 'all-directory-companies'
+                or not isinstance(fresh.get('companies'), list) or not isinstance(fresh.get('funds'), list)
+                or fresh.get('companyCount') != len(fresh['companies']) or fresh.get('fundCount') != len(fresh['funds'])
+                or not fresh['companies'] or not fresh['funds']):
+            raise ValueError('INVALID_DIRECTORY_CHECKPOINT')
+        # Discovery's existing retention gate keeps historical codes and dated
+        # ownership. Reapply it before accepting an interrupted refresh.
+        fresh = retain_known_catalog(fresh, current)
+        old_codes = {row['code'] for row in (current or {}).get('funds', [])}
+        if not old_codes.issubset({row['code'] for row in fresh['funds']}):
+            raise ValueError('DIRECTORY_CHECKPOINT_REGRESSION')
+        atomic_json(file, fresh)
+        return {'status': 'refreshed' if fresh['coverage'].get('directoryComplete') else 'partial',
+                'asOf': fresh['asOf'], 'errorCode': error_code, 'checkpointRetained': True,
+                'staleCompanyCount': fresh['coverage'].get('staleCompanyCount', 0)}
+    except Exception:
+        # Keep exact old bytes, including all original observation timestamps.
+        # A partial prior snapshot is also useful and must remain resumable.
+        if current and original is not None:
+            file.write_bytes(original)
+            return {'status': 'cached', 'asOf': current.get('asOf'), 'errorCode': error_code,
+                    'checkpointRetained': False}
+        raise ValueError('DIRECTORY_REFRESH_NO_CHECKPOINT') from None
+
+
+def refresh_directory(root, as_of, *, max_seconds=DIRECTORY_REFRESH_SECONDS):
+    if not isinstance(max_seconds, (int, float)) or isinstance(max_seconds, bool) or not 0 < max_seconds <= DIRECTORY_REFRESH_SECONDS:
+        raise ValueError('INVALID_DIRECTORY_REFRESH_BUDGET')
     current = read_json(root / 'catalog.json', optional=True)
+    original = (root / 'catalog.json').read_bytes() if current else None
     if current and current.get('asOf') == as_of and current.get('coverage', {}).get('directoryComplete'):
         return {'status': 'current', 'asOf': current['asOf']}
     # The first new date refreshes all institution pages. Subsequent waves reuse
@@ -76,19 +126,17 @@ def refresh_directory(root, as_of):
     try:
         subprocess.run([sys.executable, 'scripts/discover.py', '--output', str(root / 'catalog.json'),
                         '--state', 'raw/catalog-state.json', '--as-of', as_of,
-                        '--allow-partial', '--max-companies', '250'], check=True)
+                        '--allow-partial', '--max-companies', '250'], check=True, timeout=max_seconds)
         refreshed = read_json(root / 'catalog.json')
         return {'status': 'refreshed' if refreshed.get('coverage', {}).get('directoryComplete') else 'partial',
                 'asOf': refreshed.get('asOf'),
                 'staleCompanyCount': refreshed.get('coverage', {}).get('staleCompanyCount', 0)}
+    except subprocess.TimeoutExpired:
+        # subprocess.run kills and waits for the discovery child before this
+        # branch reads its last atomic checkpoint; queued work stays unattempted.
+        return directory_refresh_checkpoint(root, current, original, as_of, 'DIRECTORY_REFRESH_TIME_LIMIT')
     except subprocess.CalledProcessError:
-        # Discovery's regression gate preserves the old complete directory. A
-        # failed refresh must not prevent known products' reports being read.
-        preserved = read_json(root / 'catalog.json', optional=True)
-        if (not current or not preserved or not current.get('coverage', {}).get('directoryComplete')
-                or preserved != current):
-            raise
-        return {'status': 'cached', 'asOf': current.get('asOf'), 'errorCode': 'DIRECTORY_REFRESH_FAILED'}
+        return directory_refresh_checkpoint(root, current, original, as_of, 'DIRECTORY_REFRESH_FAILED')
 
 
 def fetch_historical_overlay():
@@ -126,7 +174,7 @@ def retained_report_candidates(root, quarter):
         return []
 
 
-def quarter_history(root, quarter, *, explicit=None, now=None):
+def quarter_history(root, quarter, *, explicit=None, now=None, allow_fetch=True):
     """Use only validated source rows; a failed refresh never redates cached evidence."""
     if explicit is not None:
         value = explicit.get(quarter)
@@ -148,8 +196,9 @@ def quarter_history(root, quarter, *, explicit=None, now=None):
     def result(value, state):
         if candidates: state['candidateCodes'] = sorted(candidates)
         return value, state
-    if quarter != '2026Q2' or os.environ.get('GITHUB_ACTIONS') != 'true':
+    if quarter != '2026Q2' or os.environ.get('GITHUB_ACTIONS') != 'true' or not allow_fetch:
         state = {'status': 'cached' if cached else 'not-configured' if quarter != '2026Q2' else 'local-only'}
+        if quarter == '2026Q2' and not allow_fetch: state.update(status='cached' if cached else 'deferred', errorCode='HISTORICAL_REFRESH_TIME_BUDGET')
         if cache_error: state['cacheErrorCode'] = cache_error
         return result(cached, state)
     try:
@@ -203,6 +252,8 @@ def deployed_continuation_state(root, quarter):
 
 
 def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True, historical_overlays=None, source_repair=False):
+    started = time.monotonic()
+    refresh_deadline = started + PLAN_REFRESH_SECONDS
     if type(source_repair) is not bool: raise ValueError('INVALID_SOURCE_REPAIR_LANE')
     selected = selected_periods(quarter)
     # Planning, Actions output and missing-part reconciliation share one bound.
@@ -230,17 +281,28 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
         scan_campaign_files()
         return {'status': 'held', 'batchCount': 0, 'quarters': [], 'heldQuarters': list(holds),
                 'continuationHolds': holds, 'directoryRefresh': directory_status}
-    directory_status = refresh_directory(root, as_of) if refresh else {'status': 'provided'}
+    plan_stage('DIRECTORY_REFRESH_START', started, maxSeconds=DIRECTORY_REFRESH_SECONDS)
+    directory_status = refresh_directory(root, as_of, max_seconds=min(DIRECTORY_REFRESH_SECONDS,
+        max(0.001, refresh_deadline - time.monotonic()))) if refresh else {'status': 'provided'}
+    plan_stage('DIRECTORY_REFRESH_END', started, status=directory_status['status'], errorCode=directory_status.get('errorCode'))
     catalog = read_json(root / 'catalog.json')
     base = read_json('config/universe.json')
     configs = {name: quarter_config(base, name, as_of) for name in selected}
     if source_repair:
         for config in configs.values():
             config.update(collectionLane=SOURCE_REPAIR_LANE, maxPriceSymbols=0, maxPriceSeconds=0)
-    locator_registries = refresh_registries(root, selected, as_of, allow_fetch=refresh)
+    locator_seconds = max(0, min(LOCATOR_REFRESH_SECONDS, int(refresh_deadline - time.monotonic())))
+    plan_stage('LOCATOR_REFRESH_START', started, maxSeconds=locator_seconds)
+    locator_registries = refresh_registries(root, selected, as_of, allow_fetch=refresh and locator_seconds > 0,
+        fetcher=partial(fetch_locator_results, max_seconds=locator_seconds) if locator_seconds else None)
+    plan_stage('LOCATOR_REFRESH_END', started, status='deferred' if refresh and not locator_seconds else 'observed',
+        quarters={name: locator_registries[name]['refreshStatus'] for name in selected})
     scoped_catalogs, identity_parts = {}, {}
     for name in selected:
-        overlay, status = quarter_history(root, name, explicit=historical_overlays)
+        allow_history = refresh_deadline - time.monotonic() >= HISTORICAL_REFRESH_SECONDS
+        plan_stage('HISTORICAL_REFRESH_START', started, quarter=name, allowed=allow_history)
+        overlay, status = quarter_history(root, name, explicit=historical_overlays, allow_fetch=allow_history)
+        plan_stage('HISTORICAL_REFRESH_END', started, quarter=name, status=status['status'], errorCode=status.get('errorCode'))
         candidates = status.pop('candidateCodes', [])
         scoped_catalogs[name] = compose_quarter_catalog(catalog, name, overlay, candidates=candidates)
         scoped_catalogs[name]['quarterUniverse']['historicalRefresh'] = status
@@ -264,10 +326,12 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
         # CLI hydration reads existing reports without serializing their raw text
         # into the public batch plan.
         private_plan = Path('.cache') / ('plan-' + name)
+        plan_stage('QUARTER_PLAN_START', started, quarter=name)
         subprocess.run([sys.executable, 'scripts/traversal.py', 'plan', '--catalog', str(frozen),
                         '--progress', str(output / 'progress.json'), '--config', f'.cache/campaign/{name}.json',
                         '--data-root', str(output), '--output', str(private_plan),
                         '--shards', str(shards), '--batch-size', str(batch_size)], check=True)
+        plan_stage('QUARTER_PLAN_END', started, quarter=name)
         for item in read_json(private_plan / 'matrix.json'):
             batch = read_json(private_plan / item['config'])
             index = str(len(matrix))
@@ -287,6 +351,7 @@ def plan(quarter, as_of, data='web/data', shards=16, batch_size=75, refresh=True
                 'strategyClaimsQuotas': {name: configs[name]['strategyClaimsQuota'] for name in selected},
                 'reportLocators': locator_locks})
     scan_campaign_files()
+    plan_stage('PLAN_COMPLETE', started, batchCount=len(matrix), collectionComplete=False)
     return {'batchCount': len(matrix), 'quarters': selected, 'directoryRefresh': directory_status,
             'heldQuarters': list(holds), 'continuationHolds': holds}
 

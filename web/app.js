@@ -4,10 +4,11 @@
     typeof module === 'object' && module.exports ? require('./zero-stock') : root.RecordLabZeroStock,
     typeof module === 'object' && module.exports ? require('./nonstock-assets') : root.RecordLabNonstockAssets,
     typeof module === 'object' && module.exports ? require('./strategy-sections') : root.RecordLabStrategySections,
-    typeof module === 'object' && module.exports ? require('./source-dates') : root.RecordLabSourceDates);
+    typeof module === 'object' && module.exports ? require('./source-dates') : root.RecordLabSourceDates,
+    typeof module === 'object' && module.exports ? require('./price-range-reference') : root.RecordPriceRangeReference);
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root && root.document) api.mount(root.document, root);
-})(typeof globalThis !== 'undefined' ? globalThis : this, function (lifecycle, zeroStock, nonstockAssets, strategySections, sourceDates) {
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (lifecycle, zeroStock, nonstockAssets, strategySections, sourceDates, priceReferences) {
   'use strict';
 
   const CHANGE_GROUPS = {
@@ -478,6 +479,8 @@
     return isFiniteNumber(holding[key]) ? `${formatNumber(holding[key])}${suffix}` : '未提供';
   }
   function priceDescription(range) {
+    const reference = priceReferences?.effectiveReference(range);
+    if (reference) range = reference;
     if (!range || range.status !== 'observed' || !isFiniteNumber(range.low) || !isFiniteNumber(range.high)) {
       return { value: '价格区间缺失', note: range && textValue(range.label) || '尚无可用行情', observed: false };
     }
@@ -496,7 +499,8 @@
     const coverage = conflictPending ? '存在来源冲突待核验' : complete ? '交易日完整' : Number.isInteger(range.missingSessionCount) && range.missingSessionCount > 0
       ? `仍缺 ${range.missingSessionCount} 个交易日或上市/停牌证据` : '完整交易日覆盖未核验';
     return { value: `${formatNumber(range.low, 3)} – ${formatNumber(range.high, 3)} ${textValue(range.currency)}`.trim(),
-      note: `${range.observedStart || '日期未提供'} → ${range.observedEnd || '日期未提供'} · ${isFiniteNumber(range.observedCount) ? range.observedCount : '—'} 条行情 · ${coverage}`, observed: true, complete, conflictPending };
+      note: `${range.observedStart || '日期未提供'} → ${range.observedEnd || '日期未提供'} · ${isFiniteNumber(range.observedCount) ? range.observedCount : '—'} 条行情 · ${coverage}${reference ? ' · 使用完整东方财富区间；已存端点数值兼容，未新增逐日或原响应复验' : ''}`, observed: true, complete, conflictPending,
+      referenceCompatible: Boolean(reference) };
   }
 
   function priceConflictSources(range) {
@@ -528,9 +532,9 @@
       '价格区间完整性', '应有交易日数', '缺失交易日数', '异常行情行数', '应有日期集合哈希', '观测日期集合哈希',
       '待核验行情来源1', '对照价格区间1', '原始采集时间1', '待核验行情来源2', '对照价格区间2', '原始采集时间2']];
     for (const fund of funds) for (const row of fund.visibleRows || fund.rows) {
-      const price = row.priceRange || {};
+      const price = priceReferences?.effectiveReference(row.priceRange) || row.priceRange || {};
       const validPrice = priceDescription(price).observed;
-      const conflictSources = priceConflictSources(price);
+      const conflictSources = priceConflictSources(row.priceRange);
       lines.push([fund.code, fund.name, fund.company, managerNames(fund).join(' / '), reportPeriod(fund), fund.previousReport?.periodEnd,
         row.stockCode, row.stockName, row.market, row.currency, row.change.label || row.change.kind, row.change.reason,
         row.current?.shares, row.previous?.shares, row.change.sharesDelta, row.current?.weightPct, row.previous?.weightPct, row.change.weightDeltaPp,
@@ -832,13 +836,14 @@
       addCell(tr, formatMoney(row.position.disclosedYuan), '本期报告披露 · 人民币', 'number');
       addCell(tr, formatMoney(row.position.estimatedYuan), row.position.estimateNote || '期末净资产 × 披露占比', 'number');
       const price = priceDescription(row.priceRange);
+      const displayedRange = priceReferences?.effectiveReference(row.priceRange) || row.priceRange;
       const priceCell = el('td'); priceCell.append(el('span', price.observed ? 'price-value' : 'missing', price.value),
         el('span', 'cell-sub', `窗口 ${row.priceRange.rangeStart || '未提供'} → ${row.priceRange.rangeEnd || '未提供'}`), el('span', 'cell-sub', price.note));
       if (price.observed) priceCell.append(el('span', 'cell-sub', `口径 ${row.priceRange.priceBasis || '未提供'} · ${price.conflictPending ? '来源冲突待核验' : price.complete ? '已核对完整交易日' : '区间极值尚未完整'} · 非实际持仓成本`));
-      if (row.priceRange.fetchedAt) priceCell.append(el('span', 'cell-sub', `${row.priceRange.dataStatus === 'cached' ? '保留行情 · ' : ''}采集 ${row.priceRange.fetchedAt}`));
-      const priceSource = el('span', 'cell-sub'); if (addLink(priceSource, '行情来源 ↗', row.priceRange.sourceUrl)) priceCell.append(priceSource);
+      if (displayedRange.fetchedAt) priceCell.append(el('span', 'cell-sub', `${displayedRange.dataStatus === 'cached' ? '保留行情 · ' : ''}采集 ${displayedRange.fetchedAt}`));
+      const priceSource = el('span', 'cell-sub'); if (addLink(priceSource, '行情来源 ↗', displayedRange.sourceUrl)) priceCell.append(priceSource);
       for (const [index, source] of priceConflictSources(row.priceRange).entries()) {
-        const comparison = el('span', 'cell-sub', `待核验对照 ${index + 1}：${source.interval} · 采集 ${source.fetchedAt} `);
+        const comparison = el('span', 'cell-sub', `${price.referenceCompatible ? '保留原观测' : '待核验对照'} ${index + 1}：${source.interval} · 采集 ${source.fetchedAt} `);
         addLink(comparison, '来源 ↗', source.sourceUrl); priceCell.append(comparison);
       }
       tr.append(priceCell); return tr;
