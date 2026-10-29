@@ -17,10 +17,18 @@ from report_managers import normalize_manager_table_coverage
 from source_dates import china_today
 
 
-def safe_error(code, stage, error):
+def safe_error(code, stage, error, *, document=None):
     result = {"code": code, "stage": stage, "errorCode": error.code if isinstance(error, DataError) else "PARSE_FAILED"}
     if isinstance(error, DataError) and getattr(error, "provider_errors", None):
         result["providerErrors"] = error.provider_errors
+    if stage in {"report", "quarterly-report", "no-equities-report", "report-locator"} and isinstance(document, dict):
+        period, kind = document.get("periodEnd"), document.get("kind")
+        try:
+            valid_period = isinstance(period, str) and dt.date.fromisoformat(period).isoformat() == period
+        except ValueError:
+            valid_period = False
+        if valid_period and isinstance(kind, str) and kind in {"quarterly", "semiannual", "annual"}:
+            result.update(reportPeriodEnd=period, reportKind=kind)
     return result
 
 
@@ -187,7 +195,7 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
                 reports = [report for report in reports if report['sourceUrl'] != document['sourceUrl']] + [document]
                 break
             except Exception as error:
-                errors.append(safe_error(code, 'report-locator', error))
+                errors.append(safe_error(code, 'report-locator', error, document=document))
     if not reports:
         if announcement_missing and check_missing_target_lifecycle():
             errors = [item for item in errors if item.get('stage') != 'announcements' or item.get('errorCode') != 'NO_REPORTS']
@@ -298,13 +306,18 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
                        "holdingsIncompleteReason": "UNSUPPORTED_OR_INVALID_SECURITY_ROWS" if getattr(holdings, "excluded_rows", 0) else None})
         details = {}
         try:
-            details = report_details_cache.get(selected['sourceUrl'])
-            if details is None:
-                details = source.report_details(selected)
-                report_details_cache[selected['sourceUrl']] = details
+            cached_details = report_details_cache.get(selected['sourceUrl'])
+            if cached_details is None:
+                cached_details = source.report_details(selected)
+            if not isinstance(cached_details, dict):
+                raise DataError("PARSE_FAILED")
+            report_details_cache[selected['sourceUrl']] = cached_details
+            # Preserve the empty details object when acquisition raises, so its
+            # original typed error survives the remaining collection path.
+            details = cached_details
             locator_identity = normalize_portfolio_identity(details.get('portfolioIdentityEvidence'), {**selected, 'fundCode': code}) if selected.get('sourceLocatorEvidence') else None
             if selected.get('sourceLocatorEvidence') and not locator_identity or not selected.get('sourceLocatorEvidence') and not identity_matches(details):
-                errors.append({"code": code, "stage": "report", "errorCode": "REPORT_IDENTITY_MISMATCH"})
+                errors.append(safe_error(code, "report", DataError("REPORT_IDENTITY_MISMATCH"), document=selected))
                 continue
             attach_details(report, details, selected)
             pdf_holdings = details.get("pdfHoldings") or []
@@ -328,12 +341,12 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
                 if stock_proof:
                     report["holdingsPdfEvidence"] = stock_proof
         except Exception as error:
-            errors.append(safe_error(code, "report", error))
+            errors.append(safe_error(code, "report", error, document=selected))
             if selected.get('sourceLocatorEvidence'):
                 continue
         evidence = details.get("noEquitiesEvidence")
         if evidence and (holdings or report["holdingsExcludedRowCount"]):
-            errors.append({"code": code, "stage": "report", "errorCode": "CONTRADICTORY_NO_EQUITIES"})
+            errors.append(safe_error(code, "report", DataError("CONTRADICTORY_NO_EQUITIES"), document=selected))
             continue
         if not holdings:
             if evidence and isinstance(evidence.get("page"), int) and evidence["page"] > 0:
@@ -412,7 +425,7 @@ def collect_fund(item, as_of, history_years=2, max_reports=4, provider=None, tar
                     if report["navYuan"] is not None:
                         report["navRetrievedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
             except Exception as error:
-                errors.append(safe_error(code, "quarterly-report", error))
+                errors.append(safe_error(code, "quarterly-report", error, document=quarterly))
         if report["navYuan"] is None:
             errors.append({"code": code, "stage": "nav", "errorCode": "NAV_NOT_DISCLOSED_OR_UNRESOLVED"})
         if report["narrative"] is None:

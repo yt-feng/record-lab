@@ -26,6 +26,15 @@ def diagnose(text):
 
 
 class VerifyManagersTests(unittest.TestCase):
+    def test_diagnostic_title_uses_the_same_period_and_kind_as_its_parser(self):
+        for title, matches in [('合成基金2026年第2季度\n报告', True),
+                               ('合成基金2026年第3季 度报告', False),
+                               ('合成基金2026年中期报告', False)]:
+            with self.subTest(title=title):
+                result = diagnose(title + '\n' + HEADER + ROW + END)
+                self.assertEqual(result['titlePeriodMatches'], matches)
+                self.assertEqual(result['tableCoverageComplete'], matches)
+
     def test_actual_report_only_normalizer_requires_and_receives_pdf_extraction_facts(self):
         from report_extract import PDFPages
         from verify_repairs import VerificationError

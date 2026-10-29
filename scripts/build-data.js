@@ -40,7 +40,8 @@ const BUILD_CODES = new Set([
   ...strategyClaimPatches.ERROR_CODES,
 ]);
 const STAGES = new Set(['metadata', 'announcements', 'holdings', 'report', 'nav', 'narrative',
-  'join', 'prices', 'build', 'collection', 'budget', 'target-report', 'no-equities-report', 'quarterly-report', 'lifecycle', 'strategy-claims']);
+  'join', 'prices', 'build', 'collection', 'budget', 'target-report', 'no-equities-report', 'quarterly-report', 'report-locator', 'lifecycle', 'strategy-claims']);
+const REPORT_ERROR_STAGES = new Set(['report', 'quarterly-report', 'no-equities-report', 'report-locator']);
 const fundCode = value => typeof value === 'string' && /^\d{6}$/.test(value);
 const clone = value => JSON.parse(JSON.stringify(value));
 // Match the publication guard and the status reader, including the final newline.
@@ -57,8 +58,14 @@ class SafeBuildError extends Error {
 
 function safeError(error, stage = 'build', code = null) {
   const errorCode = typeof error === 'string' ? error : error && (error.errorCode || error.code);
-  return { code: fundCode(code) ? code : null, stage: STAGES.has(stage) ? stage : 'build',
+  const result = { code: fundCode(code) ? code : null, stage: STAGES.has(stage) ? stage : 'build',
     errorCode: BUILD_CODES.has(errorCode) ? errorCode : 'BUILD_FAILED' };
+  if (REPORT_ERROR_STAGES.has(result.stage) && error && typeof error === 'object'
+    && validDate(error.reportPeriodEnd) && ['quarterly', 'semiannual', 'annual'].includes(error.reportKind)) {
+    result.reportPeriodEnd = error.reportPeriodEnd;
+    result.reportKind = error.reportKind;
+  }
+  return result;
 }
 
 function publicUrl(value) {

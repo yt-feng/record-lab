@@ -54,6 +54,8 @@ ERROR_CODES = {
     "PDF_PARSE_FAILED", "PDF_TEXT_EMPTY", "INVALID_PDF", "UNSUPPORTED_MARKET", "HOLDINGS_UNRESOLVED", "INVALID_FORMAT", "PARSE_FAILED",
 }
 PARSER_ERRORS = {"PDF_PARSE_FAILED", "PDF_TEXT_EMPTY", "INVALID_PDF", "UNSUPPORTED_MARKET", "HOLDINGS_UNRESOLVED", "INVALID_FORMAT", "PARSE_FAILED"}
+REPORT_ACQUISITION_ERRORS = {"TIMEOUT", "NETWORK_ERROR", "HTTP_ERROR", "TLS_FAILED"}
+REPORT_ERROR_STAGES = {"report", "quarterly-report", "no-equities-report", "report-locator"}
 RECOVERABLE_ERRORS = {"NO_VALID_REPORTS", "TARGET_REPORT_MISSING", "NO_REPORTS", "TARGET_REPORT_UNAVAILABLE",
                       "NO_DATED_HOLDINGS", "TIMEOUT", "NETWORK_ERROR", "HTTP_ERROR", "TLS_FAILED",
                       "BATCH_FAILED", "FUND_NOT_COLLECTED", "BATCH_DEADLINE_REACHED"}
@@ -1609,6 +1611,27 @@ def report_evidence(fund, phase, now, planned_at=None):
     return None
 
 
+def target_report_acquisition_error(errors, code, target_period):
+    """Only one explicit target-document acquisition cause may refine a wrapper."""
+    causes = set()
+    for entry in errors:
+        if not isinstance(entry, dict) or entry.get('code') != code or entry.get('stage') not in REPORT_ERROR_STAGES:
+            continue
+        period, kind = entry.get('reportPeriodEnd'), entry.get('reportKind')
+        if not date(period) or not isinstance(kind, str) or kind not in {'quarterly', 'semiannual', 'annual'}:
+            return None  # An unbound report error could belong to this target.
+        if period == target_period:
+            cause = entry.get('errorCode')
+            if not isinstance(cause, str):
+                return None
+            causes.add(cause)
+    if len(causes) == 1:
+        cause = next(iter(causes))
+        if cause in REPORT_ACQUISITION_ERRORS:
+            return cause
+    return None
+
+
 def build_status(config, snapshot=None, now=None):
     current = utc_now(now)
     phase = phase_for(config)
@@ -1686,7 +1709,7 @@ def build_status(config, snapshot=None, now=None):
             if snapshot_ok and error in {"NO_VALID_REPORTS", "FUND_FAILED"}:
                 diagnostics = [entry.get("errorCode") for entry in snapshot.get("errors", [])
                                if isinstance(entry, dict) and entry.get("code") == code
-                               and entry.get("stage") in {"report", "quarterly-report", "no-equities-report", "holdings", "build"}
+                               and entry.get("stage") in REPORT_ERROR_STAGES | {"holdings", "build"}
                                and entry.get("errorCode") in PARSER_ERRORS]
                 # Keep an exact announcement/target absence visible instead of
                 # losing it behind the builder's generic missing-report wrapper.
@@ -1694,7 +1717,12 @@ def build_status(config, snapshot=None, now=None):
                                       if isinstance(entry, dict) and entry.get("code") == code
                                       and entry.get("stage") in {"target-report", "announcements"}
                                       and entry.get("errorCode") in RECOVERABLE_ERRORS]
-                error = diagnostics[0] if diagnostics else source_diagnostics[0] if source_diagnostics else error
+                if diagnostics:
+                    error = diagnostics[0]
+                elif source_diagnostics:
+                    error = source_diagnostics[0]
+                else:
+                    error = target_report_acquisition_error(snapshot.get('errors', []), code, phase['targetPeriodEnd']) or error
             row = {"code": code, "companyCode": item.get("companyCode") or item.get("companyId"), "status": "failed",
                    "errorCode": error if error in ERROR_CODES else "FUND_FAILED" if snapshot_ok else "BATCH_FAILED"}
         row["enrichmentAttempt"] = code in enrich_codes

@@ -175,7 +175,7 @@ def diagnose_pages(pages, sample, *, pdf_sha256, total_pages=None):
             'parserHash': trace['parserHash'], 'sourceTextHash': coverage.get('sourceTextHash'),
             'physicalPagesRead': len(pages), 'totalPdfPages': total_pages if total_pages is not None else len(pages),
             'pageReadLimitReached': total_pages is not None and total_pages > len(pages),
-            'titlePeriodMatches': managers._title_matches_period(cleaned, '2026-06-30'),
+            'titlePeriodMatches': managers._title_matches_period(cleaned, report['periodEnd'], report['kind']),
             'managerHeadingCount': sum(len(list(managers._TITLE.finditer(page))) for page in cleaned),
             'headings': headings, 'parsedManagers': parsed, 'tables': tables,
             'coverageStatus': coverage.get('status'), 'tableCoverageComplete': coverage.get('complete') is True,
