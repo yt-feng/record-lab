@@ -91,6 +91,15 @@ class SemanticAdapterTests(unittest.TestCase):
             self.assertEqual(result['errorCode'], code)
             self.assertEqual((parses, result['modelRequests']), (0, 0))
 
+    def test_known_zero_request_input_limit_is_not_reported_as_missing_receipt(self):
+        inference = {'status': 'rejected', 'errorCode': 'SEMANTIC_INPUT_LIMIT',
+                     'requestCount': 0, 'attempted': False, 'receipt': None}
+        with patch.object(adapter, 'run_packet', return_value=inference):
+            result, parses = self.run_candidate()
+        self.assertEqual((result['status'], result['errorCode'], result['modelRequests']),
+                         ('rejected', 'SEMANTIC_INPUT_LIMIT', 0))
+        self.assertEqual((parses, result['usageHistory']), (1, []))
+
     def test_source_pool_pdf_identity_and_physical_page_changes_prevent_request(self):
         for change in ('pool', 'bytes', 'pages'):
             with self.subTest(change=change):

@@ -416,8 +416,13 @@ def run_packet(packet, credential, *, checkpoint, transport=http_transport, on_v
         return result
     try:
         body = request_body(packet)
-    except (ValueError, TypeError):
-        result.update(status='rejected', errorCode='SEMANTIC_PACKET_NOT_READY')
+    except (ValueError, TypeError) as error:
+        # Preserve a deterministic preflight limit failure. It happened before
+        # the request checkpoint and therefore cannot consume a model attempt.
+        code = str(error) if isinstance(error, ValueError) else 'SEMANTIC_PACKET_NOT_READY'
+        if code not in {'SEMANTIC_INPUT_LIMIT', 'SEMANTIC_PACKET_NOT_READY'}:
+            code = 'SEMANTIC_PACKET_NOT_READY'
+        result.update(status='rejected', errorCode=code)
         return result
     digest = hashlib.sha256(canonical({'provider': 'deepseek', 'model': MODEL,
         'promptVersion': PROMPT_VERSION, 'inputDigest': packet['inputDigest'],

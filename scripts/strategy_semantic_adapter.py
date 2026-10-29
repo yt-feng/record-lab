@@ -137,6 +137,12 @@ injecting a transport is required even if credentials are present.
             result['candidate'] = candidate
 
         inference = run_packet(packet, credential, checkpoint=record, transport=transport, on_validated=validated)
+        # A bounded request-body preflight rejects before a receipt exists. Do
+        # not turn that deterministic, zero-request outcome into a misleading
+        # MODEL_RECEIPT_MISSING failure or append a usage-history row.
+        if inference.get('requestCount') == 0 and inference.get('errorCode') in {
+                'SEMANTIC_INPUT_LIMIT', 'SEMANTIC_PACKET_NOT_READY'}:
+            return finish('rejected', inference['errorCode'])
         # Rejections also have actual usage and response digests. The private
         # callback is only for validated output; final accounting covers all.
         if len(result['usageHistory']) != prior_count + 1:

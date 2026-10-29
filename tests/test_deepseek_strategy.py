@@ -44,6 +44,15 @@ def synthetic_worker(pipe, _credential, _body):
 
 
 class DeepSeekStrategyTests(unittest.TestCase):
+    def test_input_limit_preflight_is_explicit_and_never_enters_transport(self):
+        checkpoints = []
+        with patch.object(adapter, 'request_body', side_effect=ValueError('SEMANTIC_INPUT_LIMIT')):
+            result = adapter.run_packet(packet(), 'synthetic', checkpoint=checkpoints.append,
+                transport=lambda *_: self.fail('preflight limit must not call transport'))
+        self.assertEqual((result['status'], result['errorCode'], result['attempted'], result['requestCount']),
+                         ('rejected', 'SEMANTIC_INPUT_LIMIT', False, 0))
+        self.assertEqual(checkpoints, [])
+
     def test_private_callback_runs_after_final_checkpoint_and_cannot_mutate_public_result(self):
         checkpoints, received = [], []
         def callback(bound, inference):
