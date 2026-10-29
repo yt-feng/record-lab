@@ -35,6 +35,56 @@ def comparison(june, august, root, page=None):
 
 
 class UniverseSourceDiffTests(unittest.TestCase):
+    def test_unrecognized_table_preserves_bounded_header_shape_without_inferred_mapping(self):
+        data_rows = [product(3, '508001', '公开样本基金甲'), product(4, '890017', '公开样本基金乙')]
+        entries = files(data_rows)
+        entries['xl/worksheets/sheet1.xml'] = entries['xl/worksheets/sheet1.xml'].replace('设立日期', '终止日期')
+        with tempfile.TemporaryDirectory() as directory:
+            result, _ = comparison(workbook(), workbook(entries), directory)
+        august = result['sources'][1]
+        self.assertEqual(august['parseStatus'], 'failed')
+        self.assertEqual(august['errorCode'], 'UNSUPPORTED_SCHEMA')
+        shape = august['schemaDiagnostic']
+        self.assertEqual(shape['status'], 'observed'); self.assertEqual(shape['schemaMapping'], 'not-inferred')
+        self.assertEqual(shape['sheetCount'], 1); self.assertEqual(shape['date1904Values'], ['0'])
+        sheet = shape['sheets'][0]
+        self.assertEqual(sheet['name'], 'Sheet1'); self.assertEqual(sheet['rowCount'], 4)
+        self.assertEqual([c['headerCandidateValue'] for c in sheet['firstRows'][1]['cells']],
+                         ['序号', '基金代码', '基金简称', '终止日期'])
+        self.assertEqual(sheet['fixedSampleMatches']['508001']['cells'][0]['reference'], 'B3')
+        self.assertEqual(sheet['fixedSampleMatches']['890017']['cells'][0]['reference'], 'B4')
+        text = json.dumps(shape)
+        self.assertNotIn('CONCATENATE', text)
+        # Public product names within this small preview are useful schema
+        # evidence; they are not private local user data.
+        self.assertEqual(sheet['firstRows'][2]['cells'][2]['headerCandidateValue'], '公开样本基金甲')
+        self.assertFalse(shape['fixedSamplesProveProductMembership'])
+        self.assertFalse(result['codeSetComparisonReady'])
+
+    def test_schema_diagnostic_bounds_rows_cells_and_sample_matches_and_reports_date_system(self):
+        entries = files([product(row, '508001') for row in range(3, 14)])
+        entries['xl/workbook.xml'] = entries['xl/workbook.xml'].replace('date1904="0"', 'date1904="1"')
+        shape = diff.schema_diagnostic(workbook(entries))
+        self.assertEqual(shape['date1904Values'], ['1'])
+        self.assertEqual(len(shape['sheets'][0]['firstRows']), 12)
+        self.assertEqual(shape['sheets'][0]['fixedSampleMatches']['508001']['cellCount'], 11)
+        self.assertEqual(len(shape['sheets'][0]['fixedSampleMatches']['508001']['cells']), 8)
+        self.assertFalse(shape['historicalUniverseVerified'])
+        self.assertFalse(shape['catalogCompletenessVerified'])
+        with self.assertRaises(diff.verify.VerificationError):
+            diff.parse_product_table(workbook(entries), diff.SOURCES[1], diagnostic.explicit_period_dates)
+
+    def test_later_header_text_is_visible_and_public_preview_is_truncated(self):
+        entries = files([product(row, '508001', '甲' * 100 if row == 6 else '第十三行不可导出' if row == 13 else '公开名称')
+                         for row in range(3, 14)])
+        entries['xl/worksheets/sheet1.xml'] = entries['xl/worksheets/sheet1.xml'].replace(
+            '<v>公开名称</v></c><c r="D4"', '<v>基金管理人</v></c><c r="D4"')
+        shape = diff.schema_diagnostic(workbook(entries)); rows = shape['sheets'][0]['firstRows']
+        self.assertEqual(rows[3]['cells'][2]['headerCandidateValue'], '基金管理人')
+        self.assertEqual(len(rows[5]['cells'][2]['headerCandidateValue']), 80)
+        self.assertTrue(rows[5]['cells'][2]['headerCandidateTruncated'])
+        self.assertNotIn('第十三行不可导出', json.dumps(shape, ensure_ascii=False))
+
     def test_code_sets_metadata_counts_dates_and_sample_membership_are_separate(self):
         june = workbook(files([product(3, '508001', '合成旧名'), product(4, '890017')]))
         august = workbook(files([product(3, '508001', '合成新名', date=serial('2024-06-30')),

@@ -39,6 +39,9 @@ SAMPLES = (
      'sourceUrl': 'https://www.cjzcgl.com/changjiangzg-web/product/detail/890017?type=0'},
 )
 MAX_PRODUCTS = 50000
+MAX_SCHEMA_SHEETS = 6
+MAX_SCHEMA_ROWS = 12
+MAX_SCHEMA_CELLS = 12
 CATALOG_PATHS = ('catalog.json', 'periods/2026Q2/catalog.json', 'periods/2026Q3/catalog.json')
 
 
@@ -171,6 +174,73 @@ def parse_product_table(data, source, dates):
         book.archive.close()
 
 
+def schema_diagnostic(data):
+    """Bounded shape evidence on Actions; no guessed mapping or broad names.
+
+    The first twelve physical rows expose bounded public text so a header
+    after a title or blank rows is still observable. Fixed public sample codes
+    expose matching references only. Formula expressions and rows outside the
+    bounded preview never enter this diagnostic.
+    """
+    book = verify.Workbook(data)
+    try:
+        relationships = book.relationship_targets(); shared, formats = book.strings_and_styles(relationships)
+        workbook = book.xml('xl/workbook.xml', 'workbook')
+        properties = [node for node in workbook if verify.local(node.tag) == 'workbookPr']
+        sheets = [node for group in workbook if verify.local(group.tag) == 'sheets'
+                  for node in group if verify.local(node.tag) == 'sheet']
+        if not sheets or len(sheets) > verify.MAX_SHEETS: raise verify.VerificationError('UNSUPPORTED_SCHEMA')
+        result = {'schemaVersion': 1, 'status': 'observed', 'schemaMapping': 'not-inferred',
+                  'sourceSha256': hashlib.sha256(data).hexdigest(), 'downloadedBytes': len(data),
+                  'sheetCount': len(sheets), 'omittedSheetCount': max(0, len(sheets) - MAX_SCHEMA_SHEETS),
+                  'workbookPropertyCount': len(properties),
+                  'date1904Values': [node.get('date1904', '0')[:20] for node in properties[:6]],
+                  'sheets': [], 'fixedSamplesProveProductMembership': False,
+                  'historicalUniverseVerified': False, 'catalogCompletenessVerified': False}
+        for sheet in sheets[:MAX_SCHEMA_SHEETS]:
+            name = sheet.get('name', '')
+            relation = next((v for k, v in sheet.attrib.items() if verify.local(k) == 'id'), None)
+            target = relationships.get(relation)
+            if not name or len(name) > 100 or not target or target[0] != 'worksheet':
+                raise verify.VerificationError('UNSUPPORTED_SCHEMA')
+            groups = [node for node in book.xml(target[1], 'worksheet') if verify.local(node.tag) == 'sheetData']
+            if len(groups) != 1: raise verify.VerificationError('UNSUPPORTED_SCHEMA')
+            summary = {'name': name, 'state': sheet.get('state', 'visible'), 'rowCount': 0,
+                       'cellCount': 0, 'firstRows': [],
+                       'fixedSampleMatches': {sample['code']: {'cellCount': 0, 'cells': []} for sample in SAMPLES}}
+            for index, row in enumerate(groups[0]):
+                if verify.local(row.tag) != 'row' or not re.fullmatch(r'[1-9][0-9]{0,6}', row.get('r', '')):
+                    raise verify.VerificationError('UNSUPPORTED_SCHEMA')
+                number = int(row.get('r'))
+                cells = [book.cell(c, number, shared, formats) for c in row if verify.local(c.tag) == 'c']
+                summary['rowCount'] += 1; summary['cellCount'] += len(cells)
+                if index < MAX_SCHEMA_ROWS:
+                    shown = []
+                    for cell in cells[:MAX_SCHEMA_CELLS]:
+                        value = {key: cell[key] for key in ('reference', 'column', 'type', 'hasFormula')}
+                        value['numberFormat'] = cell['numberFormat'][:80] if cell['numberFormat'] is not None else None
+                        value['headerCandidateValue'] = cell['value'][:80]
+                        value['headerCandidateTruncated'] = len(cell['value']) > 80
+                        shown.append(value)
+                    summary['firstRows'].append({'row': number, 'cellCount': len(cells),
+                        'omittedCellCount': max(0, len(cells) - MAX_SCHEMA_CELLS), 'cells': shown})
+                for cell in cells:
+                    value = cell['value'].strip()
+                    for code, matches in summary['fixedSampleMatches'].items():
+                        exact = value == code
+                        candidate = cell['type'] == 'n' and value == str(int(code))
+                        if not exact and not candidate: continue
+                        matches['cellCount'] += 1
+                        if len(matches['cells']) < 8:
+                            matches['cells'].append({'reference': cell['reference'], 'row': number,
+                                'column': cell['column'], 'type': cell['type'],
+                                'method': 'exact-six-digit-cell' if exact else 'numeric-equivalent-unverified'})
+            result['sheets'].append(summary)
+        return result
+    finally:
+        book.archive.close()
+
+
 def read_catalogs(root):
     result = {}
     for relative in CATALOG_PATHS:
@@ -204,6 +274,7 @@ def compare_sources(june_data, *, dates, core_properties, fetch=download_source,
     result['landingPage'] = landing
     by_period = {}
     for source in SOURCES:
+        data = None
         try:
             data = june_data if source['asOf'] == history.SOURCE_AS_OF else fetch(source['sourceUrl'])
             summary, records = parse_product_table(data, source, dates)
@@ -221,7 +292,13 @@ def compare_sources(june_data, *, dates, core_properties, fetch=download_source,
                 summary['parseStatus'] = 'partial'; summary['errorCode'] = 'SOURCE_HASH_MISMATCH'
             result['sources'].append(summary); by_period[source['asOf']] = records
         except Exception as error:
-            result['sources'].append({**source, 'parseStatus': 'failed', 'errorCode': getattr(error, 'code', 'SOURCE_INSPECTION_FAILED')})
+            failure = {**source, 'parseStatus': 'failed', 'errorCode': getattr(error, 'code', 'SOURCE_INSPECTION_FAILED')}
+            if data is not None:
+                try: failure['schemaDiagnostic'] = schema_diagnostic(data)
+                except Exception as diagnostic_error:
+                    failure['schemaDiagnostic'] = {'status': 'failed',
+                        'errorCode': getattr(diagnostic_error, 'code', 'SOURCE_INSPECTION_FAILED'), 'schemaMapping': 'not-inferred'}
+            result['sources'].append(failure)
     ready = len(by_period) == 2 and all(s['parseStatus'] == 'complete' for s in result['sources'])
     result['codeSetComparisonReady'] = ready
     if ready:
