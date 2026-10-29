@@ -92,7 +92,7 @@ class StrategyQualityTests(unittest.TestCase):
         old = {"fields": {key: "complete" for key in traversal.SIX_QUALITY_FIELDS}}
         merged = traversal.merge_quality_observation(current, old)
         self.assertEqual(merged["fields"]["strategy"], "complete")
-        self.assertEqual(merged["strategySectionCoverageVersion"], 1)
+        self.assertEqual(merged["strategySectionCoverageVersion"], traversal.STRATEGY_SECTION_COVERAGE_VERSION)
 
 
 if __name__ == "__main__":

@@ -357,12 +357,36 @@ function finishBatch(root, { now = new Date().toISOString() } = {}) {
 }
 function readbackBatch(root) {
   const batch = batchFor(root), summary = read(path.join(root, CACHE, 'summary.json')), store = new Ledger(root);
-  if (summary.batchDigest !== batch.batchDigest) fail('SEMANTIC_PERSISTED_READBACK_FAILED');
+  const tasks = new Map(batch.tasks.map(row => [row.code, row]));
+  if (summary.batchDigest !== batch.batchDigest || !Array.isArray(summary.products)
+    || summary.products.length !== tasks.size || new Set(summary.products.map(row => row?.code)).size !== tasks.size
+    || summary.products.some(row => !row || !tasks.has(row.code)
+      || tasks.get(row.code).ledgerKey !== row.ledgerKey)) fail('SEMANTIC_PERSISTED_READBACK_FAILED');
   for (const row of summary.products) {
     const entry = store.get(row.ledgerKey), attempt = entry?.attempts.at(-1);
     if (attempt?.status !== row.status || attempt.candidateDigest !== row.candidateDigest) fail('SEMANTIC_PERSISTED_READBACK_FAILED');
-    if (row.status === 'admitted' && retainedStrategySemanticsFor(locate(root, batch.quarter, row.code).fund.selectedReport,
-      { code: row.code })?.candidate.candidateDigest !== row.candidateDigest) fail('SEMANTIC_PERSISTED_READBACK_FAILED');
+  }
+  const admitted = summary.products.filter(row => row.status === 'admitted');
+  if (admitted.length) {
+    // Resolve every requested identity against the current complete manifest.
+    // A task's old path cannot establish uniqueness after pages are replaced.
+    const folder = path.join(root, 'web/data/periods', batch.quarter), manifest = read(path.join(folder, 'latest.json'));
+    if (manifest.targetPeriodEnd !== PERIODS[batch.quarter] || !Array.isArray(manifest.companyFiles)) fail('SEMANTIC_PHASE_INVALID');
+    const matches = new Map(admitted.map(row => [row.code, []]));
+    for (const item of manifest.companyFiles) {
+      if (!/^\.\/data\/companies\/[A-Za-z0-9_-]{1,64}\.json$/.test(item.path)) fail('SEMANTIC_COMPANY_PATH_INVALID');
+      const company = read(path.join(folder, item.path.slice('./data/'.length)), 20000000);
+      if (!Array.isArray(company.funds)) fail('SEMANTIC_COMPANY_INVALID');
+      for (const fund of company.funds) for (const [code, found] of matches)
+        if (fund.code === code || [fund.aliases, fund.shareClassCodes].some(values => Array.isArray(values)
+          && values.some(value => value === code || value?.code === code))) found.push(fund);
+    }
+    for (const row of admitted) {
+      const found = matches.get(row.code);
+      if (found.length !== 1) fail('SEMANTIC_PORTFOLIO_NOT_UNIQUE');
+      if (retainedStrategySemanticsFor(found[0].selectedReport,
+        { code: row.code })?.candidate.candidateDigest !== row.candidateDigest) fail('SEMANTIC_PERSISTED_READBACK_FAILED');
+    }
   }
   summary.publication = 'persisted'; write(path.join(root, CACHE, 'summary.json'), summary); return summary;
 }

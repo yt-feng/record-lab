@@ -4,6 +4,8 @@ const assert = require('node:assert/strict');
 const { strategySectionCoverageFor, strategyAnalysisFor } = require('../lib/strategy-sections');
 const samples = require('./fixtures/strategy-sections.json');
 const copy = value => JSON.parse(JSON.stringify(value));
+const { spawnSync } = require('node:child_process');
+const path = require('node:path');
 
 test('Python section proof and selected evidence retain their separate completeness contracts', () => {
   for (const name of ['complete', 'child', 'selected-evidence', 'next-major-section']) {
@@ -17,6 +19,21 @@ test('Python section proof and selected evidence retain their separate completen
     assert.equal(analysis.explainsIndividualStockTrades, false);
   }
   assert.ok(strategyAnalysisFor(samples['selected-evidence'].strategyAnalysis, samples['selected-evidence'].strategySectionCoverage).omittedSentenceCount > 0);
+});
+
+test('Python opening-period anchoring stays equivalent in JS with disclosure history and wrong covers', () => {
+  const report = { sourceUrl: 'https://example.org/interim.pdf', kind: 'semiannual', periodEnd: '2026-06-30', publishedAt: '2026-08-28' };
+  const section = '4.4 报告期内基金的投资策略和运作分析\n本基金增加债券配置，因为市场利率下行。\n4.5 报告期内基金的业绩表现';
+  const history = '14.5 信息披露\n合成基金2025年第4季度报告\n合成基金2025年年度报告\n合成基金2026年第1季度报告';
+  const code = "import sys,json;sys.path.insert(0,'scripts');from strategy_sections import parse_strategy_sections;x=json.load(sys.stdin);print(json.dumps(parse_strategy_sections(x['pages'],x['report']),ensure_ascii=False))";
+  for (const [cover, complete] of [['合成基金2026年中期报告', true], ['合成基金2025年年度报告', false]]) {
+    const proc = spawnSync('python3', ['-c', code], { cwd: path.resolve(__dirname, '..'), input: JSON.stringify({ pages: [cover, section, history], report }), encoding: 'utf8' });
+    assert.equal(proc.status, 0);
+    const sample = JSON.parse(proc.stdout), proof = strategySectionCoverageFor(sample.strategySectionCoverage);
+    assert.equal(proof.complete, complete);
+    assert.deepEqual(proof.documentPeriodEvidence, sample.strategySectionCoverage.documentPeriodEvidence);
+    assert.equal(strategyAnalysisFor(sample.strategyAnalysis, proof).status, complete ? 'available' : 'wrong-period');
+  }
 });
 
 test('unclosed capped unknown-page and partial mappings cannot be promoted by a complete flag', () => {

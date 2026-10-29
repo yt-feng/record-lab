@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -41,6 +42,40 @@ def anchors():
         result[sample['code']] = {'code': sample['code'], 'name': '合成基金', 'company': '合成机构',
                                   'companyId': '80000000', 'selectedReport': report}
     return result
+
+
+def reit_pages():
+    """Synthetic 69-page layout using observed boundaries, never real text."""
+    pages = ['合成基金2026年中期报告'] + ['合成正文'] * 68
+    pages[3] = '目录\n7.1.2 基金经理（或基金经理小组）简介 ...... 20\n7.4 合成投资运作分析 ...... 22'
+    pages[5] = '\n'.join(f'4.{i} 合成项目运营情况\n合成项目资料。' for i in range(1, 26))
+    pages[19] = ('§ 7 管理人报告\n7.1 基金管理人情况\n'
+                 '7.1.2 基金经理（或基金经理小组）简介\n'
+                 '姓名 职务 任本基金的基金经理期限\n任职日期 离任日期 证券从业年限 说明\n'
+                 '张甲 不动产基金经理 2022年1月1日 - 20年\n'
+                 '曾任某机构负责人，毕业于合成大学。\n资格证书编号 12345678901234\n')
+    pages[20] = ('李乙 本基金基金经理 2023年1月1日 - 15年\n'
+                 '联系人 私人联系信息\n'
+                 '7.1.3 报告期末兼任私募资产管理计划投资经理的不动产基金经理\n'
+                 '同时管理的产品情况\n无。\n7.2 管理人合规情况\n本节为合成合规说明。\n'
+                 '7.4 合成投资运作分析\n本基金根据合成运营情况维持投资安排。\n'
+                 '本基金重视项目现金流与服务质量。\n7.5 合成未来展望\n未来将关注合成项目运行。\n'
+                 '7.6 其他情况\n无。\n§ 8 托管人报告')
+    pages[65] = ('14.3 不动产基金投资策略的改变\n本报告期内，本基金无投资策略的改变。\n'
+                 '14.4 为不动产基金进行审计的会计师事务所情况\n合成事务所。')
+    return pages
+
+
+def manager_grids():
+    from foreign_holdings import Cell, GridPage
+    ranges = [(0, 30), (30, 130), (130, 200), (200, 270), (270, 320), (320, 500)]
+    labels = ['姓名', '职务', '任职日期', '离任日期', '证券从业年限', '说明']
+    header = [Cell(*bounds, 700, 720, value) for bounds, value in zip(ranges, labels)]
+    def row(values): return [Cell(*bounds, 600, 680, value) for bounds, value in zip(ranges, values)]
+    first = header + row(['张甲', '不动产基金经理', '2022年1月1日', '-', '20年', '曾任负责人，资格证书编号 12345678901234'])
+    second = row(['李乙', '本基金基金经理', '2023年1月1日', '-', '15年', '毕业于合成大学，联系电话12345678901'])
+    return [GridPage(20, first, [(750, '7.1.2基金经理（或基金经理小组）简介')]),
+            GridPage(21, second, [(500, '7.1.3报告期末兼任私募资产管理计划投资经理的不动产基金经理同时管理的产品情况')])]
 
 
 class NonstockRetentionTests(unittest.TestCase):
@@ -199,7 +234,10 @@ class NonstockRetentionTests(unittest.TestCase):
             for sample in samples:
                 current, meta = diag.extract_quarter(provider, sample, NOW)
                 self.assertEqual(current['reportPdfSourceUrl'], sample['sourceUrl'])
-                self.assertEqual(len(meta['windows']), 1)
+                self.assertEqual(len(meta['windows']), 0 if sample['kind'] == 'semiannual' else 1)
+                if sample['kind'] == 'semiannual':
+                    self.assertEqual(meta['reitFieldObservation']['additionalHttpRequests'], 0)
+                    self.assertEqual(meta['reitFieldObservation']['geometry']['reasonCode'], 'OBSERVED_BOUNDARY_NOT_FOUND')
                 self.assertEqual(meta['documentStructure']['identityRecognizer']['branch'], 'PERIOD_TITLE_NOT_FOUND')
                 self.assertTrue(meta['documentStructure']['diagnosticOnly'])
         self.assertEqual([url for url, _ in provider.calls], [s['sourceUrl'] for s in samples])
@@ -310,6 +348,131 @@ class NonstockRetentionTests(unittest.TestCase):
         self.assertLessEqual(sum(len(row['text']) for row in windows), 1800)
         self.assertLessEqual(len(windows), 6)
         self.assertTrue(all(len(row['text']) <= 500 for row in windows))
+
+    def test_reit_probe_discovers_late_real_boundaries_before_bounded_selection(self):
+        pages = reit_pages()
+        with patch.dict('os.environ', {}, clear=True), patch.object(diag, '_read_reit_manager_grids') as read:
+            result, headings, windows = diag.reit_field_observation(pages, list(range(1, 70)), b'not-parsed')
+        read.assert_not_called()
+        self.assertEqual(result['scannedPages'], 69)
+        self.assertTrue(result['allPagesScanned'])
+        self.assertTrue(result['pageNumbersVerified'])
+        self.assertTrue(result['manager']['headingFound'])
+        self.assertTrue(result['manager']['sectionBounded'])
+        self.assertEqual((result['manager']['startPage'], result['manager']['endPage']), (20, 21))
+        self.assertEqual(result['manager']['plainIdentityCandidates'], 2)
+        self.assertEqual(result['manager']['currentRoleAccepted'], 1)
+        self.assertEqual(result['geometry']['reasonCode'], 'ACTIONS_REQUIRED')
+        self.assertGreater(result['discoveredHeadingCount'], 16)
+        self.assertTrue(any('7.4 合成投资运作分析' == row['text'] for row in headings))
+        self.assertTrue(any('7.1.3' in row['text'] and '同时管理的产品情况' in row['text'] for row in headings))
+        self.assertTrue(any(row['section'] == '14.3' and row['classification'] == 'strategy-change-statement' for row in result['sections']))
+        self.assertEqual(next(row for row in result['sections'] if row['section'] == '7.1.2')['endSection'], '7.1.3')
+        self.assertLessEqual(sum(len(row['text']) for row in headings), 640)
+        self.assertLessEqual(sum(len(row['text']) for row in windows), 1800)
+        self.assertLessEqual(result['managerExcerptChars'], 800)
+        self.assertLessEqual(result['strategyExcerptChars'], 1000)
+        self.assertFalse(result['productionEvidenceCreated'])
+        encoded = json.dumps([result, headings, windows], ensure_ascii=False)
+        for unwanted in ('毕业于', '曾任', '资格证', '12345678901234', '私人联系信息', '联系人', '......'):
+            self.assertNotIn(unwanted, encoded)
+        self.assertIn('张甲', encoded)
+        self.assertIn('李乙', encoded)
+        self.assertEqual(diag.inspect_content(encoded.encode()), [])
+
+    def test_reit_geometry_uses_only_observed_two_pages_and_identity_columns(self):
+        pages = reit_pages()
+        with patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), \
+                patch.object(diag, '_read_reit_manager_grids', return_value=manager_grids()) as read:
+            result, _, windows = diag.reit_field_observation(pages, list(range(1, 70)), b'one-existing-document')
+        read.assert_called_once_with(b'one-existing-document')
+        geometry = result['geometry']
+        self.assertEqual(geometry['status'], 'observed')
+        self.assertEqual(geometry['pagesRead'], [20, 21])
+        self.assertEqual((geometry['physicalRows'], geometry['identityRows'], geometry['unresolvedRows']), (2, 2, 0))
+        self.assertEqual([row['roleAllowedByCurrentParser'] for row in geometry['rowShapes']], [False, True])
+        self.assertEqual(set(geometry['columns']), {'name', 'role', 'start', 'end', 'experience', 'description'})
+        encoded = json.dumps([result, windows], ensure_ascii=False)
+        for unwanted in ('毕业于', '曾任', '资格证', '联系电话', '12345678901'):
+            self.assertNotIn(unwanted, encoded)
+        self.assertLessEqual(result['excerptChars'], 1800)
+
+    def test_reit_geometry_failure_and_wrong_boundaries_stay_explicitly_unavailable(self):
+        pages = reit_pages()
+        with patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), \
+                patch.object(diag, '_read_reit_manager_grids', side_effect=RuntimeError('private-debug')) as read:
+            result, _, _ = diag.reit_field_observation(pages, list(range(1, 70)), b'not-parsed')
+        self.assertTrue(result['geometry']['attempted'])
+        self.assertEqual(result['geometry']['status'], 'unavailable')
+        self.assertEqual(result['geometry']['reasonCode'], 'GEOMETRY_UNAVAILABLE')
+        self.assertNotIn('private-debug', json.dumps(result))
+        with patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch.object(diag, '_read_reit_manager_grids') as read:
+            wrong = pages.copy(); wrong[20] = wrong[20].replace('7.1.3 ', '7.1.4 ')
+            result, _, _ = diag.reit_field_observation(wrong, list(range(1, 70)), b'not-parsed')
+        read.assert_not_called()
+        self.assertFalse(result['manager']['sectionBounded'])
+        self.assertEqual(result['geometry']['reasonCode'], 'OBSERVED_BOUNDARY_NOT_FOUND')
+
+    def test_reit_geometry_unknown_experience_label_keeps_safe_header_for_repair(self):
+        from foreign_holdings import Cell
+        grids = manager_grids()
+        old = grids[0].cells[4]
+        grids[0].cells[4] = Cell(old.x0, old.x1, old.y0, old.y1, '不动产项目运营或投资管理经验年限')
+        pages = reit_pages()
+        pages[19] = pages[19].replace('证券从业年限', '不动产项目运营或投资管理经验年限')
+        with patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch.object(diag, '_read_reit_manager_grids', return_value=grids):
+            result, _, windows = diag.reit_field_observation(pages, list(range(1, 70)), b'not-parsed')
+        self.assertEqual(result['geometry']['status'], 'unavailable')
+        self.assertEqual(result['geometry']['reasonCode'], 'HEADER_COLUMNS_UNRECOGNIZED')
+        self.assertTrue(any('不动产项目运营或投资管理经验年限' in row['text'] for row in windows))
+
+    def test_reit_grid_reader_indexes_only_physical_pages_twenty_and_twenty_one(self):
+        accessed = []
+        class FakePages:
+            def __len__(self): return 69
+            def __getitem__(self, index): accessed.append(index); return f'synthetic-page-{index + 1}'
+        fake = types.SimpleNamespace(PdfReader=lambda _: types.SimpleNamespace(pages=FakePages()))
+        with patch.dict('sys.modules', {'pypdf': fake}), patch('foreign_holdings.extract_grid_page', side_effect=lambda page, number: (page, number)) as extract:
+            result = diag._read_reit_manager_grids(b'synthetic-bytes')
+        self.assertEqual(accessed, [19, 20])
+        self.assertEqual(result, [('synthetic-page-20', 20), ('synthetic-page-21', 21)])
+        self.assertEqual(extract.call_count, 2)
+
+    def test_reit_combined_budget_and_complete_private_census_are_independent_of_early_volume(self):
+        pages = reit_pages()
+        pages[5] = '\n'.join(f'4.{i} 合成项目运营情况\n' + '合成运营观察内容。' * 200 for i in range(1, 95))
+        pages[20] = pages[20].replace('本基金根据合成运营情况维持投资安排。', '本基金根据合成运营情况维持投资安排。' * 200)
+        result, headings, windows = diag.reit_field_observation(pages, list(range(1, 70)), b'not-parsed')
+        self.assertGreater(result['discoveredHeadingCount'], 90)
+        self.assertTrue(result['headingsTruncated'])
+        self.assertTrue(result['sectionMetadataTruncated'])
+        self.assertTrue(result['strategyCandidatesTruncated'])
+        self.assertLessEqual(result['headingChars'], 640)
+        self.assertLessEqual(len(result['sections']), 32)
+        self.assertLessEqual(sum(len(row['text']) for row in windows), 1800)
+        self.assertTrue(any(row['section'] == '7.4' and row['truncated'] for row in windows))
+        self.assertTrue(any('7.1.2' in row['text'] for row in headings))
+
+    def test_reit_probe_replaces_raw_nav_windows_without_changing_structured_nav(self):
+        pages = reit_pages()
+        pages[30] = ('10.1 资产负债表\n单位：人民币元\n本期末 2026年6月30日 上年度末 2025年12月31日\n'
+                     '净资产合计 2,388,000,000.00 2,400,000,000.00\n10.2 利润表')
+        class Provider:
+            def __init__(self): self.calls = []
+            def get(self, url, **kwargs): self.calls.append(url); return b'%PDF-synthetic-never-parsed'
+        provider = Provider()
+        with patch.dict('os.environ', {'GITHUB_ACTIONS': 'false'}), patch('report_extract._pypdf_pages', return_value=pages), \
+                patch.object(diag, '_read_reit_manager_grids') as read:
+            result = diag.diagnose_interim(provider, anchors()['508007'], NOW, diag.extract_quarter)
+        read.assert_not_called()
+        self.assertEqual(provider.calls, [diag.SAMPLES[1]['interimUrl']])
+        self.assertEqual(result['fieldCompleteness']['nav']['valueYuan'], 2388000000.0)
+        self.assertTrue(result['fieldCompleteness']['nav']['acceptedInSnapshot'])
+        self.assertEqual(result['reitFieldObservation']['additionalHttpRequests'], 0)
+        self.assertTrue(result['reitFieldObservation']['manager']['headingFound'])
+        self.assertFalse(any('净资产合计' in row['text'] for row in result['windows']))
+        self.assertTrue(all(row['selection'].startswith(('manager-', 'strategy-')) for row in result['windows']))
+        self.assertLess(len(json.dumps(result, ensure_ascii=False).encode()), diag.MAX_OUTPUT)
 
     def test_completeness_summary_does_not_accept_unbound_flags_or_portfolio_subtotals(self):
         sample = diag.interim_sample(anchors()['508007'], NOW)

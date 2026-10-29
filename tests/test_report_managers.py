@@ -98,6 +98,31 @@ class ReportManagerTests(unittest.TestCase):
         result = parse_report_managers(["某基金2026 年第3 季度报告\n" + HEADER + row], REPORT)
         self.assertEqual(len(result), 1)
 
+    def test_semiannual_title_anchor_ignores_history_list_but_not_wrong_cover_or_kind(self):
+        report = {**REPORT, 'kind': 'semiannual', 'periodEnd': '2026-06-30', 'publishedAt': '2026-08-28'}
+        body = HEADER + '张明 本基金基金经理 2020-01-01 - 20年\n4.2 管理人报告'
+        history = '14.5 信息披露\n合成基金2025年第4季度报告\n合成基金2025年年度报告\n合成基金2026年第1季度报告'
+        result = parse_report_managers(['合成基金2026年中期报告', body, history], report)
+        self.assertEqual([r['name'] for r in result], ['张明'])
+        self.assertTrue(result.coverage['complete'])
+        for first in ['合成基金2025年年度报告', '合成基金2026年第2季度报告']:
+            self.assertEqual(parse_report_managers([first, body, history + '\n合成基金2026年中期报告'], report), [])
+        self.assertEqual(parse_report_managers(['历史公告列表\n合成基金2026年中期报告', body], report), [])
+
+    def test_wrapped_and_spaced_titles_cannot_bypass_quarter_or_kind_binding(self):
+        report = {**REPORT, 'periodEnd': '2026-06-30', 'publishedAt': '2026-07-21'}
+        body = HEADER + '张明 本基金基金经理 2020-01-01 - 20年\n4.2 管理人报告'
+        for token in ['2026年第2季度\n报告', '2026年第2季 度报 告', '2026\n年\n第2季度\n报\n告']:
+            rows = parse_report_managers(['合成证券投资基金\n' + token, body], report)
+            self.assertEqual([row['name'] for row in rows], ['张明'])
+            self.assertTrue(rows.coverage['complete'])
+        for token in ['2026年第3季 度报告', '2026年第3季度\n报告',
+                      '2026年中期报 告', '2026年中期报\n告', '2 0 2 6 年半 年 度报 告']:
+            with self.subTest(token=token):
+                rows = parse_report_managers(['合成证券投资基金\n' + token, body], report)
+                self.assertEqual(rows, [])
+                self.assertFalse(rows.coverage['complete'])
+
     def test_invalid_report_context_does_not_create_metadata(self):
         for patch in [{"periodEnd": "2026-09-29"}, {"periodEnd": "2026-02-30"}, {"kind": "termination"},
                       {"sourceUrl": "file:///report.pdf"}, {"sourceUrl": "https://" + "private:secret" + "@" + "example.test/report.pdf"}]:

@@ -1,0 +1,90 @@
+{
+  "description": "Synthetic interim real-estate product identity with disclosure-history references.",
+  "pages": [
+    "合成不动产证券投资基金\n2026 年中期报告",
+    "重要提示",
+    "目录\n2.1 不动产基金产品基本情况........5",
+    "目录（续）",
+    "§ 2 不动产基金简介\n2.1 不动产 基金产品基本情况\n基金名称 合成不动产证券投资基金\n基金代码  000008\n交易代码  000008\n基金运作方式 封闭式",
+    "2.2 不动产 项目基本情况说明\n合成项目\n2.3 不动产 基金扩募情况\n§ 3 主要财务指标和 不动产 基金运作情况",
+    "14.5 信息披露\n合成基金2025年第4季度报告\n合成基金2025年年度报告\n合成基金2026年第1季度报告"
+  ],
+  "pageNumbers": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "report": {
+    "title": "合成不动产证券投资基金2026年中期报告",
+    "fundCode": "000008",
+    "sourceUrl": "https://example.org/reit-interim.pdf",
+    "periodEnd": "2026-06-30",
+    "publishedAt": "2026-08-28",
+    "kind": "semiannual"
+  },
+  "proof": {
+    "schemaVersion": 1,
+    "method": "pdf-explicit-reit-code-rows-v1",
+    "scope": "explicitly-listed-fund-codes",
+    "sourceUrl": "https://example.org/reit-interim.pdf",
+    "periodEnd": "2026-06-30",
+    "publishedAt": "2026-08-28",
+    "kind": "semiannual",
+    "retrievedAt": "2026-08-28T10:00:00+00:00",
+    "pdfSha256": "2b37e122e21cf34952ee9bc895137e8fc4e9e26288b6280d038495ceea8e9683",
+    "sourceTextHash": "e51cba2ff18b2403a885868113a2ed83c1477fcdd74266483b41ccb7f3722ff0",
+    "textHashScope": "provided-extracted-pages",
+    "reportPeriodEvidence": {
+      "text": "2026 年中期报告",
+      "page": 1
+    },
+    "identitySection": {
+      "heading": "§ 2 不动产基金简介",
+      "endHeading": "2.2 不动产 项目基本情况说明",
+      "startPage": 5,
+      "endPage": 6,
+      "pages": [
+        5,
+        6
+      ],
+      "sectionBounded": true,
+      "pageNumbersVerified": true,
+      "subheading": "2.1 不动产 基金产品基本情况",
+      "subheadingPage": 5,
+      "subheadingAdjacent": true
+    },
+    "rows": [
+      {
+        "field": "mainCode",
+        "text": "基金代码  000008",
+        "codes": [
+          "000008"
+        ],
+        "page": 5,
+        "pages": [
+          5
+        ]
+      },
+      {
+        "field": "tradingCode",
+        "text": "交易代码  000008",
+        "codes": [
+          "000008"
+        ],
+        "page": 5,
+        "pages": [
+          5
+        ]
+      }
+    ],
+    "sourcePortfolioCode": "000008",
+    "shareClassCodes": [],
+    "eligibleForShareClassExpansion": false,
+    "shareClassUniverseComplete": false,
+    "shareClassSpecificMetricsProvided": false
+  }
+}

@@ -12,6 +12,7 @@ import html
 import ipaddress
 import re
 from urllib.parse import urlsplit, parse_qsl
+from report_period import document_periods, period_token
 
 METHOD = "bounded-strategy-sections-v1"
 CATEGORIES = ("market-review", "portfolio-operations", "outlook", "unclassified")
@@ -136,21 +137,7 @@ def _categories(sentence):
 
 
 def _document_periods(pages, numbers):
-    observed = {}
-    for index, raw in enumerate(pages):
-        compact = re.sub(r"\s+", "", raw[:600])
-        for match in re.finditer(r"(20\d{2})年(?:第?([1-4一二三四])季度|(?P<half>中期|半年度)|(?P<annual>年度))报告", compact):
-            if match[2]:
-                quarter = int(match[2]) if match[2].isdigit() else "一二三四".index(match[2]) + 1
-                suffix = {1: "03-31", 2: "06-30", 3: "09-30", 4: "12-31"}[quarter]
-                kind = "quarterly"
-            else:
-                suffix, kind = ("06-30", "semiannual") if match["half"] else ("12-31", "annual")
-            period = match[1] + "-" + suffix
-            page = numbers[index] if index < len(numbers) else None
-            if (period, kind) not in observed or type(observed[(period, kind)]["page"]) is not int:
-                observed[(period, kind)] = {"periodEnd": period, "kind": kind, "page": page, "text": match.group()}
-    return list(observed.values())[:8]
+    return document_periods(pages, numbers)
 
 
 def _valid_document_period(evidence, report):
@@ -159,7 +146,7 @@ def _valid_document_period(evidence, report):
                 and evidence[0].get("periodEnd") == report.get("periodEnd") and evidence[0].get("kind") == kind
                 and type(evidence[0].get("page")) is int and 1 <= evidence[0]["page"] <= 10000
                 and isinstance(evidence[0].get("text"), str) and len(evidence[0]["text"]) <= 100
-                and _document_periods([evidence[0]["text"]], [evidence[0]["page"]]) == evidence)
+                and period_token(evidence[0]["text"]) == (kind, report.get("periodEnd")))
 
 
 def _sentences(chunks):

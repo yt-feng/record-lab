@@ -15,6 +15,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from urllib.parse import urlsplit
+from report_period import document_periods, has_period_reference
 
 
 _CJK = r"\u3400-\u9fff"
@@ -205,20 +206,15 @@ def _report_interval(report: Mapping) -> tuple[str, str] | None:
     return start.isoformat(), period_end
 
 
-def _title_matches_period(pages: Sequence[str], period_end: str) -> bool:
-    """If a document identifies its period, never relabel that document."""
-    observed = set()
-    for page in pages:
-        compact = re.sub(r"\s+", "", page[:600])
-        for match in re.finditer(r"(\d{4})年第([1-4一二三四])季度报告", compact):
-            quarter = "一二三四".find(match[2]) + 1 if match[2] in "一二三四" else int(match[2])
-            month = quarter * 3
-            year = int(match[1])
-            if 1900 <= year <= 9999:
-                observed.add(f"{year:04d}-{month:02d}-{calendar.monthrange(year, month)[1]:02d}")
-        for match in re.finditer(r"(\d{4})年(中期|半年度|年度)报告", compact):
-            observed.add(match[1] + ("-12-31" if match[2] == "年度" else "-06-30"))
-    return not observed or observed == {period_end}
+def _title_matches_period(pages: Sequence[str], period_end: str, kind: str) -> bool:
+    """Bind the opening report title; incidental disclosure dates do not vote."""
+    observed = document_periods(pages)
+    expected = 'semiannual' if kind == 'interim' else kind
+    if not observed:
+        # Preserve support for title-free bounded table extracts, but a list
+        # of historical report names cannot serve as the current document.
+        return not has_period_reference(pages)
+    return len(observed) == 1 and (observed[0]['kind'], observed[0]['periodEnd']) == (expected, period_end)
 
 
 def _role_allowed(role: str) -> bool:
@@ -271,7 +267,7 @@ def parse_report_managers(
     numbers = list(page_numbers) if page_numbers is not None else list(range(1, len(pages) + 1))
     cleaned = [_clean_page(page) for page in pages]
     start, end = interval
-    if not _title_matches_period(cleaned, end):
+    if not _title_matches_period(cleaned, end, report.get('kind', 'quarterly')):
         return ManagerRows(coverage=coverage)
     coverage["periodStart"] = start
     managers: dict[tuple[str, str, str | None], dict] = {}

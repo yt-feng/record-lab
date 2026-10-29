@@ -165,7 +165,7 @@ class TraversalTests(unittest.TestCase):
             retry["funds"][0]["qualityAttempt"] = True
             retry["funds"][0]["managerAttempt"] = False
             retry["funds"][0]["managerTableCoverageVersion"] = traversal.MANAGER_TABLE_COVERAGE_VERSION
-            retry["funds"][0]["strategySectionCoverageVersion"] = 1
+            retry["funds"][0]["strategySectionCoverageVersion"] = traversal.STRATEGY_SECTION_COVERAGE_VERSION
             progress = traversal.merge_progress(catalog(), progress, config, [retry], now=NOW)
             replay = traversal.merge_progress(catalog(), progress, config, [retry], now=NOW)
             self.assertEqual(progress["funds"][0]["quality"]["attempts"], replay["funds"][0]["quality"]["attempts"])
@@ -658,7 +658,7 @@ class TraversalTests(unittest.TestCase):
     def test_missing_pdf_quality_reopens_but_truncated_parser_does_not(self):
         directory, previous, config = self.retry_fixture()
         fund = previous["funds"][0]
-        fund.update({"status": "complete", "quality": {"attempts": 3, "lastAttemptAt": fund["lastAttemptAt"], "managerTableCoverageVersion": traversal.MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2, "strategySectionCoverageVersion": 1,
+        fund.update({"status": "complete", "quality": {"attempts": 3, "lastAttemptAt": fund["lastAttemptAt"], "managerTableCoverageVersion": traversal.MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2, "strategySectionCoverageVersion": traversal.STRATEGY_SECTION_COVERAGE_VERSION,
                      "fields": {key: "missing" if key == "pdf" else "complete" for key in traversal.QUALITY_FIELDS}},
                      "enrichment": self.coverage(2)})
         opened = traversal.merge_progress(directory, previous, config, now="2026-10-27T07:00:00Z")
@@ -747,7 +747,7 @@ class TraversalTests(unittest.TestCase):
         self.assertFalse(blocked["complete"])
         fund = previous["funds"][0]
         fund.update({"status": "complete", "errorCode": None,
-                     "quality": {"attempts": 3, "lastAttemptAt": fund["lastAttemptAt"], "managerTableCoverageVersion": traversal.MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2, "strategySectionCoverageVersion": 1, "strategyAttempts": 3,
+                     "quality": {"attempts": 3, "lastAttemptAt": fund["lastAttemptAt"], "managerTableCoverageVersion": traversal.MANAGER_TABLE_COVERAGE_VERSION, "priceCoverageVersion": 2, "strategySectionCoverageVersion": traversal.STRATEGY_SECTION_COVERAGE_VERSION, "strategyAttempts": 3,
                          "fields": {key: "missing" if key in {"nav", "strategy"} else "complete" for key in traversal.QUALITY_FIELDS}},
                      "enrichment": self.coverage(2)})
         incomplete = traversal.merge_progress(directory, previous, config, now="2026-10-26T07:00:00Z")["completionAudit"]

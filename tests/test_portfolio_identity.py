@@ -104,6 +104,30 @@ class PortfolioIdentityTests(unittest.TestCase):
         self.assertIsNone(result['noEquitiesEvidence'])
         self.assertIsNone(result.get('navYuan'))
 
+    def test_reit_interim_uses_observed_fund_introduction_parent_and_its_own_period(self):
+        fixture = json.loads((Path(__file__).parent / 'fixtures/portfolio-identity-reit-interim.json').read_text())
+        def parse(pages=fixture['pages'], report=fixture['report']):
+            return parse_portfolio_identity(pages, report, retrieved_at=fixture['proof']['retrievedAt'],
+                pdf_sha256=fixture['proof']['pdfSha256'], now=NOW)
+        value = parse()
+        self.assertEqual(value, fixture['proof'])
+        self.assertEqual(value['identitySection']['heading'], '§ 2 不动产基金简介')
+        self.assertEqual(value['identitySection']['pages'], [5, 6])
+        self.assertEqual(value['shareClassCodes'], [])
+        for pages in [[p.replace('§ 2 不动产基金简介', '§ 2 不动产基金产品概况') for p in fixture['pages']],
+                      [p.replace('2026 年中期报告', '2026 年第 2 季度报告') for p in fixture['pages']],
+                      [p.replace('交易代码  000008', '交易代码 000009') for p in fixture['pages']]]:
+            self.assertIsNone(parse(pages))
+        forged = copy.deepcopy(value); forged['identitySection']['heading'] = '§2不动产基金产品概况'
+        self.assertIsNone(normalize_portfolio_identity(forged, fixture['report'], now=NOW))
+        forged = copy.deepcopy(value); forged['kind'] = 'annual'; forged['periodEnd'] = '2026-12-31'
+        self.assertIsNone(normalize_portfolio_identity(forged, now=NOW))
+
+    def test_identity_period_is_anchored_to_title_not_early_history_reference(self):
+        history = '3.9 信息披露\n合成基金2025年第4季度报告\n合成基金2025年年度报告'
+        self.assertEqual(proof([*PAGES, history])['sourcePortfolioCode'], '000001')
+        self.assertIsNone(proof([PAGES[0].replace('第2', '第1'), *PAGES[1:], history + '\n合成基金2026年第2季度报告']))
+
     def test_quarterly_adjacent_parent_child_titles_share_one_bounded_identity_section(self):
         # The 159366 cloud diagnostic showed these exact two adjacent headings.
         pages = [PAGES[0], PAGES[1].replace('§2 基金产品概况\n', '§2 基金产品概况\n2.1 基金基本情况\n'), PAGES[2]]

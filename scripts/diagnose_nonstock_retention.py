@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import hashlib
+import io
 import json
 import logging
 import math
@@ -350,6 +351,243 @@ def document_structure(pages, numbers, doc, *, pdf_sha256, now):
     return result
 
 
+_REIT_HEADING = re.compile(r'^\s*(?P<section>§\s*\d{1,2}|\d{1,2}(?:\s*[.．]\s*\d{1,2}){1,3})\s*(?P<title>[^\n]{2,160})$')
+_REIT_TOPIC = re.compile(r'策略|运作|投资管理|运营|经营|管理人报告|展望|宏观|证券市场')
+_REIT_PRIVATE = re.compile(r'联系人|联系方式|电话号码|联系电话|身份证|邮箱|电子邮件|资格证|资格编号|证书|证件|@|https?://|\d{10,}')
+_REIT_BIO = re.compile(r'毕业|学历|学位|硕士|博士|学士|历任|曾任|加入|曾在|就职|从事|担任')
+_REIT_HEADER = re.compile(r'^(?:姓名|职务|任职日期|离任日期|证券从业年限|证券从业|从业年限|说明|任本基金的基金经理期限|任本基金的基金经理|任本不动产基金的基金经理期限|任本不动产基金的基金经理|不动产基金经理|基金经理|期限|年限|日期|任职|离任|助理|[（()）])+?$')
+
+
+def _reit_header_label(value):
+    compact = re.sub(r'[\s|]+', '', str(value))
+    return bool(compact and len(compact) <= 120 and not _REIT_PRIVATE.search(compact)
+        and (_REIT_HEADER.fullmatch(compact) or re.search(r'姓名|职务|任职|离任|年限|从业|期限|经验|说明', compact)
+             and re.fullmatch(r'[姓名职务任本的不动产基础设施项目基金经理助期日限离证券从业运营投资管工作经验年说明相关或及与（）()、/]+', compact)))
+
+
+def _reit_sections(pages, numbers):
+    """Discover every heading privately before applying any output budget."""
+    lines = [(number, line.strip()) for page, number in zip(pages, numbers) for line in str(page).splitlines()]
+    nodes, consumed = [], set()
+    for index, (page, line) in enumerate(lines):
+        if index in consumed:
+            continue
+        hit = _REIT_HEADING.fullmatch(line)
+        if not hit:
+            continue
+        title, last = hit['title'].strip(), index
+        if (re.search(r'[.．…·]{2,}|\d\s*$', title) or _REIT_PRIVATE.search(title)
+                or not re.search(r'[\u3400-\u9fff]', title) or re.search(r'[。；！？]', title)):
+            continue
+        # Observe wrapped labels without attaching ordinary prose to a heading.
+        if re.search(r'(?:的|和|及|与|不动产基金|不动产|基金|基金经理|期末|报告期内)$', re.sub(r'\s+', '', title)):
+            for following in range(index + 1, min(index + 3, len(lines))):
+                next_page, fragment = lines[following]
+                if (next_page != page or not fragment or _REIT_HEADING.match(fragment)
+                        or len(fragment) > 65 or not re.fullmatch(r'[\u3400-\u9fff（）()、\s]+', fragment)
+                        or re.match(r'本基金|本报告|报告期内|根据|截至|公司', fragment)
+                        or _REIT_PRIVATE.search(fragment) or _REIT_BIO.search(fragment)):
+                    break
+                title += ' ' + fragment; last = following; consumed.add(following)
+                if re.search(r'说明|情况|分析|报告|简介|展望$', fragment):
+                    break
+        section = re.sub(r'[§\s]', '', hit['section']).replace('．', '.')
+        nodes.append({'section': section, 'title': title, 'text': hit['section'] + ' ' + title,
+                      'page': page, 'line': index, 'bodyStart': last + 1})
+    for index, node in enumerate(nodes):
+        parts = tuple(map(int, node['section'].split('.')))
+        following = next((other for other in nodes[index + 1:]
+            if tuple(map(int, other['section'].split('.'))) > parts
+            and (len(other['section'].split('.')) <= len(parts)
+                 or tuple(map(int, other['section'].split('.')))[:len(parts)] != parts)), None)
+        node['next'] = following
+        node['body'] = lines[node['bodyStart']:following['line'] if following else len(lines)]
+    return nodes
+
+
+def _read_reit_manager_grids(pdf_bytes):
+    """Only the two already observed physical pages; existing pypdf only."""
+    from pypdf import PdfReader
+    from foreign_holdings import extract_grid_page
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    if len(reader.pages) < 21:
+        raise ValueError('PAGE_COUNT')
+    return [extract_grid_page(reader.pages[number - 1], number) for number in (20, 21)]
+
+
+def _reit_manager_geometry(pdf_bytes, manager):
+    result = {'attempted': False, 'status': 'unavailable', 'reasonCode': 'OBSERVED_BOUNDARY_NOT_FOUND',
+              'pagesRead': [], 'physicalRows': 0, 'identityRows': 0, 'unresolvedRows': 0,
+              'columns': {}, 'rowShapes': []}
+    if not manager or manager['page'] != 20 or not manager['next'] or manager['next']['section'] != '7.1.3' or manager['next']['page'] != 21:
+        return result, []
+    if os.environ.get('GITHUB_ACTIONS') != 'true':
+        result['reasonCode'] = 'ACTIONS_REQUIRED'
+        return result, []
+    result['attempted'] = True
+    try:
+        from manager_cells import _header, _line_y, _physical_rows, _role_allowed, _date, FIELDS, IDENTITY
+        grids = _read_reit_manager_grids(pdf_bytes)
+        if [grid.number for grid in grids] != [20, 21]:
+            raise ValueError('PAGE_MAPPING')
+        result['pagesRead'] = [20, 21]
+        label_quotes = []
+        label_anchor = next((cell for cell in grids[0].cells if re.sub(r'\s+', '', cell.text) == '姓名'), None)
+        if label_anchor:
+            labels = [cell.text.strip() for cell in sorted(grids[0].cells, key=lambda cell: cell.x0)
+                if cell.y0 >= label_anchor.y0 - 1.2 and cell.y1 <= label_anchor.y1 + 1.2 and _reit_header_label(cell.text)]
+            if labels:
+                label_quotes.append((20, '\n'.join(dict.fromkeys(labels)), 'manager-header-cells'))
+        header = _header(grids[0])
+        if not header:
+            result['reasonCode'] = 'HEADER_COLUMNS_UNRECOGNIZED'
+            return result, label_quotes
+        columns, header_bottom, _ = header
+        top = _line_y(grids[0], lambda text: text.startswith('7.1.2基金经理'))
+        bottom = _line_y(grids[1], lambda text: text.startswith('7.1.3报告期末兼任'))
+        if top is None or bottom is None or top <= header_bottom:
+            result['reasonCode'] = 'GEOMETRY_BOUNDARY_UNVERIFIED'
+            return result, []
+        result['columns'] = {key: [round(v, 2) for v in columns[key]] for key in FIELDS}
+        raw_rows = []
+        for index, grid in enumerate(grids):
+            repeated = _header(grid) if index else None
+            if repeated and any(abs(repeated[0][field][side] - columns[field][side]) > 1.2 for field in FIELDS for side in (0, 1)):
+                result['reasonCode'] = 'CONTINUATION_COLUMNS_MISMATCH'
+                return result, []
+            upper = header_bottom if not index else repeated[1] if repeated else math.inf
+            raw_rows.extend(_physical_rows(grid, columns, upper, bottom if index else -math.inf))
+        quotes = label_quotes
+        result['physicalRows'] = len(raw_rows)
+        for row in raw_rows:
+            values = {key: re.sub(r'\s+', '', row['cells'][key].text) if key in row['cells'] else '' for key in IDENTITY}
+            valid = (re.fullmatch(r'[\u3400-\u9fff]{2,6}(?:[·•][\u3400-\u9fff]{1,6})?', values['name'])
+                     and 0 < len(values['role']) <= 80 and '基金经理' in values['role']
+                     and not _REIT_BIO.search(values['role']) and _date(values['start'])
+                     and (values['end'] in ('-', '—', '－', '–', '至今', '在任') or _date(values['end'])))
+            excerpt = ' '.join(values.values())
+            valid = bool(valid and not _REIT_PRIVATE.search(excerpt) and not inspect_content(excerpt.encode()))
+            result['identityRows'] += valid
+            result['unresolvedRows'] += not valid
+            if len(result['rowShapes']) < 12:
+                result['rowShapes'].append({'page': row['page'], 'presentFields': [key for key in IDENTITY if key in row['cells']],
+                    'identityReadable': valid, 'roleAllowedByCurrentParser': bool(valid and _role_allowed(values['role']))})
+            if valid:
+                quotes.append((row['page'], excerpt, 'manager-identity-cells'))
+        result.update(status='observed', reasonCode=None, rowShapesTruncated=len(raw_rows) > 12)
+        return result, quotes
+    except Exception:
+        result['reasonCode'] = 'GEOMETRY_UNAVAILABLE'
+        return result, []
+
+
+def reit_field_observation(pages, numbers, pdf_bytes):
+    """Diagnostic only: bounded public fields, never new production evidence."""
+    from report_managers import _ROW, _role_allowed
+    pages, numbers = list(pages), list(numbers)
+    nodes = _reit_sections(pages, numbers)
+    relevant = [node for node in nodes if node['section'].split('.')[0] == '7'
+        or node['section'].split('.')[0] == '4' and _REIT_TOPIC.search(node['title'])
+        or re.search(r'策略|运作分析|投资运作|展望|宏观|证券市场', node['title'])]
+    manager = next((node for node in relevant if node['section'] == '7.1.2'
+                    and re.sub(r'\s+', '', node['title']) == '基金经理（或基金经理小组）简介'), None)
+    following = manager['next'] if manager else None
+    manager_bounded = bool(manager and following and following['section'] == '7.1.3')
+    def priority(node):
+        if node is manager or node is following: return 0
+        if re.search(r'策略|运作分析|投资运作|展望', node['title']): return 1
+        return 2 if node['section'].split('.')[0] == '7' else 3
+    ordered = sorted(relevant, key=priority)
+    headings, selected, remaining = [], set(), 640
+    for node in ordered:
+        label = node['text']
+        if len(headings) >= 48 or len(label) > remaining or inspect_content(label.encode()):
+            continue
+        headings.append({'page': node['page'], 'text': label})
+        selected.add(node['line']); remaining -= len(label)
+    headings.sort(key=lambda row: (row['page'] if type(row['page']) is int else 10000,
+                                   next((node['line'] for node in relevant if node['text'] == row['text'] and node['page'] == row['page']), 0)))
+    windows, budgets = [], {'manager': 800, 'strategy': 1000}
+    def add(page, raw, selection, lane, *, section, limit=200, end=False):
+        raw = str(raw or '').strip()
+        if (not raw or type(page) is not int or not 1 <= page <= 300 or _REIT_PRIVATE.search(raw)
+                or lane == 'manager' and _REIT_BIO.search(raw) or inspect_content(raw.encode())):
+            return
+        cap = min(limit, budgets[lane])
+        if cap <= 0: return
+        text = raw[-cap:] if end else raw[:cap]
+        windows.append({'page': page, 'text': text, 'textSha256': hashlib.sha256(text.encode()).hexdigest(),
+                        'truncated': len(text) < len(raw), 'selection': selection, 'section': section})
+        budgets[lane] -= len(text)
+    manager_stats = {'headingFound': bool(manager), 'sectionBounded': manager_bounded,
+                     'startPage': manager['page'] if manager else None,
+                     'endPage': following['page'] if manager_bounded else None,
+                     'plainIdentityCandidates': 0, 'currentRoleAccepted': 0,
+                     'headerLabels': {key: False for key in ('姓名', '职务', '任职日期', '离任日期', '证券从业年限', '期限')}}
+    if manager_bounded:
+        body = '\n'.join(text for _, text in manager['body'])
+        header_lines = [(page, text) for page, text in manager['body'][:35] if _reit_header_label(text)]
+        if header_lines:
+            add(header_lines[0][0], '\n'.join(text for _, text in header_lines), 'manager-header', 'manager', section='7.1.2', limit=220)
+        compact = re.sub(r'\s+', '', body[:1400])
+        manager_stats['headerLabels'] = {label: label in compact for label in manager_stats['headerLabels']}
+        for match in list(_ROW.finditer(body))[:30]:
+            quote = re.sub(r'\s+', ' ', match.group()).strip()
+            if _REIT_PRIVATE.search(quote) or _REIT_BIO.search(quote): continue
+            manager_stats['plainIdentityCandidates'] += 1
+            manager_stats['currentRoleAccepted'] += bool(_role_allowed(match['role']))
+            # Determine the physical page from the original bounded text only.
+            offset, page = 0, manager['page']
+            for candidate_page, line in manager['body']:
+                if offset > match.start(): break
+                page = candidate_page; offset += len(line) + 1
+            add(page, quote, 'manager-identity-text', 'manager', section='7.1.2', limit=120)
+    geometry, geometry_quotes = _reit_manager_geometry(pdf_bytes, manager if manager_bounded else None)
+    for page, quote, selection in geometry_quotes[:7]:
+        if not any(row['text'].replace(' ', '') == quote.replace(' ', '') for row in windows):
+            add(page, quote, selection, 'manager', section='7.1.2', limit=120)
+    strategy = [node for node in ordered if '.' in node['section'] and '基金经理' not in node['title']
+                and _REIT_TOPIC.search(node['title']) and node.get('next')]
+    # One pass selects distinct leaf sections, so a long parent cannot consume
+    # the entire budget or duplicate all of its child content.
+    strategy = [node for node in strategy if not any(other['section'].startswith(node['section'] + '.')
+                for other in nodes if node['line'] < other['line'] < node['next']['line'])]
+    selected_strategy = strategy[:4]
+    for node in selected_strategy:
+        safe = [(page, text) for page, text in node['body'] if text and not _REIT_PRIVATE.search(text)
+                and not _REIT_BIO.search(text) and not inspect_content(text.encode())
+                and not re.fullmatch(r'第\s*\d+\s*页\s*共\s*\d+\s*页', text)
+                and not re.search(r'20\d{2}\s*年.*报告\s*$', text)]
+        if not safe: continue
+        first_page, first = safe[0]; last_page, last = safe[-1]
+        add(first_page, first, 'strategy-section-opening', 'strategy', section=node['section'], limit=125)
+        if last != first:
+            add(last_page, last, 'strategy-section-ending', 'strategy', section=node['section'], limit=125, end=True)
+    descriptors = []
+    for node in ordered[:32]:
+        raw = '\n'.join(text for _, text in node['body'])
+        after = node['next']
+        descriptors.append({'section': node['section'], 'startPage': node['page'],
+            'endPage': after['page'] if after else None, 'endSection': after['section'] if after else None,
+            'sectionBounded': after is not None, 'headingIncluded': node['line'] in selected,
+            'bodyChars': len(raw), 'bodySha256': hashlib.sha256(raw.encode()).hexdigest(),
+            'classification': 'manager-table' if node is manager else 'strategy-change-statement' if '策略的改变' in node['title']
+                else 'manager-report-section' if node['section'].split('.')[0] == '7' else 'project-operations' if node['section'].split('.')[0] == '4' else 'strategy-candidate'})
+    observation = {'diagnosticOnly': True, 'productionEvidenceCreated': False, 'additionalHttpRequests': 0,
+        'allPagesScanned': bool(pages) and len(pages) == len(numbers), 'scannedPages': len(pages),
+        'pageNumbersVerified': bool(pages) and len(numbers) == len(pages) and all(type(p) is int and p == i + 1 for i, p in enumerate(numbers)),
+        'discoveredHeadingCount': len(nodes), 'relevantHeadingCount': len(relevant),
+        'returnedHeadingCount': len(headings), 'headingsTruncated': len(headings) < len(relevant),
+        'headingChars': 640 - remaining, 'sections': descriptors, 'sectionMetadataTruncated': len(relevant) > 32,
+        'manager': manager_stats, 'geometry': geometry,
+        'strategyCandidateCount': len(strategy), 'strategyWindowCandidateCount': len(selected_strategy),
+        'strategySelectedSections': [node['section'] for node in selected_strategy],
+        'strategyCandidatesTruncated': len(strategy) > len(selected_strategy),
+        'managerExcerptChars': 800 - budgets['manager'], 'strategyExcerptChars': 1000 - budgets['strategy'],
+        'excerptChars': sum(len(row['text']) for row in windows), 'excerptBudget': 1800}
+    return observation, headings, windows
+
+
 def extract_quarter(provider, sample, now):
     """One fixed-document request and the same extraction as collection."""
     doc, private = document(sample), {}
@@ -371,6 +609,12 @@ def extract_quarter(provider, sample, now):
                        tableRecognition=table_recognition(context['pages'], context['page_numbers']),
                        documentStructure=document_structure(context['pages'], context['page_numbers'], doc,
                            pdf_sha256=hashlib.sha256(data).hexdigest(), now=now))
+        if doc['sourceUrl'] == SAMPLES[1]['interimUrl'] and doc['kind'] == 'semiannual':
+            observation, headings, windows = reit_field_observation(context['pages'], context['page_numbers'], data)
+            private['reitFieldObservation'] = observation
+            private['windows'] = windows
+            private['documentStructure'].update(headings=headings, headingsTruncated=observation['headingsTruncated'],
+                headingSelection='full-private-discovery-then-reit-manager-strategy-budget')
     details = extract_report(data, doc['sourceUrl'], doc['periodEnd'], doc['kind'], parse_pages=parse_pdf_pages,
         filename=doc['title'], max_pages=300, env={}, enrich_pages=enrich, published_at=doc['publishedAt'],
         retrieved_at=now.isoformat(), on_private_sections=capture)
@@ -598,7 +842,9 @@ def main():
         code = getattr(error, 'code', 'DIAGNOSTIC_FAILED')
         result = {'status': 'failed', 'errorCode': code if code in ERRORS else 'DIAGNOSTIC_FAILED',
                   'productionDataUpdated': False}
-    encoded = (json.dumps(result, ensure_ascii=False, indent=2) + '\n').encode()
+    # Keep the fixed artifact cap for the additional bounded observations;
+    # whitespace is not evidence and need not consume the source budget.
+    encoded = (json.dumps(result, ensure_ascii=False, separators=(',', ':')) + '\n').encode()
     if len(encoded) > MAX_OUTPUT or inspect_content(encoded):
         print(json.dumps({'status': 'failed', 'errorCode': 'DIAGNOSTIC_OUTPUT_REJECTED'}))
         return 1

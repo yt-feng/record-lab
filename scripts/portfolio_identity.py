@@ -6,14 +6,16 @@ import hashlib
 import re
 from urllib.parse import urlsplit, parse_qsl
 from source_dates import china_date
+from report_period import document_periods
 
 METHOD = 'pdf-explicit-fund-code-rows-v1'
 REIT_METHOD = 'pdf-explicit-reit-code-rows-v1'
 PERIOD = re.compile(r'(20\d{2})\s*年\s*(?:第\s*([1-4一二三四])\s*季度|(中期|半年度|年度))\s*报告')
-HEADINGS = re.compile(r'(?m)^[ \t|]*(?P<text>(?:§\s*2\s*(?:基金产品概况|不动产\s*基金产品概况)|2\.1\s*(?:基金基本情况|不动产\s*基金产品基本情况)|§\s*3\s*[^\n|]+|2\.2\s*[^\n|]+))[ \t|]*$')
+HEADINGS = re.compile(r'(?m)^[ \t|]*(?P<text>(?:§\s*2\s*(?:基金产品概况|不动产\s*基金产品概况|不动产\s*基金简介)|2\.1\s*(?:基金基本情况|不动产\s*基金产品基本情况)|§\s*3\s*[^\n|]+|2\.2\s*[^\n|]+))[ \t|]*$')
 LABELS = {'mainCode': ['基金主代码'], 'shareClassCodes': ['下属分级基金的交易代码', '下属分类基金的交易代码']}
 REIT_LABELS = {'mainCode': ['基金代码'], 'tradingCode': ['交易代码']}
 REIT_PARENT = '§2不动产基金产品概况'
+REIT_PARENTS = {'quarterly': REIT_PARENT, 'semiannual': '§2不动产基金简介'}
 REIT_CHILD = '2.1不动产基金产品基本情况'
 REIT_END = '2.2不动产项目基本情况说明'
 
@@ -92,7 +94,7 @@ def normalize_portfolio_identity(raw, report=None, *, now=None):
     compact = lambda value: re.sub(r'\s+', '', value) if isinstance(value, str) else ''
     is_reit = raw['method'] == REIT_METHOD
     if is_reit:
-        if (raw.get('kind') != 'quarterly' or compact(heading) != REIT_PARENT or compact(end) != REIT_END
+        if (raw.get('kind') not in ('quarterly', 'semiannual') or compact(heading) != REIT_PARENTS[raw['kind']] or compact(end) != REIT_END
                 or not isinstance(table.get('subheading'), str) or len(table['subheading']) > 160
                 or compact(table['subheading']) != REIT_CHILD or not _page(table.get('subheadingPage'))
                 or table['subheadingPage'] != pages[0]
@@ -142,12 +144,7 @@ def parse_portfolio_identity(pages, report, *, page_numbers=None, retrieved_at=N
     for text, number in zip(pages[:12], numbers[:12]):
         value = str(text or '') + '\n'; chunks.append(value); positions.extend([number] * len(value))
     text = ''.join(chunks)
-    periods = []
-    for chunk, number in zip(pages[:12], numbers[:12]):
-        lines = str(chunk or '').splitlines()
-        for line in [*lines[:8], *lines[-8:]]:
-            if len(line) > 180: continue
-            for match in PERIOD.finditer(line): periods.append((match[0], number))
+    periods = [(item['text'], item['page']) for item in document_periods(pages[:12], numbers[:12], preserve_spacing=True)]
     expected = (report.get('kind'), report.get('periodEnd'))
     if not periods: return reject('PERIOD_TITLE_NOT_FOUND')
     if any(_period(value) != expected for value, _ in periods): return reject('PERIOD_TITLE_MISMATCH')
@@ -155,8 +152,8 @@ def parse_portfolio_identity(pages, report, *, page_numbers=None, retrieved_at=N
     if not title: return reject('PERIOD_TITLE_PAGE_UNKNOWN')
     headings = list(HEADINGS.finditer(text))
     compact = lambda value: re.sub(r'\s+', '', value)
-    starts = [item for item in headings if compact(item['text']) in {'§2基金产品概况', '2.1基金基本情况', REIT_PARENT, REIT_CHILD}]
-    is_reit = any(compact(item['text']) in {REIT_PARENT, REIT_CHILD} for item in starts)
+    starts = [item for item in headings if compact(item['text']) in {'§2基金产品概况', '2.1基金基本情况', *REIT_PARENTS.values(), REIT_CHILD}]
+    is_reit = any(compact(item['text']) in {*REIT_PARENTS.values(), REIT_CHILD} for item in starts)
     subheading = None
     # A quarterly product overview may contain an immediately nested 2.1
     # heading. This pair describes one section, not two independent tables.
@@ -164,8 +161,8 @@ def parse_portfolio_identity(pages, report, *, page_numbers=None, retrieved_at=N
     # followed by a real section, or identity data before the child stay rejected.
     if len(starts) == 2:
         parent, child = starts
-        if (report.get('kind') != 'quarterly'
-                or compact(parent['text']) != (REIT_PARENT if is_reit else '§2基金产品概况')
+        if ((report.get('kind') not in REIT_PARENTS if is_reit else report.get('kind') != 'quarterly')
+                or compact(parent['text']) != (REIT_PARENTS.get(report.get('kind')) if is_reit else '§2基金产品概况')
                 or compact(child['text']) != (REIT_CHILD if is_reit else '2.1基金基本情况')
                 or text[parent.end():child.start()].strip(' \t\r\n|')):
             return reject('IDENTITY_SECTION_START_COUNT')

@@ -120,14 +120,37 @@ def read_public(path, maximum=MAX_BYTES):
     return json.loads(path.read_bytes())
 
 
-def reserved(task, root):
+def ledger_stamp(path):
+    if path.is_symlink() or not path.is_file():
+        raise ValueError('SEMANTIC_TASK_CHANGED')
+    value = path.stat()
+    if value.st_size > 10_000_000:
+        raise ValueError('SEMANTIC_TASK_CHANGED')
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def reserved(task, root, *, ledger_cache=None):
     match = re.fullmatch(r'(2026Q[23]):([0-9]{6})', task['ledgerKey'])
     if not match: raise ValueError('SEMANTIC_RESERVATION_MISMATCH')
     expected = f'web/data/periods/{match[1]}/semantic-model-ledgers/{match[2][:2]}.json'
     relative = task.get('ledgerPath', 'web/data/semantic-model-ledger.json')
     if relative not in (expected, 'web/data/semantic-model-ledger.json'):
         raise ValueError('SEMANTIC_RESERVATION_MISMATCH')
-    ledger = read_public(Path(root) / relative, 10_000_000)
+    file = Path(root) / relative
+    if ledger_cache is None:
+        ledger = read_public(file, 10_000_000)
+    else:
+        observed = ledger_stamp(file)
+        cached = ledger_cache.get(file)
+        if cached is None:
+            ledger = read_public(file, 10_000_000)
+            if observed != ledger_stamp(file):
+                raise ValueError('SEMANTIC_RESERVATION_MISMATCH')
+            ledger_cache[file] = (observed, ledger)
+        else:
+            if observed != cached[0]:
+                raise ValueError('SEMANTIC_RESERVATION_MISMATCH')
+            ledger = cached[1]
     entry = ledger['products'][task['ledgerKey']]; attempt = entry['attempts'][-1]
     if (attempt['reservationId'] != task['reservationId'] or attempt['status'] != 'reserved'
             or entry['usageHistory'] != task['usageHistory']
@@ -145,7 +168,7 @@ def execute_batch(batch, *, root='.', credential, executor=execute, clock=time.m
             or len({item.get('code') for item in items}) != len(items)
             or len({item.get('ledgerKey') for item in items}) != len(items)):
         raise ValueError('SEMANTIC_TASK_CHANGED')
-    tasks = []
+    tasks, ledger_cache = [], {}
     for item in items:
         if not re.fullmatch(r'[0-9]{6}', item.get('code', '')) or item.get('path') != f"tasks/{item['code']}":
             raise ValueError('SEMANTIC_TASK_CHANGED')
@@ -155,7 +178,13 @@ def execute_batch(batch, *, root='.', credential, executor=execute, clock=time.m
                 or any(task[field] != batch[field] for field in ('quarter', 'runId', 'runAttempt'))
                 or task['code'] != item['code'] or task['ledgerKey'] != item['ledgerKey']):
             raise ValueError('SEMANTIC_TASK_CHANGED')
-        reserved(task, root); tasks.append((directory, task))
+        reserved(task, root, ledger_cache=ledger_cache); tasks.append((directory, task))
+    # Cache only this immutable preflight snapshot. Every product above still
+    # passed its own reservation/history checks before either worker can start.
+    for file in ledger_cache:
+        if ledger_cache[file][0] != ledger_stamp(file):
+            raise ValueError('SEMANTIC_RESERVATION_MISMATCH')
+    ledger_cache.clear()
     deadline = clock() + batch['maxSeconds']
 
     def process(item):

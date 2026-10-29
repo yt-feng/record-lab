@@ -333,6 +333,69 @@ test('an unknown or missing product receipt never resets its usage or blocks ind
   }
 });
 
+test('batch readback resolves multiple products in one complete partition scan without trusting old task paths', t => {
+  const value = batchFixture(t);
+  save(path.join(value.folder, 'companies/other.json'), { funds: [{ code: '000101', selectedReport: {} }] });
+  const manifest = read(path.join(value.folder, 'latest.json'));
+  manifest.companyFiles.push({ companyCode: '80000002', path: './data/companies/other.json' });
+  save(path.join(value.folder, 'latest.json'), manifest);
+  batchPrepare(value); batchProduce(value);
+  const staged = lane.finishBatch(value.root, { now: NOW });
+  assert.equal(staged.admittedProducts, 2);
+  assert.equal(fs.existsSync(path.join(value.folder, 'companies/co1.json')), false);
+  const reads = [], original = fs.readFileSync;
+  fs.readFileSync = (file, ...args) => {
+    if (String(file).includes('/companies/')) reads.push(String(file));
+    return original(file, ...args);
+  };
+  let checked;
+  try { checked = lane.readbackBatch(value.root); } finally { fs.readFileSync = original; }
+  assert.equal(reads.length, 2); assert.equal(new Set(reads).size, 2);
+  assert.deepEqual(checked, { ...staged, publication: 'persisted' });
+});
+
+test('batch readback rejects duplicate or missing identities anywhere in the current manifest', t => {
+  for (const mode of ['code', 'alias', 'missing']) {
+    const value = batchFixture(t); batchPrepare(value); batchProduce(value);
+    lane.finishBatch(value.root, { now: NOW });
+    const manifestFile = path.join(value.folder, 'latest.json'), manifest = read(manifestFile);
+    const companyFile = path.join(value.folder, manifest.companyFiles[0].path.slice('./data/'.length));
+    const company = read(companyFile);
+    if (mode === 'missing') {
+      company.funds = company.funds.filter(fund => fund.code !== '000003'); save(companyFile, company);
+    } else {
+      const duplicate = mode === 'code' ? clone(company.funds[1])
+        : { code: '000101', aliases: [{ code: '000003' }], selectedReport: {} };
+      save(path.join(value.folder, 'companies/duplicate.json'), { funds: [duplicate] });
+      manifest.companyFiles.push({ companyCode: '80000002', path: './data/companies/duplicate.json' });
+      save(manifestFile, manifest);
+    }
+    assert.throws(() => lane.readbackBatch(value.root), { code: 'SEMANTIC_PORTFOLIO_NOT_UNIQUE' });
+    assert.equal(read(path.join(value.root, lane.CACHE, 'summary.json')).publication, 'staged');
+  }
+});
+
+test('batch readback rejects changed candidate and duplicate, missing or unknown summary products', t => {
+  for (const mode of ['candidate', 'duplicate', 'missing', 'unknown']) {
+    const value = batchFixture(t); batchPrepare(value); batchProduce(value);
+    lane.finishBatch(value.root, { now: NOW });
+    const summaryFile = path.join(value.root, lane.CACHE, 'summary.json');
+    if (mode === 'candidate') {
+      const located = lane.locate(value.root, '2026Q2', '000003');
+      located.fund.selectedReport.strategySemantics.candidate.candidateDigest = 'a'.repeat(64);
+      save(path.join(value.folder, located.relative), located.company);
+    } else {
+      const summary = read(summaryFile);
+      if (mode === 'duplicate') summary.products[1] = clone(summary.products[0]);
+      else if (mode === 'missing') summary.products.pop();
+      else { summary.products[1].code = '999999'; delete summary.products[1].ledgerKey; }
+      save(summaryFile, summary);
+    }
+    assert.throws(() => lane.readbackBatch(value.root), { code: 'SEMANTIC_PERSISTED_READBACK_FAILED' });
+    assert.equal(read(summaryFile).publication, 'staged');
+  }
+});
+
 test('legacy ledger bytes and previous failed usage survive partitioning and a new admitted attempt', t => {
   const value = batchFixture(t);
   const old = { usageHistory: [{ requestDigest: 'a'.repeat(64), inputDigest: 'b'.repeat(64),

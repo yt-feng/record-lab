@@ -8,6 +8,7 @@ const { buildSnapshot } = require('../scripts/build-data');
 const { mergeSnapshots } = require('../scripts/merge-parts');
 const fixture = require('./fixtures/portfolio-identity.json');
 const reitFixture = require('./fixtures/portfolio-identity-reit.json');
+const reitInterimFixture = require('./fixtures/portfolio-identity-reit-interim.json');
 const clone = value => JSON.parse(JSON.stringify(value));
 const now = '2026-10-26T12:00:00Z';
 const config = { targetPeriodEnd: '2026-06-30', baselinePeriodEnd: '2026-03-31', funds: [{ code: '000001' }] };
@@ -69,6 +70,22 @@ test('REIT normalization rejects generic code proof, mismatched pair, missing bo
     assert.equal(normalizePortfolioIdentity(value, reitFixture.report, now), null);
   }
   assert.equal(normalizePortfolioIdentity(reitFixture.proof, { ...reitFixture.report, fundCode: '000009' }, now), null);
+});
+
+test('REIT interim identity preserves its exact introduction parent without weakening quarterly boundaries', () => {
+  const value = normalizePortfolioIdentity(reitInterimFixture.proof, reitInterimFixture.report, now);
+  assert.deepEqual(value, reitInterimFixture.proof);
+  assert.equal(value.kind, 'semiannual');
+  assert.deepEqual(value.identitySection.pages, [5, 6]);
+  assert.deepEqual(value.shareClassCodes, []);
+  for (const fixture of [reitFixture, reitInterimFixture]) {
+    const bad = clone(fixture.proof);
+    bad.identitySection.heading = fixture === reitFixture ? '§2不动产基金简介' : '§2不动产基金产品概况';
+    assert.equal(normalizePortfolioIdentity(bad, fixture.report, now), null);
+  }
+  const bad = clone(reitInterimFixture.proof);
+  bad.kind = 'annual'; bad.periodEnd = '2026-12-31';
+  assert.equal(normalizePortfolioIdentity(bad, null, now), null);
 });
 
 test('rejects unmatched reports, future receipts, corrupt rows, unknown pages and inflated scope', () => {

@@ -1,0 +1,48 @@
+name: Profile bounded retained Q2 coverage
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: profile-stored-coverage
+  cancel-in-progress: false
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/*/
+            /scripts/
+            /lib/
+            /tests/
+            /config/
+            /.github/workflows/profile-stored-coverage.yml
+            /web/*.js
+            /web/data/periods/2026Q2/
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Validate bounded read-only profiling
+        run: python -m unittest discover -s tests -p 'test_profile_stored_coverage.py'
+      - name: Profile at most 64 retained products with a 180-second child deadline
+        run: python scripts/profile_stored_coverage.py
+      - name: Retain aggregate profile only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stored-coverage-profile-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .cache/stored-coverage-profile/summary.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7

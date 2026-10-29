@@ -12,7 +12,7 @@ def retained():
 def previous(quality, at='2026-09-29T10:00:00Z'):
     return {'schemaVersion': 1, 'phase': PHASE, 'collectorVersion': 4, 'funds': [
         {'code': '000001', 'companyCode': 'co1', 'status': 'complete', 'attempts': 1,
-         'lastAttemptAt': at, 'quality': {'priceCoverageVersion': 2, 'strategySectionCoverageVersion': 1, **quality}}]}
+         'lastAttemptAt': at, 'quality': {'priceCoverageVersion': 2, 'strategySectionCoverageVersion': traversal.STRATEGY_SECTION_COVERAGE_VERSION, **quality}}]}
 
 
 class ManagerQualityTests(unittest.TestCase):
@@ -56,7 +56,7 @@ class ManagerQualityTests(unittest.TestCase):
     def test_legacy_six_field_complete_and_exhausted_states_get_independent_manager_budget(self):
         for attempts in (0, 3):
             prior = {'fields': {key: 'complete' for key in traversal.SIX_QUALITY_FIELDS}, 'attempts': attempts,
-                     'totalAttempts': attempts, 'status': 'complete', 'priceCoverageVersion': 2, 'strategySectionCoverageVersion': 1}
+                     'totalAttempts': attempts, 'status': 'complete', 'priceCoverageVersion': 2, 'strategySectionCoverageVersion': traversal.STRATEGY_SECTION_COVERAGE_VERSION}
             normalized = traversal.normalize_quality(prior, 'complete', traversal.utc_now(NOW))
             self.assertEqual(normalized['missingFields'], ['managers'])
             self.assertEqual(normalized['status'], 'pending')
@@ -132,7 +132,7 @@ class ManagerQualityTests(unittest.TestCase):
     def test_new_parser_version_reopens_only_manager_budget_and_legacy_receipt_cannot_reconsume_it(self):
         fields = {key: 'complete' for key in traversal.QUALITY_FIELDS}
         prior = {'fields': fields, 'attempts': 3, 'totalAttempts': 8, 'managerAttempts': 3, 'managerTotalAttempts': 6,
-                 'managerTableCoverageVersion': 1, 'priceCoverageVersion': 2, 'strategySectionCoverageVersion': 1,
+                 'managerTableCoverageVersion': 1, 'priceCoverageVersion': 2, 'strategySectionCoverageVersion': traversal.STRATEGY_SECTION_COVERAGE_VERSION,
                  'strategyAttempts': 2, 'strategyTotalAttempts': 4}
         normalized = traversal.normalize_quality(prior, 'complete', traversal.utc_now(NOW))
         self.assertEqual(normalized['fields']['managers'], 'partial')
@@ -143,7 +143,7 @@ class ManagerQualityTests(unittest.TestCase):
         self.assertEqual(normalized['missingFields'], ['managers'])
         attempt = event(at='2026-09-29T11:00:00Z')
         attempt['funds'][0].update(qualityAttempt=True, managerAttempt=True, managerTableCoverageVersion=1,
-            reportQuality={'fields': fields, 'managerTableCoverageVersion': 1, 'priceCoverageVersion': 2, 'strategySectionCoverageVersion': 1})
+            reportQuality={'fields': fields, 'managerTableCoverageVersion': 1, 'priceCoverageVersion': 2, 'strategySectionCoverageVersion': traversal.STRATEGY_SECTION_COVERAGE_VERSION})
         config = {**CONFIG, 'collectorVersion': 4, 'requireReportQuality': True}
         progress = traversal.merge_progress(catalog(), previous(prior), config, [attempt], NOW)
         quality = progress['funds'][0]['quality']

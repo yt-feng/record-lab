@@ -81,6 +81,42 @@ class StrategySectionTests(unittest.TestCase):
             self.assertEqual(bool(result["strategyAnalysis"]["evidence"]), not bool(title))
             self.assertTrue(result.sections[0]["text"])
 
+    def test_wrapped_and_spaced_periods_preserve_correct_titles_and_reject_wrong_kind(self):
+        for token in ['2026年第2季度\n报告', '2026年第2季 度报 告', '2026\n年\n第2季度\n报\n告']:
+            result = extract(['合成证券投资基金\n' + token, START + BODY + END])
+            self.assertTrue(result['strategySectionCoverage']['complete'])
+            self.assertTrue(normalize_strategy_section_coverage(result['strategySectionCoverage'])['complete'])
+            self.assertTrue(result['strategyAnalysis']['evidence'])
+        for token in ['2026年第3季 度报告', '2026年第3季度\n报告',
+                      '2026年中期报 告', '2026年中期报\n告', '2 0 2 6 年半 年 度报 告']:
+            with self.subTest(token=token):
+                result = extract(['合成证券投资基金\n' + token, START + BODY + END])
+                self.assertFalse(result['strategySectionCoverage']['complete'])
+                self.assertEqual(result['strategyAnalysis']['evidence'], [])
+                self.assertTrue(result.sections[0]['text'])
+
+    def test_semiannual_cover_period_survives_late_disclosure_history_and_wrong_cover_does_not(self):
+        report = {**REPORT, 'kind': 'semiannual', 'publishedAt': '2026-08-28'}
+        pages = ['合成基金\n2026年中期报告', START + BODY + END,
+                 '14.5 信息披露\n合成基金2025年第4季度报告\n合成基金2025年年度报告\n合成基金2026年第1季度报告']
+        result = parse_strategy_sections(pages, report)
+        proof = result['strategySectionCoverage']
+        self.assertTrue(proof['complete'])
+        self.assertTrue(normalize_strategy_section_coverage(proof)['complete'])
+        self.assertEqual(proof['documentPeriodEvidence'], [
+            {'periodEnd': '2026-06-30', 'kind': 'semiannual', 'page': 1, 'text': '2026年中期报告'}])
+        wrong = parse_strategy_sections(['合成基金2025年年度报告', pages[1], pages[2] + '\n合成基金2026年中期报告'], report)
+        self.assertFalse(wrong['strategySectionCoverage']['complete'])
+        self.assertEqual(wrong['strategyAnalysis']['status'], 'wrong-period')
+        self.assertFalse(wrong['strategyAnalysis']['evidence'])
+
+    def test_history_only_or_conflicting_opening_periods_cannot_complete_strategy(self):
+        for pages in [['历史公告列表\n合成基金2026年第2季度报告', START + BODY + END],
+                      [TITLE + '2025年年度报告\n' + START + BODY + END]]:
+            result = extract(pages)
+            self.assertFalse(result['strategySectionCoverage']['complete'])
+            self.assertIn('MISSING_OR_MISMATCHED_DOCUMENT_PERIOD', result['strategySectionCoverage']['reasonCodes'])
+
     def test_toc_is_not_a_strategy_section(self):
         result = extract([TITLE + "目录\n4.4 报告期内基金的投资策略和运作分析........7\n4.5 报告期内基金的业绩表现.......8", START + BODY + END])
         self.assertEqual(result["strategySectionCoverage"]["sectionCount"], 1)

@@ -186,6 +186,59 @@ class ProductionExecutionTests(unittest.TestCase):
                 producer.execute_batch(batch, root=root, credential='synthetic',
                     executor=lambda *_args, **_kwargs: self.fail('all reservations must be checked before calls'))
 
+    def test_batch_reads_one_immutable_ledger_once_and_does_not_reuse_it_in_next_batch(self):
+        with tempfile.TemporaryDirectory() as root:
+            batch = self.batch(root)
+            ledger_path = Path(root) / 'web/data/periods/2026Q2/semantic-model-ledgers/00.json'
+            clocks = iter([0, 2000, 2000, 2000])
+            with patch.object(producer, 'read_public', wraps=producer.read_public) as read:
+                result = producer.execute_batch(batch, root=root, credential='synthetic',
+                    executor=lambda *_args, **_kwargs: self.fail('deferred batch must make no request'),
+                    clock=lambda: next(clocks))
+            self.assertEqual(sum(Path(call.args[0]) == ledger_path for call in read.call_args_list), 1)
+            self.assertTrue(all(row['status'] == 'deferred' for row in result['products']))
+            ledger = producer.read_public(ledger_path)
+            ledger['products']['2026Q2:000005']['attempts'][0]['status'] = 'unknown'
+            producer.write_public(ledger_path, ledger)
+            with patch.object(producer, 'read_public', wraps=producer.read_public) as read:
+                with self.assertRaisesRegex(ValueError, 'SEMANTIC_RESERVATION_MISMATCH'):
+                    producer.execute_batch(batch, root=root, credential='synthetic',
+                        executor=lambda *_args, **_kwargs: self.fail('next batch must check its current ledger'))
+            self.assertEqual(sum(Path(call.args[0]) == ledger_path for call in read.call_args_list), 1)
+
+    def test_cached_ledger_change_during_preflight_prevents_all_requests(self):
+        for replacement in [False, True]:
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as root:
+                batch = self.batch(root)
+                ledger_path = Path(root) / 'web/data/periods/2026Q2/semantic-model-ledgers/00.json'
+                original_read = producer.read_public
+                def change_after_first_reservation(path, maximum=producer.MAX_BYTES):
+                    value = original_read(path, maximum)
+                    if Path(path).parent.name == '000003' and Path(path).name == 'task.json':
+                        if replacement:
+                            # Even byte-identical replacement is a different on-disk snapshot.
+                            temporary = ledger_path.with_suffix('.replacement')
+                            temporary.write_bytes(ledger_path.read_bytes()); temporary.replace(ledger_path)
+                        else:
+                            ledger = original_read(ledger_path)
+                            ledger['products']['2026Q2:000005']['attempts'][0]['status'] = 'unknown'
+                            producer.write_public(ledger_path, ledger)
+                    return value
+                with patch.object(producer, 'read_public', side_effect=change_after_first_reservation):
+                    with self.assertRaisesRegex(ValueError, 'SEMANTIC_RESERVATION_MISMATCH'):
+                        producer.execute_batch(batch, root=root, credential='synthetic',
+                            executor=lambda *_args, **_kwargs: self.fail('changed ledger must stop preflight'))
+
+    def test_duplicate_product_code_is_rejected_before_reading_tasks_or_ledger(self):
+        with tempfile.TemporaryDirectory() as root:
+            batch = self.batch(root)
+            batch['tasks'][1]['code'] = batch['tasks'][0]['code']
+            batch['batchDigest'] = canonical_digest({key: value for key, value in batch.items() if key != 'batchDigest'})
+            with patch.object(producer, 'read_public', side_effect=AssertionError('no input read before batch validation')):
+                with self.assertRaisesRegex(ValueError, 'SEMANTIC_TASK_CHANGED'):
+                    producer.execute_batch(batch, root=root, credential='synthetic',
+                        executor=lambda *_args, **_kwargs: self.fail('duplicate batch must make no request'))
+
 
 if __name__ == '__main__':
     unittest.main()
