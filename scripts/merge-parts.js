@@ -31,7 +31,8 @@ const label = (value, limit = 200) => typeof value === 'string' ? value.trim().s
 const clone = value => JSON.parse(JSON.stringify(value));
 const fixedErrors = new Set(['INVALID_CATALOG', 'INVALID_PART', 'INVALID_FUND', 'INVALID_COMPANY_SNAPSHOT',
   'CATALOG_IDENTITY_MISMATCH', 'INVALID_ARGUMENTS', 'MERGE_READ_FAILED', 'MERGE_WRITE_FAILED',
-  'PORTFOLIO_IDENTITY_CONFLICT', 'TARGET_PERIOD_MISMATCH', 'COMPANY_FUND_TOO_LARGE', 'MERGE_COMPONENT_TOO_LARGE', 'MERGE_FAILED']);
+  'PORTFOLIO_IDENTITY_CONFLICT', 'TARGET_PERIOD_MISMATCH', 'COMPANY_FUND_TOO_LARGE', 'MERGE_COMPONENT_TOO_LARGE',
+  'MERGE_RECEIPT_INVALID', 'MERGE_RECEIPT_TOO_LARGE', 'MERGE_FAILED']);
 
 class MergeError extends Error {
   constructor(code) { super(fixedErrors.has(code) ? code : 'MERGE_FAILED'); this.code = this.message; }

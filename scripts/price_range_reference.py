@@ -95,19 +95,19 @@ def normalize_reference(value, identity, now=None):
     except (AttributeError, TypeError, ValueError): return None
 
 
-def effective_reference(price, identity=None, now=None):
-    if not isinstance(price, dict): return None
-    identity = price if identity is None else identity
-    identity = raw._identity(identity)
-    if identity is None: return None
-    current = now or dt.datetime.now(dt.timezone.utc)
+_WITNESS_UNCHECKED = object()
+
+
+def _effective_reference(price, identity, current, witness=_WITNESS_UNCHECKED):
+    """The caller validates identity; a supplied witness is scoped to this call."""
     ref = normalize_reference(price.get('rangeReference'), identity, current)
     if ref is None: return None
     selected = next(f for f in ref['facts'] if f['factId'] == ref['referenceFactId'])
     identities = {f['factId'] for f in ref['facts']}
     if 'globalPriceConflict' in price:
-        witness = raw.normalize_price_conflict(price['globalPriceConflict'], identity['market'], identity['stockCode'],
-                                               identity['rangeStart'], identity['rangeEnd'], current)
+        if witness is _WITNESS_UNCHECKED:
+            witness = raw.normalize_price_conflict(price['globalPriceConflict'], identity['market'], identity['stockCode'],
+                                                   identity['rangeStart'], identity['rangeEnd'], current)
         if witness is None or any(f['factId'] not in identities for f in witness['facts']): return None
     if price.get('status') == 'observed':
         fact = raw._fact({'price': price, 'sourceUrl': price.get('sourceUrl'),
@@ -117,6 +117,13 @@ def effective_reference(price, identity=None, now=None):
         if price.get('completeness') != 'complete' and (price['low'] < selected['price']['low'] or price['high'] > selected['price']['high']): return None
     return {**copy.deepcopy(selected['price']), 'sourceUrl': selected['sourceUrl'], 'sourceUrls': selected['sourceUrls'][:],
             'fetchedAt': selected['fetchedAt'], 'rangeReference': ref, 'referenceOnly': True}
+
+
+def effective_reference(price, identity=None, now=None):
+    if not isinstance(price, dict): return None
+    identity = raw._identity(price if identity is None else identity)
+    if identity is None: return None
+    return _effective_reference(price, identity, now or dt.datetime.now(dt.timezone.utc))
 
 
 def effective_price_range(price, identity=None, now=None):
@@ -136,6 +143,33 @@ def resolution_for(price, identity=None, now=None):
     if effective is None or not isinstance(price.get('globalPriceConflict'), dict): return None
     return {'market': identity['market'], 'stockCode': identity['stockCode'],
             'reference': copy.deepcopy(effective['rangeReference']), 'rawWitness': copy.deepcopy(price['globalPriceConflict'])}
+
+
+def coverage_resolution(price, identity=None, now=None):
+    """Evaluate three coverage views once at an explicit, unchanged clock.
+
+    Default-clock callers retain the original independent clock reads and call
+    order. Nothing is cached across rows, identities, inputs or invocations.
+    """
+    if not now:
+        unresolved = unresolved_conflict(price, identity, now)
+        resolution = resolution_for(price, identity, now)
+        effective = effective_price_range(price, identity, now)
+        return effective, resolution, unresolved
+    scoped = raw._identity(price if identity is None else identity)
+    witness = effective = resolution = None
+    if isinstance(price, dict) and scoped:
+        if 'globalPriceConflict' in price:
+            witness = raw.normalize_price_conflict(price['globalPriceConflict'], scoped['market'], scoped['stockCode'],
+                                                   scoped['rangeStart'], scoped['rangeEnd'], now)
+        effective = _effective_reference(price, scoped, now, witness)
+        if effective is not None and isinstance(price.get('globalPriceConflict'), dict):
+            resolution = {'market': scoped['market'], 'stockCode': scoped['stockCode'],
+                          'reference': copy.deepcopy(effective['rangeReference']),
+                          'rawWitness': copy.deepcopy(price['globalPriceConflict'])}
+    unresolved = bool(witness and effective is None)
+    fallback = price if isinstance(price, dict) and 'globalPriceConflict' not in price else None
+    return effective or fallback, resolution, unresolved
 
 
 def valid_resolution(value):

@@ -203,6 +203,48 @@ class ResumeTests(unittest.TestCase):
             self.assertEqual(result['mergeOutcome'], 'passed')
             self.assertEqual(marker.read_bytes(), original)
 
+    def test_diagnostic_paged_storage_is_hash_verified_without_retaining_page_contents(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            path = root / '.cache/parts-2026Q2/merge-receipt.json'
+            pages_root = path.parent / 'merge-receipt-pages'; pages_root.mkdir(parents=True)
+            pages = []
+            for index, code in enumerate(('000001', '000002')):
+                raw = resume.encoded({'code': code, 'privateDiagnosticBody': 'never copied'})
+                sha = resume.digest(raw); name = f'merge-receipt-pages/{index:04d}-{sha}.json'
+                (path.parent / name).write_bytes(raw)
+                pages.append({'path': name, 'sha256': sha, 'byteLength': len(raw), 'fundCount': 1,
+                              'firstCode': code, 'lastCode': code})
+            manifest = {'schemaVersion': 2, 'storageFormat': 'fund-pages-v1',
+                        'receipt': {'schemaVersion': 1, 'privateMetadata': 'never copied'},
+                        'fundCount': 2, 'totalPageBytes': sum(page['byteLength'] for page in pages), 'fundPages': pages}
+            path.write_bytes(resume.encoded(manifest))
+            expected = {'quarter': '2026Q2', 'byteLength': path.stat().st_size, 'storageFormat': 'fund-pages-v1',
+                        'pageCount': 2, 'totalPageBytes': manifest['totalPageBytes'], 'pageFileHashesVerified': True}
+            self.assertEqual(resume.receipt_storage_summary(path, '2026Q2'), expected)
+            self.assertNotIn(b'private', resume.encoded(expected))
+            target = path.parent / pages[0]['path']
+            original = target.read_bytes(); target.write_bytes(original.replace(b'000001', b'000003'))
+            rejected = resume.receipt_storage_summary(path, '2026Q2')
+            self.assertEqual(rejected['pageSummaryErrorCode'], 'MERGE_RECEIPT_INVALID')
+            self.assertNotIn('totalPageBytes', rejected)
+            target.unlink(); target.symlink_to(path)
+            self.assertEqual(resume.receipt_storage_summary(path, '2026Q2')['pageSummaryErrorCode'], 'MERGE_RECEIPT_INVALID')
+            manifest['fundPages'][0]['path'] = '../private.json'; path.write_bytes(resume.encoded(manifest))
+            self.assertEqual(resume.receipt_storage_summary(path, '2026Q2')['pageSummaryErrorCode'], 'MERGE_RECEIPT_INVALID')
+
+    def test_diagnostic_accepts_only_fixed_paging_error_codes(self):
+        def failed(command, **kwargs):
+            for code in ('MERGE_RECEIPT_INVALID', 'MERGE_RECEIPT_TOO_LARGE', 'INVALID_PROGRESS',
+                         'MERGE_RECEIPT_PRIVATE_MESSAGE', {'private': 'not a string'}):
+                kwargs['stdout'].write(resume.encoded({'errorCode': code, 'privateBody': 'never copy'}))
+            return subprocess.CompletedProcess(command, 1)
+        with tempfile.TemporaryDirectory() as folder:
+            result = resume.diagnostic_merge(folder, {}, execute=failed)
+        self.assertEqual(result['diagnostics'], [{'errorCode': code} for code in
+            ('MERGE_RECEIPT_INVALID', 'MERGE_RECEIPT_TOO_LARGE', 'INVALID_PROGRESS')])
+        self.assertNotIn(b'private', resume.encoded(result))
+
     def test_diagnostic_workflow_has_read_only_permissions_and_no_publication_steps(self):
         workflow = (Path(__file__).resolve().parents[1] / resume.DIAGNOSTIC_WORKFLOW).read_text()
         self.assertIn('contents: read', workflow)

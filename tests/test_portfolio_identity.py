@@ -30,6 +30,80 @@ def proof(pages=None, report=None, **kwargs):
 
 
 class PortfolioIdentityTests(unittest.TestCase):
+    def reit_fixture(self):
+        return json.loads((Path(__file__).parent / 'fixtures/portfolio-identity-reit.json').read_text())
+
+    def test_reit_observed_bounded_parent_child_format_and_matching_two_code_rows(self):
+        fixture = self.reit_fixture()
+        value = parse_portfolio_identity(fixture['pages'], fixture['report'], page_numbers=fixture['pageNumbers'],
+            retrieved_at=fixture['proof']['retrievedAt'], pdf_sha256=fixture['proof']['pdfSha256'], now=NOW)
+        self.assertEqual(value, fixture['proof'])
+        self.assertEqual(value['method'], 'pdf-explicit-reit-code-rows-v1')
+        self.assertEqual(value['sourcePortfolioCode'], '000008')
+        self.assertEqual([r['field'] for r in value['rows']], ['mainCode', 'tradingCode'])
+        self.assertEqual(value['shareClassCodes'], [])
+        self.assertFalse(value['eligibleForShareClassExpansion'])
+        self.assertEqual(value['identitySection']['endHeading'], '2.2 不动产 项目基本情况说明')
+        self.assertEqual(value['identitySection']['subheadingPage'], 2)
+        self.assertTrue(value['identitySection']['subheadingAdjacent'])
+        self.assertNotIn('noEquitiesConfirmed', value)
+
+    def test_reit_parser_rejects_unbounded_or_ambiguous_sections_and_conflicting_codes(self):
+        fixture = self.reit_fixture()
+        pages = fixture['pages']
+        mutations = [
+            [pages[0], pages[1].replace('§ 2  不动产 基金产品概况\n', ''), pages[2]],
+            [pages[0], pages[1].replace('2.1 不动产 基金产品基本情况\n', ''), pages[2]],
+            [pages[0], pages[1].replace('2.1 不动产', '基金代码 000009\n2.1 不动产'), pages[2]],
+            [pages[0], pages[1].replace('基金代码  000008', '基金主代码 000008'), pages[2]],
+            [pages[0], pages[1].replace('交易代码  000008', '交易代码 000009'), pages[2]],
+            [pages[0], pages[1].replace('交易代码  000008', '交易代码 000008 000009'), pages[2]],
+            [pages[0], pages[1].replace('交易代码  000008', ''), pages[2]],
+            [pages[0], pages[1] + '\n基金代码 000008', pages[2]],
+            [pages[0], pages[1] + '\n交易代码 000008', pages[2]],
+            [pages[0], pages[1] + '\n基金主代码 000009', pages[2]],
+            [pages[0], pages[1], pages[2].replace('2.2 不动产 项目基本情况说明', '2.2 其他说明')],
+            [pages[0], pages[1], pages[2], pages[1], pages[2]],
+            [pages[0].replace('第 2', '第 3'), pages[1], pages[2]],
+            [pages[0], pages[1].replace('000008', '000009'), pages[2]],
+        ]
+        for changed in mutations:
+            with self.subTest(changed=changed):
+                self.assertIsNone(parse_portfolio_identity(changed, fixture['report'],
+                    retrieved_at=fixture['proof']['retrievedAt'], pdf_sha256=fixture['proof']['pdfSha256'], now=NOW))
+        for numbers in ([1, None, 3], [1, 2, 4]):
+            self.assertIsNone(parse_portfolio_identity(pages, fixture['report'], page_numbers=numbers,
+                retrieved_at=fixture['proof']['retrievedAt'], pdf_sha256=fixture['proof']['pdfSha256'], now=NOW))
+
+    def test_reit_normalizer_revalidates_pair_and_format_not_generic_fund_code(self):
+        fixture = self.reit_fixture()
+        def check(change):
+            value = copy.deepcopy(fixture['proof']); change(value)
+            self.assertIsNone(normalize_portfolio_identity(value, fixture['report'], now=NOW))
+        for change in [
+            lambda p: p.update(method='pdf-explicit-fund-code-rows-v1'),
+            lambda p: p.update(rows=p['rows'][:1]),
+            lambda p: p['rows'][1].update(text='交易代码 000009', codes=['000009']),
+            lambda p: p['rows'][1].update(text='基金代码 000008'),
+            lambda p: p['rows'][1].update(field='shareClassCodes', text='下属分类基金的交易代码 000008'),
+            lambda p: p.update(shareClassCodes=['000008']),
+            lambda p: p['identitySection'].update(subheading='2.1 基金基本情况'),
+            lambda p: p['identitySection'].update(subheadingPage=3),
+            lambda p: p['identitySection'].update(subheadingAdjacent=False),
+            lambda p: p['identitySection'].update(endHeading='§3 主要财务指标和不动产基金运作情况'),
+        ]:
+            with self.subTest(change=change): check(change)
+
+    def test_reit_common_extraction_exposes_identity_without_inventing_holdings(self):
+        fixture = self.reit_fixture()
+        with patch('report_extract._pypdf_pages', return_value=fixture['pages']):
+            report = fixture['report']
+            result = extract_report(b'%PDF synthetic reit identity', report['sourceUrl'], report['periodEnd'], report['kind'],
+                parse_pages=parse_pdf_pages, published_at=report['publishedAt'], retrieved_at=RECEIVED, env={})
+        self.assertEqual(result['portfolioIdentityEvidence'], fixture['proof'])
+        self.assertIsNone(result['noEquitiesEvidence'])
+        self.assertIsNone(result.get('navYuan'))
+
     def test_quarterly_adjacent_parent_child_titles_share_one_bounded_identity_section(self):
         # The 159366 cloud diagnostic showed these exact two adjacent headings.
         pages = [PAGES[0], PAGES[1].replace('§2 基金产品概况\n', '§2 基金产品概况\n2.1 基金基本情况\n'), PAGES[2]]

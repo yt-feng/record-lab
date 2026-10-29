@@ -9,6 +9,7 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 const { checkpoint: mergeCheckpoint, capture: captureMergeFailure } = require('../lib/merge-diagnostics');
 const { createPriceIndex, addPriceSources, applyPriceIndex } = require('../lib/reuse-prices');
+const { writeMergeReceipt } = require('../lib/merge-receipt');
 const CODE = /^\d{6}$/;
 const COMPANY_FILE = /^[A-Za-z0-9_-]{1,64}$/;
 const ADDITIVE = ['fundCount', 'holdingCount', 'priceAvailable', 'priceComplete', 'narrativeCount',
@@ -320,7 +321,7 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
       }
     }
     if (beforeCommit) beforeCommit({ manifest, receipt, workspace });
-    writeAtomic(path.join(parts, 'merge-receipt.json'), receipt);
+    writeMergeReceipt(path.join(parts, 'merge-receipt.json'), receipt);
     if (changed) writeAtomic(manifestFile, manifest);
     committed = true;
     if (changed) {

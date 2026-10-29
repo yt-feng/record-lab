@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -164,6 +165,81 @@ def verify_persisted(run_id, source_commit, *, root='.', execute=None):
     return {'status': 'remote-verified', 'runId': str(run_id)}
 
 
+def receipt_storage_summary(path, quarter):
+    """Measure receipt storage without decoding or retaining fund page bodies.
+
+    Page counts describe hash-verified files only. The campaign's normal
+    receipt reader remains responsible for all row and evidence validation.
+    """
+    from merge_receipt import MAX_PAGE_BYTES, MAX_PAGES, MAX_TOTAL_BYTES, MAX_FUNDS
+    try:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode): return None
+    except OSError: return None
+    summary = {'quarter': quarter, 'byteLength': before.st_size}
+    if not 0 < before.st_size <= 25_000_000: return summary
+    descriptor = root_fd = page_fd = None
+    paged = False
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'rb') as handle:
+            descriptor = None
+            opened = os.fstat(handle.fileno())
+            if (opened.st_dev, opened.st_ino, opened.st_size) != (before.st_dev, before.st_ino, before.st_size):
+                return summary
+            raw = handle.read(25_000_001)
+        if len(raw) != before.st_size: return summary
+        manifest = json.loads(raw)
+        if not isinstance(manifest, dict) or manifest.get('schemaVersion') != 2: return summary
+        paged = True
+        pages = manifest.get('fundPages')
+        metadata = manifest.get('receipt')
+        if (set(manifest) != {'schemaVersion', 'storageFormat', 'receipt', 'fundCount', 'totalPageBytes', 'fundPages'}
+                or manifest['storageFormat'] != 'fund-pages-v1' or not isinstance(metadata, dict)
+                or metadata.get('schemaVersion') != 1 or 'funds' in metadata
+                or not isinstance(pages, list) or not 1 <= len(pages) <= MAX_PAGES
+                or type(manifest['fundCount']) is not int or not 1 <= manifest['fundCount'] <= MAX_FUNDS
+                or type(manifest['totalPageBytes']) is not int or not 1 <= manifest['totalPageBytes'] <= MAX_TOTAL_BYTES):
+            raise ValueError()
+        count = total = 0
+        previous = ''
+        for index, page in enumerate(pages):
+            if (not isinstance(page, dict) or set(page) != {'path', 'sha256', 'byteLength', 'fundCount', 'firstCode', 'lastCode'}
+                    or not isinstance(page['sha256'], str) or not re.fullmatch('[a-f0-9]{64}', page['sha256'])
+                    or page['path'] != f"merge-receipt-pages/{index:04d}-{page['sha256']}.json"
+                    or type(page['byteLength']) is not int or not 1 <= page['byteLength'] <= MAX_PAGE_BYTES
+                    or type(page['fundCount']) is not int or not 1 <= page['fundCount'] <= MAX_FUNDS
+                    or any(not isinstance(page[key], str) or not re.fullmatch('[0-9]{6}', page[key]) for key in ('firstCode', 'lastCode'))
+                    or not previous < page['firstCode'] <= page['lastCode']):
+                raise ValueError()
+            previous = page['lastCode']; count += page['fundCount']; total += page['byteLength']
+        if count != manifest['fundCount'] or total != manifest['totalPageBytes']: raise ValueError()
+        root_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        page_fd = os.open('merge-receipt-pages', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        for page in pages:
+            descriptor = os.open(page['path'].split('/')[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=page_fd)
+            with os.fdopen(descriptor, 'rb') as handle:
+                descriptor = None
+                opened = os.fstat(handle.fileno())
+                if not stat.S_ISREG(opened.st_mode) or opened.st_size != page['byteLength']: raise ValueError()
+                hasher, measured = hashlib.sha256(), 0
+                while measured <= page['byteLength']:
+                    chunk = handle.read(min(65_536, page['byteLength'] + 1 - measured))
+                    if not chunk: break
+                    measured += len(chunk); hasher.update(chunk)
+                after = os.fstat(handle.fileno())
+                if (measured != page['byteLength'] or hasher.hexdigest() != page['sha256']
+                        or (after.st_size, after.st_mtime_ns) != (opened.st_size, opened.st_mtime_ns)):
+                    raise ValueError()
+        return {**summary, 'storageFormat': 'fund-pages-v1', 'pageCount': len(pages),
+                'totalPageBytes': total, 'pageFileHashesVerified': True}
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError):
+        return {**summary, **({'pageSummaryErrorCode': 'MERGE_RECEIPT_INVALID'} if paged else {})}
+    finally:
+        for opened_fd in (descriptor, page_fd, root_fd):
+            if opened_fd is not None: os.close(opened_fd)
+
+
 def diagnostic_merge(root, env, *, execute=None):
     """Keep raw child output ephemeral; return only fixed classifications."""
     runner = execute or subprocess.run
@@ -187,7 +263,8 @@ def diagnostic_merge(root, env, *, execute=None):
             except (ValueError, UnicodeError): continue
             if not isinstance(row, dict): continue
             code = row.get('errorCode')
-            if code not in {'READ_FAILED', 'CAMPAIGN_FAILED', 'TRAVERSAL_FAILED'}: continue
+            if not isinstance(code, str) or code not in {'READ_FAILED', 'CAMPAIGN_FAILED', 'TRAVERSAL_FAILED',
+                    'INVALID_PROGRESS', 'MERGE_RECEIPT_INVALID', 'MERGE_RECEIPT_TOO_LARGE'}: continue
             record = {'errorCode': code}
             read = row.get('readDiagnostic')
             if (isinstance(read, dict) and read.get('inputKind') in {
@@ -201,8 +278,8 @@ def diagnostic_merge(root, env, *, execute=None):
     sizes = []
     for quarter in sorted(QUARTERS):
         path = Path(root) / '.cache' / ('parts-' + quarter) / 'merge-receipt.json'
-        if path.is_file() and not path.is_symlink():
-            sizes.append({'quarter': quarter, 'byteLength': path.stat().st_size})
+        summary = receipt_storage_summary(path, quarter)
+        if summary is not None: sizes.append(summary)
     return {'status': 'diagnosed', 'mergeOutcome': 'timed-out' if timed_out else
             'passed' if returncode == 0 else 'failed', 'diagnostics': errors,
             'generatedReceiptSizes': sizes, 'rawLogBytes': log_bytes,

@@ -250,6 +250,30 @@ class NonstockRetentionTests(unittest.TestCase):
         self.assertFalse(period['periodTitles'][0]['matchesExpected'])
         self.assertEqual(period['periodTitles'][0]['periodEnd'], '2026-09-30')
 
+    def test_observed_reit_structure_reports_verified_identity_and_specific_code_conflict(self):
+        fixture = json.loads((Path(__file__).parent / 'fixtures/portfolio-identity-reit.json').read_text())
+        result = diag.document_structure(fixture['pages'], fixture['pageNumbers'], fixture['report'],
+            pdf_sha256=fixture['proof']['pdfSha256'], now=NOW)
+        self.assertEqual(result['identityRecognizer']['branch'], 'VERIFIED')
+        self.assertTrue(result['identityRecognizer']['requestedCodeMatched'])
+        pages = [p.replace('交易代码  000008', '交易代码 000009') for p in fixture['pages']]
+        result = diag.document_structure(pages, fixture['pageNumbers'], fixture['report'],
+            pdf_sha256=fixture['proof']['pdfSha256'], now=NOW)
+        self.assertEqual(result['identityRecognizer']['branch'], 'REIT_CODE_MISMATCH')
+        self.assertFalse(result['identityRecognizer']['requestedCodeMatched'])
+
+    def test_reit_financial_and_other_security_windows_keep_original_short_quote_budget(self):
+        pages = ['§3 主要财务指标和不动产基金运作情况\n3.1 主要财务指标\n'
+                 '项目 本期金额\n期末基金资产净值 100.00\n3.2 其他财务指标\n'
+                 '7.1 其他证券投资情况\n本期证券投资表\n7.2 其他说明',
+                 '8.1 投资组合报告\n' + '证券金额 100\n' * 200 + '\n8.2 基金份额'] * 5
+        windows = diag.bounded_table_windows(pages, list(range(1, len(pages) + 1)))
+        self.assertTrue(any('期末基金资产净值' in row['text'] for row in windows))
+        self.assertTrue(any('其他证券投资情况' in row['text'] for row in windows))
+        self.assertLessEqual(sum(len(row['text']) for row in windows), 1800)
+        self.assertLessEqual(len(windows), 6)
+        self.assertTrue(all(len(row['text']) <= 500 for row in windows))
+
     def test_structure_excerpts_are_bounded_and_omit_contact_or_free_prose(self):
         email = 'private' + '@' + 'example.org'
         text = ('联系人 不输出\n' + email + '\n2026年第2季度报告\n'

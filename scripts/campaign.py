@@ -572,6 +572,7 @@ def publish(data='web/data', parts='.cache/parts'):
     summaries = []
     for quarter in selection['quarters']:
         if quarter not in PERIODS: raise ValueError('INVALID_PERIOD')
+        started = time.monotonic()
         output = seed_quarter(root, quarter)
         if quarter in locator_paths:
             shutil.copy2(locator_paths[quarter], output / 'report-locators.json')
@@ -583,12 +584,16 @@ def publish(data='web/data', parts='.cache/parts'):
                 src = part_root / ('part-' + item['id'])
                 if src.is_dir(): shutil.copytree(src, scoped_parts / src.name, dirs_exist_ok=True)
         config = f'.cache/campaign/{quarter}.json'
+        plan_stage('MERGE_PARTS_START', started, quarter=quarter)
         subprocess.run(['node', 'scripts/merge-parts.js', '--parts', str(scoped_parts), '--data', str(output),
                         '--catalog', str(catalogs[quarter]), '--config', config,
                         *(['--reuseMarketPrices', 'false'] if source_repair else [])], check=True)
+        plan_stage('MERGE_PARTS_END', started, quarter=quarter)
+        plan_stage('RECONCILE_START', started, quarter=quarter)
         subprocess.run([sys.executable, 'scripts/traversal.py', 'merge', '--parts', str(scoped_parts),
                         '--catalog', str(catalogs[quarter]), '--progress', str(output / 'progress.json'),
                         '--config', config, '--data-root', str(output)], check=True)
+        plan_stage('RECONCILE_END', started, quarter=quarter)
         progress = read_json(output / 'progress.json')
         quarter_input_errors = [item for item in input_state['batchInputErrors'] if item['quarter'] == quarter]
         quarter_hold = {**input_state['continuationHold'], 'quarter': quarter,
@@ -635,8 +640,10 @@ def publish(data='web/data', parts='.cache/parts'):
         # whole per-product checkpoint in this parent process during analysis
         # or while merging the next quarter.
         del progress
+        plan_stage('ANALYSIS_START', started, quarter=quarter)
         subprocess.run(['node', 'scripts/analyze-data.js', '--data', str(output),
                         '--output', str(output / 'analysis.json')], check=True)
+        plan_stage('ANALYSIS_END', started, quarter=quarter)
         summaries.append(summary)
     periods = []
     for quarter, (target, baseline) in PERIODS.items():

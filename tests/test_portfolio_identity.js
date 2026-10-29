@@ -7,6 +7,7 @@ const { normalizeReport } = require('../lib/fund-analysis');
 const { buildSnapshot } = require('../scripts/build-data');
 const { mergeSnapshots } = require('../scripts/merge-parts');
 const fixture = require('./fixtures/portfolio-identity.json');
+const reitFixture = require('./fixtures/portfolio-identity-reit.json');
 const clone = value => JSON.parse(JSON.stringify(value));
 const now = '2026-10-26T12:00:00Z';
 const config = { targetPeriodEnd: '2026-06-30', baselinePeriodEnd: '2026-03-31', funds: [{ code: '000001' }] };
@@ -34,6 +35,40 @@ test('Python-generated proof survives JS validation and report normalization', (
   assert.equal(value.shareClassUniverseComplete, false);
   assert.equal(value.shareClassSpecificMetricsProvided, false);
   assert.deepEqual(value.identitySection.pages, [2, 3]);
+});
+
+test('bounded REIT fund and trading codes survive matching JS validation without class or holding inference', () => {
+  const value = normalizePortfolioIdentity(reitFixture.proof, reitFixture.report, now);
+  assert.deepEqual(value, reitFixture.proof);
+  assert.equal(value.sourcePortfolioCode, '000008');
+  assert.deepEqual(value.shareClassCodes, []);
+  assert.equal(value.eligibleForShareClassExpansion, false);
+  const normalized = normalizeReport({ ...reitFixture.report, holdings: [], coverage: 'unknown', portfolioIdentityEvidence: value });
+  assert.deepEqual(normalized.portfolioIdentityEvidence, value);
+  assert.deepEqual(normalized.holdings, []);
+  assert.equal(normalized.noEquitiesConfirmed, false);
+  assert.equal(normalized.navYuan, null);
+});
+
+test('REIT normalization rejects generic code proof, mismatched pair, missing boundaries and inferred classes', () => {
+  const changes = [
+    p => { p.method = 'pdf-explicit-fund-code-rows-v1'; },
+    p => { p.rows = p.rows.slice(0, 1); },
+    p => { p.rows[1].text = '交易代码 000009'; p.rows[1].codes = ['000009']; },
+    p => { p.rows[1].text = '基金代码 000008'; },
+    p => { p.rows[1].field = 'shareClassCodes'; p.rows[1].text = '下属分类基金的交易代码 000008'; },
+    p => { p.shareClassCodes = ['000008']; },
+    p => { p.identitySection.subheading = '2.1 基金基本情况'; },
+    p => { p.identitySection.subheadingPage = 3; },
+    p => { p.identitySection.subheadingAdjacent = false; },
+    p => { p.identitySection.endHeading = '§3 主要财务指标和不动产基金运作情况'; },
+    p => { p.kind = 'semiannual'; p.reportPeriodEvidence.text = '2026年中期报告'; },
+  ];
+  for (const change of changes) {
+    const value = clone(reitFixture.proof); change(value);
+    assert.equal(normalizePortfolioIdentity(value, reitFixture.report, now), null);
+  }
+  assert.equal(normalizePortfolioIdentity(reitFixture.proof, { ...reitFixture.report, fundCode: '000009' }, now), null);
 });
 
 test('rejects unmatched reports, future receipts, corrupt rows, unknown pages and inflated scope', () => {

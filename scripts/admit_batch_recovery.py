@@ -20,6 +20,7 @@ import zipfile
 
 from publication_cache import read_bounded_command
 from publication_guard import inspect_content
+from merge_receipt import read_merge_receipt
 import recover_batches as recovery
 from traversal import (atomic_json, read_json, read_status_snapshot, valid_status,
                        reconcile_observations, merge_progress, load_retained_funds, catalog_records)
@@ -747,7 +748,7 @@ def admit(repo, bundle, binding, *, env, now=None, runner=command):
                 '--catalog', str(quarter / 'catalog.json'), '--config', str(config_file),
                 '--reuseMarketPrices', 'false'], cwd=ROOT, timeout=2400)
         stage('ADMIT_RECONCILE')
-        receipt = read_json(parts / 'merge-receipt.json')
+        receipt = read_merge_receipt(parts / 'merge-receipt.json', read_json=read_json)
         statuses = reconcile_observations([row['status'] for row in bundle_info['batches']], receipt, config, current)
         updated = merge_progress(bundle_info['catalog'], progress_before, config, statuses, current,
                                  retained=load_retained_funds(quarter))

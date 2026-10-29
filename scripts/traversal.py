@@ -19,7 +19,7 @@ from report_managers import normalize_manager_table_coverage, manager_key
 from strategy_sections import normalize_strategy_section_coverage
 from price_coverage import CALENDAR, VERSION as PRICE_COVERAGE_VERSION, valid_usable_complete_price
 from price_consistency import normalize_price_conflict
-from price_range_reference import effective_price_range, unresolved_conflict, resolution_for, valid_resolution
+from price_range_reference import effective_price_range, unresolved_conflict, resolution_for, valid_resolution, coverage_resolution
 from price_patches import valid_binding as valid_price_binding, valid_target as valid_price_target, status_for as price_patch_status
 from source_dates import china_date
 
@@ -694,12 +694,14 @@ def price_coverage(fund, now=None):
         identity = {'market': row.get('market'), 'stockCode': row.get('stockCode'),
                     'currency': CALENDAR['markets'].get(row.get('market'), {}).get('currency'),
                     'rangeStart': start, 'rangeEnd': end, 'calendarId': CALENDAR['id']}
-        if key in stocks and unresolved_conflict(price, identity, now):
-            conflicts.add(key)
-        resolution = resolution_for(price, identity, now) if key in stocks else None
-        if resolution: resolutions.append(resolution)
         original = price
-        price = effective_price_range(price, identity, now) or price
+        if key in stocks:
+            effective, resolution, unresolved = coverage_resolution(price, identity, now)
+            if unresolved: conflicts.add(key)
+            if resolution: resolutions.append(resolution)
+        else:
+            effective = effective_price_range(price, identity, now)
+        price = effective or price
         low, high = price.get("low"), price.get("high")
         if (key in stocks and price.get("status") == "observed" and price.get("priceBasis") == "unadjusted"
                 and public_url(price.get("sourceUrl")) and isinstance(low, (int, float)) and not isinstance(low, bool)
@@ -2540,7 +2542,9 @@ def main(argv=None):
                 statuses.append(read_json(file))
             except TraversalError:
                 continue
-        statuses = reconcile_observations(statuses, read_json(parts / "merge-receipt.json"), config)
+        from merge_receipt import read_merge_receipt
+        statuses = reconcile_observations(statuses, read_merge_receipt(parts / "merge-receipt.json",
+            read_json=read_json, error_type=TraversalError), config)
         result = merge_progress(read_json(args.catalog), read_json(args.progress, optional=True), config, statuses,
                                 retained=load_retained_funds(args.data_root))
         atomic_json(args.progress, result)

@@ -147,7 +147,8 @@ def proof_summary(raw, doc):
 
 
 _HEADING = re.compile(r'^\s*(?:§\s*\d+|\d{1,2}(?:\.\d{1,2}){1,3})\s*[^\d\n]{2,120}$')
-_ASSET = re.compile(r'期末基金资产组合|其他(?:各项)?资产构成|资产负债表|股票投资明细|基础设施(?:基金)?投资组合')
+_ASSET = re.compile(r'期末基金资产组合|其他(?:各项)?资产构成|资产负债表|股票投资明细|基础设施(?:基金)?投资组合|'
+                    r'主要财务指标|其他(?:证券|金融资产)投资|投资组合(?:报告|情况)')
 _PRIVATE = re.compile(r'基金经理|联系人|联系方式|电话号码|身份证|邮箱|电子邮件|@|https?://')
 
 
@@ -198,7 +199,8 @@ def table_recognition(pages, numbers):
 _IDENTITY_BRANCHES = {'VERIFIED', 'INVALID_INPUT', 'PAGE_MAPPING_LENGTH_MISMATCH', 'PERIOD_TITLE_NOT_FOUND',
     'PERIOD_TITLE_MISMATCH', 'PERIOD_TITLE_PAGE_UNKNOWN', 'IDENTITY_SECTION_START_COUNT',
     'IDENTITY_SECTION_END_NOT_FOUND', 'IDENTITY_SECTION_PAGE_MAPPING_INVALID', 'DUPLICATE_CODE_LABEL',
-    'MAIN_CODE_LABEL_NOT_FOUND', 'CODE_ROWS_EXCEED_BOUND', 'CODE_ROW_INVALID', 'PROOF_VALIDATION_REJECTED'}
+    'MAIN_CODE_LABEL_NOT_FOUND', 'CODE_ROWS_EXCEED_BOUND', 'CODE_ROW_INVALID', 'PROOF_VALIDATION_REJECTED',
+    'TRADING_CODE_LABEL_NOT_FOUND', 'REIT_CODE_MISMATCH', 'REIT_UNEXPECTED_CODE_LABEL'}
 _STRUCTURE_HEADING = re.compile(r'^\s*(?:§\s*)?\d{1,2}(?:[.．]\d{1,2}){0,3}\s*[^\d\n]{2,100}$')
 _STRUCTURE_TOPIC = re.compile(r'基金|基础设施|项目|资产|投资|财务|管理|净值|运营')
 _CODE_LABEL = re.compile(r'^(?:基金主代码|基金代码|场内代码|交易代码|下属(?:分级|分类)基金的交易代码)[：:|]*')
@@ -219,7 +221,7 @@ def document_structure(pages, numbers, doc, *, pdf_sha256, now):
         page_numbers=numbers, retrieved_at=now.isoformat(), pdf_sha256=pdf_sha256, now=now, diagnostics=branch)
     result = {'identityRecognizer': {
         'branch': branch.get('branch') if branch.get('branch') in _IDENTITY_BRANCHES else 'UNKNOWN_BRANCH',
-        'field': branch.get('field') if branch.get('field') in {'mainCode', 'shareClassCodes'} else None,
+        'field': branch.get('field') if branch.get('field') in {'mainCode', 'shareClassCodes', 'tradingCode'} else None,
         'parsedPortfolioCode': (identity or {}).get('sourcePortfolioCode'),
         'requestedCodeMatched': bool(identity and doc['fundCode'] in
             [identity['sourcePortfolioCode'], *identity['shareClassCodes']])},

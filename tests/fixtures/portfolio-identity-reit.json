@@ -1,0 +1,82 @@
+{
+  "description": "Synthetic quarterly real-estate product identity format.",
+  "pages": [
+    "合成不动产证券投资基金\n2026 年第 2 季度报告",
+    "§ 2  不动产 基金产品概况\n2.1 不动产 基金产品基本情况\n基金名称 合成不动产证券投资基金\n基金代码  000008\n交易代码  000008\n基金运作方式 封闭式",
+    "2.2 不动产 项目基本情况说明\n合成项目\n2.3 不动产 基金扩募情况\n§ 3 主要财务指标和 不动产 基金运作情况"
+  ],
+  "pageNumbers": [
+    1,
+    2,
+    3
+  ],
+  "report": {
+    "title": "合成不动产证券投资基金2026年第2季度报告",
+    "fundCode": "000008",
+    "sourceUrl": "https://example.org/reit-quarter.pdf",
+    "periodEnd": "2026-06-30",
+    "publishedAt": "2026-07-21",
+    "kind": "quarterly"
+  },
+  "proof": {
+    "schemaVersion": 1,
+    "method": "pdf-explicit-reit-code-rows-v1",
+    "scope": "explicitly-listed-fund-codes",
+    "sourceUrl": "https://example.org/reit-quarter.pdf",
+    "periodEnd": "2026-06-30",
+    "publishedAt": "2026-07-21",
+    "kind": "quarterly",
+    "retrievedAt": "2026-07-21T10:00:00+00:00",
+    "pdfSha256": "eb2e01b01b7a38adcb9605ad4ae374db2b6659319791cd5f2a565a04f025999a",
+    "sourceTextHash": "c23a693cfeb434d2533262c548d0ed51010b5686e9ecc64f15f7df60c0c909c6",
+    "textHashScope": "provided-extracted-pages",
+    "reportPeriodEvidence": {
+      "text": "2026 年第 2 季度报告",
+      "page": 1
+    },
+    "identitySection": {
+      "heading": "§ 2  不动产 基金产品概况",
+      "endHeading": "2.2 不动产 项目基本情况说明",
+      "startPage": 2,
+      "endPage": 3,
+      "pages": [
+        2,
+        3
+      ],
+      "sectionBounded": true,
+      "pageNumbersVerified": true,
+      "subheading": "2.1 不动产 基金产品基本情况",
+      "subheadingPage": 2,
+      "subheadingAdjacent": true
+    },
+    "rows": [
+      {
+        "field": "mainCode",
+        "text": "基金代码  000008",
+        "codes": [
+          "000008"
+        ],
+        "page": 2,
+        "pages": [
+          2
+        ]
+      },
+      {
+        "field": "tradingCode",
+        "text": "交易代码  000008",
+        "codes": [
+          "000008"
+        ],
+        "page": 2,
+        "pages": [
+          2
+        ]
+      }
+    ],
+    "sourcePortfolioCode": "000008",
+    "shareClassCodes": [],
+    "eligibleForShareClassExpansion": false,
+    "shareClassUniverseComplete": false,
+    "shareClassSpecificMetricsProvided": false
+  }
+}
