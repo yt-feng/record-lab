@@ -13,6 +13,14 @@ COMPANY_PATH = re.compile(r'^\./data/companies/([A-Za-z0-9_-]{1,64})\.json$')
 ANALYSIS_PATH = re.compile(r'^\./analysis/(details-(?:portfolios-)?\d+\.json)$')
 COMPANY_FILE = re.compile(r'^[A-Za-z0-9_-]{1,64}\.json$')
 ANALYSIS_FILE = re.compile(r'^details-(?:portfolios-)?\d+\.json$')
+PUBLIC_ERRORS = frozenset({
+    'ANALYSIS_REQUIRES_ACTIONS', 'INVALID_ANALYSIS_PERIOD',
+    'SITE_PUBLICATION_REJECTED', 'INVALID_SITE_MANIFEST',
+    'INVALID_COMPANY_PATH', 'MISSING_COMPANY_PART',
+    'INVALID_ANALYSIS_PATH', 'MISSING_ANALYSIS_PART',
+    'SITE_SYMLINK', 'SITE_SOURCE_MISSING', 'SITE_OUTPUT_EXISTS',
+    'SITE_OUTPUT_INSIDE_SOURCE', 'SITE_FILE_TYPE', 'SITE_SIZE_EXCEEDED',
+})
 
 
 def ensure_analyses(source='web'):
@@ -161,8 +169,17 @@ def main(argv=None):
         result = {'status': 'analyses_ready', 'rebuiltPeriods': rebuilt} if args.analyses_only else prepare(args.source, args.output)
         print(json.dumps(result))
         return 0
-    except Exception:
-        print(json.dumps({'status': 'failed', 'errorCode': 'SITE_PREPARATION_FAILED'}))
+    except Exception as error:
+        result = {'status': 'failed', 'errorCode': 'SITE_PREPARATION_FAILED'}
+        # Emit only fixed categories, never exception messages or source data.
+        if type(error) is ValueError and str(error) in PUBLIC_ERRORS:
+            result['reasonCode'] = str(error)
+        elif isinstance(error, OSError):
+            result['reasonCode'] = 'SITE_IO_FAILED'
+            result['errno'] = error.errno
+        elif isinstance(error, subprocess.CalledProcessError):
+            result['reasonCode'] = 'SITE_ANALYSIS_FAILED'
+        print(json.dumps(result))
         return 1
 
 

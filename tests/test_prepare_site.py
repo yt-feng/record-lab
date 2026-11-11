@@ -194,6 +194,18 @@ class PrepareSitePartitionTests(unittest.TestCase):
         pack.assert_not_called()
         self.assertEqual(json.loads(output.getvalue())['errorCode'], 'SITE_PREPARATION_FAILED')
 
+    def test_cli_reports_fixed_failure_categories_without_exception_details(self):
+        for error, reason in ((ValueError('SITE_SIZE_EXCEEDED'), 'SITE_SIZE_EXCEEDED'),
+                              (OSError(28, 'private source details'), 'SITE_IO_FAILED'),
+                              (ValueError('private source details'), None)):
+            with self.subTest(reason=reason), patch.object(site, 'ensure_analyses', return_value=0), \
+                    patch.object(site, 'prepare', side_effect=error), patch('sys.stdout', io.StringIO()) as output:
+                self.assertEqual(site.main([]), 1)
+            result = json.loads(output.getvalue())
+            self.assertEqual(result.get('reasonCode'), reason)
+            self.assertNotIn('private source details', output.getvalue())
+            if isinstance(error, OSError): self.assertEqual(result['errno'], 28)
+
     def test_semantic_workflow_persists_all_analysis_changes_and_checks_source_after_pack(self):
         workflow = (ROOT / '.github/workflows/enrich-strategy-semantics.yml').read_text()
         target = workflow.index('run: node scripts/analyze-data.js --data')
