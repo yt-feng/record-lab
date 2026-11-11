@@ -13,13 +13,14 @@ COMPANY_PATH = re.compile(r'^\./data/companies/([A-Za-z0-9_-]{1,64})\.json$')
 ANALYSIS_PATH = re.compile(r'^\./analysis/(details-(?:portfolios-)?\d+\.json)$')
 COMPANY_FILE = re.compile(r'^[A-Za-z0-9_-]{1,64}\.json$')
 ANALYSIS_FILE = re.compile(r'^details-(?:portfolios-)?\d+\.json$')
+METADATA_FILES = ('catalog.json', 'progress.json')
 PUBLIC_ERRORS = frozenset({
     'ANALYSIS_REQUIRES_ACTIONS', 'INVALID_ANALYSIS_PERIOD',
     'SITE_PUBLICATION_REJECTED', 'INVALID_SITE_MANIFEST',
     'INVALID_COMPANY_PATH', 'MISSING_COMPANY_PART',
     'INVALID_ANALYSIS_PATH', 'MISSING_ANALYSIS_PART',
     'SITE_SYMLINK', 'SITE_SOURCE_MISSING', 'SITE_OUTPUT_EXISTS',
-    'SITE_OUTPUT_INSIDE_SOURCE', 'SITE_FILE_TYPE', 'SITE_SIZE_EXCEEDED',
+    'SITE_OUTPUT_INSIDE_SOURCE', 'SITE_FILE_TYPE', 'SITE_SIZE_EXCEEDED', 'INVALID_SITE_PERIODS',
 })
 
 
@@ -123,6 +124,32 @@ def current_partitions(root, files):
     return manifests, historical, referenced
 
 
+def metadata_partitions(root, files):
+    """Advertise compressed quarter metadata without changing source snapshots."""
+    available = set(files)
+    manifest = root / 'data/periods.json'
+    if manifest not in available: return {}, set()
+    body = json.loads(public_bytes(root, manifest))
+    if (not isinstance(body, dict) or body.get('schemaVersion') != 1
+            or not isinstance(body.get('periods'), list) or not 1 <= len(body['periods']) <= 40):
+        raise ValueError('INVALID_SITE_PERIODS')
+    seen, compressed = set(), set()
+    for period in body['periods']:
+        quarter = period.get('id') if isinstance(period, dict) else None
+        if (not isinstance(quarter, str) or not re.fullmatch(r'2026Q[23]', quarter)
+                or quarter in seen or period.get('path') != f'./data/periods/{quarter}/'):
+            raise ValueError('INVALID_SITE_PERIODS')
+        seen.add(quarter)
+        folder = root / 'data/periods' / quarter
+        names = [name for name in METADATA_FILES if folder / name in available]
+        compressed.update(folder / name for name in names)
+        if names: period['compressedMetadata'] = names
+        else: period.pop('compressedMetadata', None)
+    if body.get('defaultPeriod') not in seen: raise ValueError('INVALID_SITE_PERIODS')
+    raw = (json.dumps(body, ensure_ascii=False, separators=(',', ':')) + '\n').encode()
+    return {manifest: raw}, compressed
+
+
 def prepare(source='web', output='.cache/site', max_bytes=900_000_000):
     root, target = Path(source), Path(output)
     if root.is_symlink(): raise ValueError('SITE_SYMLINK')
@@ -136,6 +163,8 @@ def prepare(source='web', output='.cache/site', max_bytes=900_000_000):
         if file.suffix not in {'.json', '.js', '.css', '.html'}: raise ValueError('SITE_FILE_TYPE')
         files.append(file)
     manifests, historical, referenced = current_partitions(root, files)
+    metadata_manifests, compressed_metadata = metadata_partitions(root, files)
+    manifests.update(metadata_manifests)
     skipped_bytes = sum(file.stat().st_size for file in historical)
     target.mkdir(parents=True)
     count, total = 0, 0
@@ -144,7 +173,7 @@ def prepare(source='web', output='.cache/site', max_bytes=900_000_000):
         relative = file.relative_to(root)
         raw = manifests[file] if file in manifests else public_bytes(root, file)
         destination = target / relative
-        if file not in manifests and file.parent.name in {'companies', 'analysis'} and file.suffix == '.json':
+        if file in compressed_metadata or (file not in manifests and file.parent.name in {'companies', 'analysis'} and file.suffix == '.json'):
             raw = gzip.compress(raw, compresslevel=6, mtime=0)
             destination = destination.with_suffix('.json.gz')
         total += len(raw)
@@ -153,6 +182,7 @@ def prepare(source='web', output='.cache/site', max_bytes=900_000_000):
         destination.write_bytes(raw)
         count += 1
     return {'status': 'site_ready', 'files': count, 'bytes': total, 'compression': 'gzip-data-partitions',
+            'compressedMetadataFiles': len(compressed_metadata),
             'selectedPartitionFiles': len(referenced), 'skippedHistoricalPartitionFiles': len(historical),
             'skippedSourceBytes': skipped_bytes}
 

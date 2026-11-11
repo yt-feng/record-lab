@@ -114,11 +114,17 @@
     for (const period of data.periods) {
       const dates = isRecord(period) && quarterDates(period.id);
       if (!dates || ids.has(period.id) || typeof period.label !== 'string' || !period.label.trim() || period.label.length > 64 ||
-        period.path !== `./data/periods/${period.id}/` || period.targetPeriodEnd !== dates.targetPeriodEnd || period.baselinePeriodEnd !== dates.baselinePeriodEnd) fail();
+        period.path !== `./data/periods/${period.id}/` || period.targetPeriodEnd !== dates.targetPeriodEnd || period.baselinePeriodEnd !== dates.baselinePeriodEnd ||
+        !validMetadataCompression(period)) fail();
       ids.add(period.id);
     }
     if (!ids.has(data.defaultPeriod)) fail();
     return data;
+  }
+  function validMetadataCompression(period) {
+    return period.compressedMetadata === undefined || Array.isArray(period.compressedMetadata) &&
+      new Set(period.compressedMetadata).size === period.compressedMetadata.length &&
+      period.compressedMetadata.every(file => ['catalog.json', 'progress.json'].includes(file));
   }
   function selectQuarter(manifest, requested) {
     const periods = manifest ? validatePeriods(manifest).periods : [LEGACY_PERIOD];
@@ -127,8 +133,9 @@
   }
   function periodDataPath(period, file) {
     if (!period || (!((period.id === LEGACY_PERIOD.id && period.path === LEGACY_PERIOD.path)) &&
-      (!quarterDates(period.id) || period.path !== `./data/periods/${period.id}/`))) throw new Error('INVALID_PERIOD_PATH');
-    if (['latest.json', 'catalog.json', 'progress.json'].includes(file)) return period.path + file;
+      (!quarterDates(period.id) || period.path !== `./data/periods/${period.id}/`)) || !validMetadataCompression(period)) throw new Error('INVALID_PERIOD_PATH');
+    if (['latest.json', 'catalog.json', 'progress.json'].includes(file)) return period.path + file +
+      (period.compressedMetadata?.includes(file) ? '.gz' : '');
     const companyPath = safeCompanyPath(file);
     if (!companyPath) throw new Error('INVALID_PERIOD_PATH');
     return period.path + companyPath.slice('./data/'.length);
@@ -782,7 +789,7 @@
         try {
           const response = await win.fetch(task.path, { cache: 'no-store', signal: controller.signal, credentials: 'omit' });
           if (!response.ok) throw new Error(response.status === 404 ? 'NOT_GENERATED' : 'LOAD_FAILED');
-          const raw = await response.text(); if (raw.length > MAX_DATA_BYTES) throw new Error('INVALID_DATA');
+          const raw = await responseText(response, task.path, win);
           return { ...task, data: task.validate(JSON.parse(raw)) };
         } catch (error) { return { ...task, failure: `${task.label}${error.message === 'NOT_GENERATED' ? '待生成' : '载入未成功'}` }; }
         finally { win.clearTimeout(timer); }

@@ -91,6 +91,45 @@ class PrepareSitePartitionTests(unittest.TestCase):
             for file in root.rglob('*.json'):
                 self.assertEqual(gzip.decompress((output / (file.relative_to(root).as_posix() + '.gz')).read_bytes()), file.read_bytes())
 
+    def test_quarter_metadata_fits_the_package_and_round_trips_all_original_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, output = Path(directory) / 'web', Path(directory) / 'site'
+            periods = {'schemaVersion': 1, 'defaultPeriod': '2026Q3', 'periods': []}
+            for quarter in ('2026Q2', '2026Q3'):
+                folder = root / 'data/periods' / quarter
+                self.scope(folder, quarter)
+                periods['periods'].append({'id': quarter, 'path': f'./data/periods/{quarter}/'})
+                for name in ('catalog.json', 'progress.json'):
+                    write(folder / name, {'quarter': quarter, 'retrievedAt': '2026-10-28T10:00:00.123456Z',
+                        'continuationHold': {'reason': 'BATCH_ARTIFACTS_UNVERIFIED'},
+                        'funds': [{'code': str(index), 'label': '原始记录与精确时点' * 10} for index in range(2000)]})
+            write(root / 'data/periods.json', periods)
+            write(root / 'data/catalog.json', {'legacy': True})
+            before = tree(root)
+            result = site.prepare(root, output, max_bytes=100_000)
+            self.assertEqual(tree(root), before)
+            self.assertEqual(result['compressedMetadataFiles'], 4)
+            self.assertLess(result['bytes'], 100_000)
+            packed_periods = json.loads((output / 'data/periods.json').read_text())
+            for period in packed_periods['periods']:
+                self.assertEqual(period['compressedMetadata'], ['catalog.json', 'progress.json'])
+                for name in period['compressedMetadata']:
+                    relative = f"data/periods/{period['id']}/{name}"
+                    self.assertFalse((output / relative).exists())
+                    self.assertEqual(gzip.decompress((output / (relative + '.gz')).read_bytes()), before[relative])
+            self.assertEqual((output / 'data/catalog.json').read_bytes(), before['data/catalog.json'])
+            with self.assertRaisesRegex(ValueError, 'SITE_SIZE_EXCEEDED'):
+                site.prepare(root, Path(directory) / 'too-small', max_bytes=1)
+
+    def test_metadata_quarters_cannot_redirect_to_another_scope(self):
+        for period in ({'id': '../2026Q3', 'path': './data/periods/2026Q3/'},
+                       {'id': '2026Q3', 'path': './data/periods/2026Q2/'}):
+            with self.subTest(period=period), tempfile.TemporaryDirectory() as directory:
+                root, output = Path(directory) / 'web', Path(directory) / 'site'
+                write(root / 'data/periods.json', {'schemaVersion': 1, 'defaultPeriod': '2026Q3', 'periods': [period]})
+                with self.assertRaisesRegex(ValueError, 'INVALID_SITE_PERIODS'): site.prepare(root, output)
+                self.assertFalse(output.exists())
+
     def test_duplicate_references_within_an_owner_fail_before_any_output(self):
         for kind in ('company', 'stock', 'portfolio'):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
@@ -153,7 +192,8 @@ class PrepareSitePartitionTests(unittest.TestCase):
     def test_analyses_only_updates_stale_other_quarter_before_packing_without_source_clock_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             root, output = Path(directory) / 'web', Path(directory) / 'site'
-            write(root / 'data/periods.json', {'periods': [{'id': '2026Q2'}, {'id': '2026Q3'}]})
+            write(root / 'data/periods.json', {'schemaVersion': 1, 'defaultPeriod': '2026Q3',
+                'periods': [{'id': quarter, 'path': f'./data/periods/{quarter}/'} for quarter in ('2026Q2', '2026Q3')]})
             originals = {}
             for quarter, target, baseline in (('2026Q2', '2026-06-30', '2026-03-31'), ('2026Q3', '2026-09-30', '2026-06-30')):
                 folder = root / 'data/periods' / quarter

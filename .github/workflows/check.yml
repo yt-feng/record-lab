@@ -5,6 +5,15 @@ on:
     paths-ignore: ['web/data/**']
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish_site:
+        description: Republish verified saved observations without collection
+        type: boolean
+        default: false
+concurrency:
+  # Manual republication shares the collection writer lock for the whole run.
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_site && github.ref == 'refs/heads/main' && 'published-records' || format('validate-records-{0}', github.run_id) }}
+  cancel-in-progress: false
 permissions:
   contents: read
   actions: read
@@ -19,7 +28,7 @@ jobs:
         with:
           fetch-depth: 0
           # Validate publishable commits, not GitHub's synthetic PR merge identity.
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_site && github.ref == 'refs/heads/main' && 'main' || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
@@ -46,3 +55,25 @@ jobs:
           path: ${{ runner.temp }}/publication-history.json
           if-no-files-found: error
           retention-days: 14
+      - name: Upload verified saved site
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_site && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: .cache/site
+  publish:
+    needs: check
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_site && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+      - uses: actions/deploy-pages@v4
+        id: deployment

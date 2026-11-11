@@ -325,6 +325,27 @@ test('quarter paths are limited to the validated local period and company namesp
   }
 });
 
+test('quarter metadata compression is explicit and limited to catalog and progress', async () => {
+  const manifest = fixturePeriods(), period = manifest.periods[1];
+  period.compressedMetadata = ['catalog.json', 'progress.json'];
+  assert.equal(ui.validatePeriods(manifest), manifest);
+  const { gzipSync } = require('node:zlib');
+  const text = JSON.stringify({retrievedAt:'2026-10-28T10:00:00.123456Z', label:'原始记录', value:0.123456789});
+  for (const name of period.compressedMetadata) {
+    const path = ui.periodDataPath(period, name);
+    assert.equal(path, './data/periods/2026Q3/' + name + '.gz');
+    assert.equal(await ui.responseText(new Response(gzipSync(text)), path), text);
+    assert.equal(await ui.responseText(new Response(text, {headers:{'content-encoding':'gzip'}}), path), text);
+  }
+  assert.equal(ui.periodDataPath(period, 'latest.json'), './data/periods/2026Q3/latest.json');
+  assert.equal(ui.periodDataPath(manifest.periods[0], 'progress.json'), './data/periods/2026Q2/progress.json');
+  for (const invalid of [['analysis.json'], ['../progress.json'], ['progress.json', 'progress.json'], 'progress.json', null]) {
+    period.compressedMetadata = invalid;
+    assert.throws(() => ui.validatePeriods(manifest), /INVALID_PERIODS/);
+    assert.throws(() => ui.periodDataPath(period, 'progress.json'), /INVALID_PERIOD_PATH/);
+  }
+});
+
 test('period dataset validation refuses a Q2 payload under the Q3 selector', () => {
   const data = fixtureData(); data.targetPeriodEnd = '2026-06-30';
   assert.equal(ui.validatePeriodDataset(data, fixturePeriods().periods[0]), data);
