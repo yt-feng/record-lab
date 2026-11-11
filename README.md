@@ -45,6 +45,16 @@ Batch collection runs on the hosted runner. Tests use small synthetic fixtures, 
 
 Report PDFs are parsed in runner memory. If the repository's Actions secrets include `MINER_U_KEYS`, `MINER_U`, or `MINERU_API_KEY`, the optional MinerU v4 path extracts `full.md`; original page references are retained only when verified page markers exist. Without a secret, the bounded pypdf fallback remains available and reports processed pages, original page count, and truncation. Raw PDFs and MinerU markdown are temporary runner inputs and are never published under `web/data`.
 
+`Parse and export all stored quarterly holdings` is a read-only manual workflow.
+It parses every retained JSON file, inventories current and historical report
+versions, and exports Q2/Q3 holdings observations, source-linked comparison rows,
+fund/report indexes, stock summaries, and the complete directory gap list.
+CSV files are split at 250,000 rows and packaged with source hashes and exact
+reconciliation counts. It makes no collection or market requests and never
+rewrites the stored observations. Missing disclosure values stay blank; an
+entry or exit from a disclosure list is not labeled as a trade. An export of all
+stored data does not certify complete collection of every directory product.
+
 The separate explicit-claims verifier scans a complete, source-verified strategy section using finite language rules. It separates negation, conditions, comparisons, forward-looking statements and reported portfolio actions, retaining unknown clauses and short page-linked evidence. It is not yet a production semantic backfill and never claims complete semantic interpretation. Any future integration must share the report's existing short-quotation budget; security mentions alone cannot establish a trade or its reason.
 
 See [Methodology](docs/methodology.md) and [Publication](docs/publication.md).
