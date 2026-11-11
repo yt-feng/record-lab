@@ -1,0 +1,36 @@
+name: Parse and export all stored quarterly holdings
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: export-stored-holdings
+  cancel-in-progress: false
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Validate extraction and reconciliation
+        run: python -m unittest discover -s tests -p 'test_export_stored_holdings.py'
+      - name: Parse every retained JSON and export both quarters
+        run: python scripts/export-stored-holdings.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stored-holdings-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .cache/holdings-export/*.zip
+            .cache/holdings-export/files/summary.json
+          include-hidden-files: true
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
