@@ -7,7 +7,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { StringDecoder } = require('node:string_decoder');
 const DEFAULT_BUFFER_BYTES = 4_000_000;
-const MAX_ITEM_BYTES = 8_000_000;
+const MAX_ITEM_BYTES = 25_000_000;
 const MAX_TOTAL_BYTES = 4_000_000_000;
 const fail = code => { throw new Error(code); };
 

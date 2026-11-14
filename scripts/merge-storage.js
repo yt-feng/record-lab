@@ -63,6 +63,8 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
   const directoryByCode = new Map(directory.funds.map(fund => [fund.code, fund]));
   const companyByCode = new Map(directory.companies.map(company => [company.id, company]));
   const maxBytes = pageLimits?.maxBytes || helpers.maxCompanyBytes;
+  const maxFundBytes = pageLimits?.maxFundBytes || (pageLimits?.maxBytes || helpers.maxCompanyFundBytes || maxBytes);
+  if (!Number.isSafeInteger(maxFundBytes) || maxFundBytes < maxBytes || maxFundBytes > 25_000_000) throw failure('INVALID_ARGUMENTS');
   const maxFunds = pageLimits?.maxFunds || helpers.maxCompanyFunds;
   if (!Number.isInteger(componentLimit) || componentLimit < 1024 || componentLimit > LIMIT) throw failure('INVALID_ARGUMENTS');
   // Raw bounded inputs are temporary work, never files under the publication
@@ -139,7 +141,8 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
       // A missing or unreadable referenced page is not an empty company: abort
       // without replacing the prior manifest rather than silently losing it.
       const envelope = readJson(path.join(companyRoot, key + '.json'));
-      if (envelope.funds?.length > maxFunds || Buffer.byteLength(JSON.stringify(envelope)) + 1 > maxBytes) needsRepartition = true;
+      if (envelope.funds?.length > maxFunds || Buffer.byteLength(JSON.stringify(envelope)) + 1
+        > (envelope.funds?.length === 1 ? maxFundBytes : maxBytes)) needsRepartition = true;
       ingest(envelope, 'previous');
     }
     for (const file of partFiles(parts)) {
@@ -215,7 +218,7 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
     const flush = () => {
       if (!page.length) return;
       const envelope = makeEnvelope(page), serialized = JSON.stringify(envelope) + '\n';
-      if (Buffer.byteLength(serialized) > maxBytes) throw failure('COMPANY_FUND_TOO_LARGE');
+      if (Buffer.byteLength(serialized) > (page.length === 1 ? maxFundBytes : maxBytes)) throw failure('COMPANY_FUND_TOO_LARGE');
       const key = currentCompany + '-r' + sha(serialized).slice(0, 20);
       fs.writeFileSync(path.join(outputRoot, key + '.json'), serialized);
       if (page.some(fund => receiptRelevant(fund, requested, publicUrl))) receiptPages.add(key + '.json');
@@ -258,7 +261,7 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
       if (['ok', 'no-equities'].includes(fund.status)) for (const code of fund.sourcePortfolioCode && publicUrl(fund.portfolioSourceUrl) ? fund.shareClassCodes : [fund.code]) available.add(code);
       const size = Buffer.byteLength(JSON.stringify(fund)) + 1;
       if (page.length && (page.length >= maxFunds || bytes + size > maxBytes)) { flush(); bytes = Buffer.byteLength(JSON.stringify(makeEnvelope([]))) + 1024; }
-      if (bytes + size > maxBytes) throw failure('COMPANY_FUND_TOO_LARGE');
+      if (bytes + size > (page.length === 0 ? maxFundBytes : maxBytes)) throw failure('COMPANY_FUND_TOO_LARGE');
       page.push(fund); bytes += size;
     }
     flush();

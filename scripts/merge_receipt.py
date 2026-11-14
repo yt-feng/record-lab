@@ -7,9 +7,9 @@ from pathlib import Path
 import re
 import stat
 
-MAX_PAGE_BYTES = 8_000_000
+MAX_PAGE_BYTES = 25_000_000
 MAX_PAGES = 64
-MAX_TOTAL_BYTES = MAX_PAGE_BYTES * MAX_PAGES
+MAX_TOTAL_BYTES = 8_000_000 * MAX_PAGES
 MAX_FUNDS = 8192
 
 
@@ -58,6 +58,8 @@ def read_merge_receipt(path, *, read_json, error_type=ValueError):
                 or not previous_code < page['firstCode'] <= page['lastCode']):
             fail()
         count += page['fundCount']; size += page['byteLength']; previous_code = page['lastCode']
+        if page['byteLength'] > 8_000_000 and page['fundCount'] != 1:
+            fail()
     if count != manifest['fundCount'] or size != manifest['totalPageBytes']:
         fail()
     root_fd = page_fd = None

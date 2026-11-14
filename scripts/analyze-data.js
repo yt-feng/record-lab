@@ -212,18 +212,19 @@ function appendValue(stock, field, value, coverage) {
 }
 
 function boundedParts(kind, field, items, prefix, phase, limit, writePart, onPart) {
+  const singleLimit = limit === PART_LIMIT ? INDEX_LIMIT : limit;
   let part = [], bytes = 200, index = 0;
   const flush = () => {
     if (!part.length) return;
     const file = `./analysis/${prefix}-${String(index++).padStart(4, '0')}.json`;
     const document = { schemaVersion: 1, kind, generation: phase.generation,
       targetPeriodEnd: phase.target, baselinePeriodEnd: phase.baseline, [field]: part };
-    if (Buffer.byteLength(JSON.stringify(document)) > limit) fail('ANALYSIS_PART_TOO_LARGE');
+    if (Buffer.byteLength(JSON.stringify(document)) + 1 > (part.length === 1 ? singleLimit : limit)) fail('ANALYSIS_PART_TOO_LARGE');
     writePart(file, document); onPart(file, part); part = []; bytes = 200;
   };
   for (const item of items) {
     const size = Buffer.byteLength(JSON.stringify(item)) + 1;
-    if (size + 200 > limit) fail('ANALYSIS_ITEM_TOO_LARGE');
+    if (size + 200 > singleLimit) fail('ANALYSIS_ITEM_TOO_LARGE');
     if (bytes + size > limit) flush();
     part.push(item); bytes += size;
   }

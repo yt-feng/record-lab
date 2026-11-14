@@ -14,6 +14,18 @@ function setup(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   return path.join(root, 'merge-receipt.json');
 }
+test('an indivisible large fund receipt retains every byte on its own bounded page', t => {
+  const file = setup(t), original = receipt(2);
+  original.funds[0].sourceEvidence = 'x'.repeat(8_100_000);
+  writeMergeReceipt(file, original, { legacyLimit: 100 });
+  const manifest = JSON.parse(fs.readFileSync(file));
+  assert.deepEqual(manifest.fundPages.map(page => page.fundCount), [1, 1]);
+  const page = manifest.fundPages[0], raw = fs.readFileSync(path.join(path.dirname(file), page.path));
+  assert.ok(raw.length > 8_000_000 && raw.length <= 25_000_000);
+  assert.equal(raw.length, page.byteLength);
+  assert.equal(crypto.createHash('sha256').update(raw).digest('hex'), page.sha256);
+  assert.deepEqual(JSON.parse(raw).funds, [original.funds[0]]);
+});
 test('small receipts retain exact legacy bytes; paged receipts preserve all rows and metadata', t => {
   const file = setup(t), original = receipt(6);
   writeMergeReceipt(file, original);

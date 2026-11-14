@@ -28,6 +28,19 @@ function snapshot(codes = ['000001'], { retrievedAt = '2026-09-29T10:00:00Z', ov
 }
 const merge = changes => mergeSnapshots({ catalog, config, now, ...changes });
 
+test('one intact large portfolio gets an isolated page within the publication hard bound', () => {
+  const big = { code: '000001', sourceEvidence: 'x'.repeat(8_100_000) };
+  const small = { code: '000002', sourceEvidence: 'synthetic' };
+  const envelope = funds => ({ schemaVersion: 1, funds });
+  const pages = splitCompanyFunds([big, small, big], envelope);
+  assert.deepEqual(pages.map(items => items.length), [1, 1, 1]);
+  assert.strictEqual(pages[0][0], big);
+  assert.ok(Buffer.byteLength(JSON.stringify(envelope(pages[0]))) > 8_000_000);
+  assert.ok(pages.every(items => Buffer.byteLength(JSON.stringify(envelope(items))) + 1 <= 25_000_000));
+  assert.throws(() => splitCompanyFunds([{ code: '000003', sourceEvidence: 'x'.repeat(25_000_000) }], envelope),
+    /COMPANY_FUND_TOO_LARGE/);
+});
+
 test('publishes company envelopes and a small manifest with catalog coverage', () => {
   const result = merge({ snapshots: [snapshot(['000001', '000003'])] });
   assert.equal(result.changed, true);

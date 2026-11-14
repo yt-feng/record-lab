@@ -23,6 +23,9 @@ const CODE = /^\d{6}$/;
 const COMPANY = /^[A-Za-z0-9_-]{1,40}$/;
 const COMPANY_FILE = /^[A-Za-z0-9_-]{1,64}$/;
 const MAX_COMPANY_BYTES = 8_000_000;
+// A single portfolio's retained witnesses cannot be split into partial funds.
+// Use the existing publication object's hard bound for that isolated page.
+const MAX_COMPANY_FUND_BYTES = 25_000_000;
 const MAX_COMPANY_FUNDS = 100;
 const timestamp = value => typeof value === 'string'
   && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
@@ -352,7 +355,9 @@ function observationDates(funds) {
     retrievedAt: funds.length ? [...funds].sort((a, b) => Date.parse(b.retrievedAt) - Date.parse(a.retrievedAt))[0].retrievedAt : null };
 }
 
-function splitCompanyFunds(funds, makeEnvelope, { maxBytes = MAX_COMPANY_BYTES, maxFunds = MAX_COMPANY_FUNDS } = {}) {
+function splitCompanyFunds(funds, makeEnvelope, limits = {}) {
+  const { maxBytes = MAX_COMPANY_BYTES, maxFunds = MAX_COMPANY_FUNDS,
+    maxFundBytes = limits.maxBytes === undefined ? MAX_COMPANY_FUND_BYTES : maxBytes } = limits;
   const pages = [];
   let page = [];
   const overhead = Buffer.byteLength(JSON.stringify(makeEnvelope([]))) + 1024;
@@ -366,10 +371,11 @@ function splitCompanyFunds(funds, makeEnvelope, { maxBytes = MAX_COMPANY_BYTES, 
     }
     page.push(fund);
     bytes += size;
-    if (bytes > maxBytes) throw new MergeError('COMPANY_FUND_TOO_LARGE');
+    if (bytes > (page.length === 1 ? maxFundBytes : maxBytes)) throw new MergeError('COMPANY_FUND_TOO_LARGE');
   }
   if (page.length) pages.push(page);
-  if (pages.some(items => Buffer.byteLength(JSON.stringify(makeEnvelope(items))) + 1 > maxBytes)) throw new MergeError('COMPANY_FUND_TOO_LARGE');
+  if (pages.some(items => Buffer.byteLength(JSON.stringify(makeEnvelope(items))) + 1
+    > (items.length === 1 ? maxFundBytes : maxBytes))) throw new MergeError('COMPANY_FUND_TOO_LARGE');
   return pages;
 }
 
@@ -738,7 +744,9 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
   receipt.strategyClaims = strategyResults;
   // No new observation means no fabricated new timestamp or overwritten old files.
   const needsRepartition = Object.values(previousCompanies).some(item => item.funds?.length > (pageLimits?.maxFunds || MAX_COMPANY_FUNDS)
-    || Buffer.byteLength(JSON.stringify(item)) + 1 > (pageLimits?.maxBytes || MAX_COMPANY_BYTES));
+    || Buffer.byteLength(JSON.stringify(item)) + 1 > (item.funds?.length === 1
+      ? pageLimits?.maxFundBytes || (pageLimits?.maxBytes || MAX_COMPANY_FUND_BYTES)
+      : pageLimits?.maxBytes || MAX_COMPANY_BYTES));
   if (!acceptedFreshFundCount && !acceptedPricePatchCount && !acceptedInceptionPatchCount && !acceptedStrategyClaimsPatchCount && !reusedFunds.length && !migratedBootstrapFundCount && !needsRepartition && previousManifest) {
     return { changed: false, manifest: previousManifest, companySnapshots: {},
       receipt, counts: { acceptedFreshFundCount: 0, acceptedPricePatchCount: 0, acceptedInceptionPatchCount: 0, acceptedStrategyClaimsPatchCount: 0, ...reuseCounts,
@@ -845,7 +853,8 @@ function mergeFiles(options) {
     reuseAcrossComponents: options.reuseAcrossComponents !== false,
     receiptCodes: options.receiptCodes || statusCodes(options.parts), engine: mergeSnapshots,
     helpers: { readJson, validEnvelope, coverageFor, observationDates, recoverPrice, writeAtomic, finalObservation,
-      publicUrl, catalogDetails, maxCompanyBytes: MAX_COMPANY_BYTES, maxCompanyFunds: MAX_COMPANY_FUNDS } });
+      publicUrl, catalogDetails, maxCompanyBytes: MAX_COMPANY_BYTES, maxCompanyFundBytes: MAX_COMPANY_FUND_BYTES,
+      maxCompanyFunds: MAX_COMPANY_FUNDS } });
 }
 
 function main(argv = process.argv.slice(2)) {

@@ -71,6 +71,20 @@ function equivalent(state, snapshots, options = {}) {
   return result;
 }
 
+test('disk merge isolates an intact oversized portfolio and a replay leaves publication unchanged', t => {
+  const state = setup(t), options = { pageLimits: { maxBytes: 2000, maxFundBytes: 100000 } };
+  const result = equivalent(state, [snapshot('000001'), snapshot('000002')], options);
+  assert.equal(result.manifest.companyFiles.length, 2);
+  for (const file of result.manifest.companyFiles) {
+    const raw = fs.readFileSync(path.join(state.data, 'companies', path.basename(file.path)));
+    assert.ok(raw.length > 2000 && raw.length < 100000);
+    assert.equal(JSON.parse(raw).funds.length, 1);
+  }
+  const previous = fs.readFileSync(path.join(state.data, 'latest.json'));
+  assert.equal(equivalent(state, [], options).changed, false);
+  assert.deepEqual(fs.readFileSync(path.join(state.data, 'latest.json')), previous);
+});
+
 test('disk pipeline matches ordinary merging across companies, unknown mapping and repeated observations', t => {
   const state = setup(t);
   equivalent(state, [snapshot('000001'), snapshot('000003'), snapshot('000004')]);
