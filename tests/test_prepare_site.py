@@ -1,5 +1,6 @@
 """Deploy only referenced partitions without pruning or rewriting the source."""
 import gzip
+import hashlib
 import importlib.util
 import io
 import json
@@ -27,6 +28,98 @@ def tree(root):
 
 
 class PrepareSitePartitionTests(unittest.TestCase):
+    def accounting_scope(self, root, quarter='2026Q3', outcome='returned', count=200):
+        import campaign_accounting as accounting
+        import request_receipts as receipts
+        target, baseline, start = ('2026-06-30', '2026-03-31', '2026-04-01') if quarter == '2026Q2' else (
+            '2026-09-30', '2026-06-30', '2026-07-01')
+        phase = {'targetPeriodEnd': target, 'baselinePeriodEnd': baseline}
+        config = {'quarter': quarter, **phase, 'funds': [{'code': '000001'}],
+            'traversal': {'phase': phase, 'batchId': '0', 'plannedAt': '2026-10-26T00:00:00Z'}}
+        env = {'GITHUB_RUN_ID': '100', 'GITHUB_RUN_ATTEMPT': '1', 'GITHUB_SHA': 'a' * 40, 'RECEIPT_BATCH_ID': '0'}
+        capture = root / 'capture'
+        write(capture / 'plan/batch-0.json', config)
+        config_raw = (capture / 'plan/batch-0.json').read_bytes()
+        journal = receipts.RequestJournal(capture / 'private', config, config_raw, env)
+        for index in range(count):
+            code = str(600000 + index)
+            observer = journal.observer('CN:' + code, (code, 'CN', start, target))
+            token = observer.begin('https://push2his.eastmoney.com/api/qt/stock/kline/get')
+            if outcome != 'unknown' or index != count - 1: observer.finish(token, 'returned')
+        if outcome != 'unknown': journal.close(True)
+        receipt = receipts.encoded(receipts.validate(capture / 'private', config, config_raw, env))
+        write(capture / 'receipts/request-accounting-100-1-0/receipts.json', receipt)
+        matrix = [{'id': '0', 'config': 'batch-0.json', 'quarter': quarter}]
+        rows = accounting.collect_batch_accounting(matrix, capture / 'plan', capture / 'receipts', env)[quarter]
+        folder = root / 'web/data/periods' / quarter
+        accounting.persist_accounting(folder, quarter, rows)
+        return folder, receipt
+
+    def test_accounting_receipts_fit_by_compression_and_round_trip_hashes_clocks_and_unknowns(self):
+        for quarter in ('2026Q2', '2026Q3'):
+            for outcome in ('returned', 'unknown'):
+                with self.subTest(quarter=quarter, outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    folder, receipt = self.accounting_scope(root, quarter, outcome)
+                    source, output = root / 'web', root / 'site'
+                    before = tree(source)
+                    original = json.loads((folder / 'market-accounting.json').read_bytes())
+                    result = site.prepare(source, output, max_bytes=len(receipt) // 2)
+                    self.assertEqual(tree(source), before)
+                    self.assertEqual(result['compressedAccountingFiles'], 1)
+                    packed_folder = output / 'data/periods' / quarter
+                    packed = json.loads((packed_folder / 'market-accounting.json').read_bytes())
+                    row = packed['entries'][0]
+                    self.assertEqual(row['receiptPath'], original['entries'][0]['receiptPath'] + '.gz')
+                    self.assertFalse((packed_folder / original['entries'][0]['receiptPath']).exists())
+                    restored = gzip.decompress((packed_folder / row['receiptPath']).read_bytes())
+                    self.assertEqual(restored, receipt)
+                    self.assertEqual(hashlib.sha256(restored).hexdigest(), row['receiptSha256'])
+                    row['receiptPath'] = row['receiptPath'][:-3]
+                    self.assertEqual(packed, original)
+                    self.assertEqual(row['counts']['unknown'], 1 if outcome == 'unknown' else 0)
+                    self.assertEqual(row['status'], 'incomplete' if outcome == 'unknown' else 'complete')
+
+    def test_accounting_missing_changed_or_cross_scope_proofs_fail_before_output(self):
+        for damage in ('missing', 'changed', 'quarter', 'path'):
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                folder, receipt = self.accounting_scope(root, count=1)
+                index = folder / 'market-accounting.json'
+                value = json.loads(index.read_bytes())
+                proof = folder / value['entries'][0]['receiptPath']
+                if damage == 'missing': proof.unlink()
+                elif damage == 'changed': proof.write_bytes(receipt + b' ')
+                elif damage == 'quarter': value['quarter'] = '2026Q2'; write(index, value)
+                else: value['entries'][0]['receiptPath'] = '../2026Q2/market-accounting/100-1-0.json'; write(index, value)
+                before, output = tree(root / 'web'), root / 'site'
+                with self.assertRaisesRegex(ValueError, 'INVALID_SITE_ACCOUNTING'):
+                    site.prepare(root / 'web', output)
+                self.assertFalse(output.exists())
+                self.assertEqual(tree(root / 'web'), before)
+
+    def test_accounting_unresolved_entries_and_unindexed_files_are_retained(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder, _ = self.accounting_scope(root, count=1)
+            index = folder / 'market-accounting.json'
+            original = json.loads(index.read_bytes())
+            row = original['entries'][0]
+            (folder / row['receiptPath']).unlink()
+            row.update(status='missing', counts=None, receiptPath=None, receiptSha256=None, errorCode='MARKET_RECEIPT_MISSING')
+            invalid = {**row, 'batchId': '1', 'status': 'invalid', 'errorCode': 'MARKET_RECEIPT_INVALID'}
+            original['entries'].append(invalid)
+            write(index, original)
+            write(folder / 'market-accounting/legacy.json', {'unindexedPublicRecord': True})
+            before = tree(root / 'web')
+            result = site.prepare(root / 'web', root / 'site')
+            packed_folder = root / 'site/data/periods/2026Q3'
+            self.assertEqual(result['compressedAccountingFiles'], 0)
+            self.assertEqual(json.loads((packed_folder / 'market-accounting.json').read_bytes()), original)
+            self.assertEqual((packed_folder / 'market-accounting/legacy.json').read_bytes(),
+                (folder / 'market-accounting/legacy.json').read_bytes())
+            self.assertEqual(tree(root / 'web'), before)
+
     def scope(self, folder, label):
         company = {'retrievedAt': '2026-10-28T10:00:00.123456Z', 'funds': [{'code': '000001', 'scope': label}]}
         write(folder / 'companies/co1-current.json', company)
@@ -236,6 +329,7 @@ class PrepareSitePartitionTests(unittest.TestCase):
 
     def test_cli_reports_fixed_failure_categories_without_exception_details(self):
         for error, reason in ((ValueError('SITE_SIZE_EXCEEDED'), 'SITE_SIZE_EXCEEDED'),
+                              (ValueError('INVALID_SITE_ACCOUNTING'), 'INVALID_SITE_ACCOUNTING'),
                               (OSError(28, 'private source details'), 'SITE_IO_FAILED'),
                               (ValueError('private source details'), None)):
             with self.subTest(reason=reason), patch.object(site, 'ensure_analyses', return_value=0), \
