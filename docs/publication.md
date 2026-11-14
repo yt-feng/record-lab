@@ -11,3 +11,9 @@ run `Validate records` manually on `main` with `publish_site=true`. It checks th
 saved snapshot, site package, and complete publication history before deploying.
 This operation shares the publication writer lock and makes no collection or
 market-data requests. Ordinary validation runs never deploy.
+
+The site package losslessly gzips the market request receipts after verifying
+their stored SHA-256 hashes. Its accounting indexes advertise `.json.gz` receipt
+paths; `receiptSha256` continues to identify the decompressed original bytes.
+Stored source indexes and receipts retain their original bytes, timestamps,
+counts, and unresolved outcomes. The site package remains bounded to 900 MB.
