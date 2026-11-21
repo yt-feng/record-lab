@@ -23,7 +23,8 @@ env:
 jobs:
   resume:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # Replaying saved batches still runs the full merge, verification and Pages deployment.
+    timeout-minutes: 300
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
