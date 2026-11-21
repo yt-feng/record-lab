@@ -29,7 +29,9 @@ env:
 jobs:
   plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # Recent runs used nearly 38 minutes before verifying the plan and
+    # archiving it. Leave time for both steps on the full repository.
+    timeout-minutes: 65
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       has_work: ${{ steps.plan.outputs.has_work }}
@@ -202,9 +204,9 @@ jobs:
       group: published-records
       cancel-in-progress: false
     runs-on: ubuntu-latest
-    # A measured two-quarter merge exceeded 60 minutes before publication.
-    # Include analysis, history validation and deployment in this bound.
-    timeout-minutes: 180
+    # A recent single-quarter merge and reconciliation took 159 minutes.
+    # Leave time for analysis, full history validation and Pages deployment.
+    timeout-minutes: 300
     permissions:
       contents: write
       pages: write
