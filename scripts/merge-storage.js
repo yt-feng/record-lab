@@ -9,7 +9,7 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 const { checkpoint: mergeCheckpoint, capture: captureMergeFailure } = require('../lib/merge-diagnostics');
 const { createPriceIndex, addPriceSources, applyPriceIndex } = require('../lib/reuse-prices');
-const { writeMergeReceipt } = require('../lib/merge-receipt');
+const { writeMergeReceipt, receiptRelevant } = require('../lib/merge-receipt');
 const CODE = /^\d{6}$/;
 const COMPANY_FILE = /^[A-Za-z0-9_-]{1,64}$/;
 const ADDITIVE = ['fundCount', 'holdingCount', 'priceAvailable', 'priceComplete', 'narrativeCount',
@@ -18,15 +18,6 @@ const ADDITIVE = ['fundCount', 'holdingCount', 'priceAvailable', 'priceComplete'
 const LIMIT = 128_000_000;
 const sha = value => crypto.createHash('sha256').update(value).digest('hex');
 const failure = code => Object.assign(new Error(code), { code });
-
-function receiptRelevant(fund, requested, publicUrl) {
-  // Match finalObservation's share-class projection before doing its holdings,
-  // calendar and conflict work. The engine already validates every component.
-  const codes = fund.notApplicableEvidence && !fund.selectedReport ? [fund.code]
-    : fund.sourcePortfolioCode && publicUrl(fund.portfolioSourceUrl) ? fund.shareClassCodes : [fund.code];
-  // Preserve the original validation/error path for unexpected legacy shapes.
-  return !Array.isArray(codes) || codes.some(code => requested.has(code));
-}
 
 function partFiles(root) {
   const files = [];
@@ -159,6 +150,7 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
       if (group.bytes > componentLimit) throw failure('MERGE_COMPONENT_TOO_LARGE');
     }
     const priceIndex = createPriceIndex(config, current);
+    const validation = priceIndex.validation;
     const funds = [], receipt = { schemaVersion: 1, phase: { targetPeriodEnd: config.targetPeriodEnd, baselinePeriodEnd: config.baselinePeriodEnd },
       generatedAt: current.toISOString(), requestedCodes: [...requested].sort(), funds: [], pricePatches: [], strategyClaims: [] };
     const counts = { acceptedFreshFundCount: 0, acceptedPricePatchCount: 0, acceptedInceptionPatchCount: 0, acceptedStrategyClaimsPatchCount: 0,
@@ -192,7 +184,7 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
         // Component-local bootstrap is null for ordinary persisted pages.
         // Keep the outer manifest's provenance without passing that global
         // manifest into a component's no-change/output decision.
-        preservePersisted: Boolean(previousManifest),
+        preservePersisted: Boolean(previousManifest), priceValidation: validation,
         receiptCodes: group.codes.filter(code => requested.has(code)), pageLimits, reusePrices: false,
         onSourceFunds: reuseAcrossComponents ? values => addPriceSources(priceIndex, values) : null });
       for (const key of ['acceptedFreshFundCount', 'acceptedPricePatchCount', 'acceptedInceptionPatchCount', 'acceptedStrategyClaimsPatchCount', 'migratedBootstrapFundCount']) counts[key] += result.counts[key] || 0;
@@ -251,10 +243,10 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
         companies.set(currentCompany, { name: companyName, fundCount: 0, holdingCount: 0, partCount: 0 });
         makeEnvelope = values => ({ schemaVersion: 1, ...observationDates(values), sourceMode: 'actions',
           targetPeriodEnd: config.targetPeriodEnd || null, baselinePeriodEnd: config.baselinePeriodEnd || null,
-          company: { code: currentCompany, name: companyName }, coverage: coverageFor(values, directory, config, expected), funds: values, errors: [] });
+          company: { code: currentCompany, name: companyName }, coverage: coverageFor(values, directory, config, expected, validation), funds: values, errors: [] });
         bytes = Buffer.byteLength(JSON.stringify(makeEnvelope([]))) + 1024;
       }
-      const coverage = coverageFor([fund], directory, config);
+      const coverage = coverageFor([fund], directory, config, undefined, validation);
       ADDITIVE.forEach(key => { totalCoverage[key] += coverage[key]; });
       const company = companies.get(currentCompany); company.fundCount++; company.holdingCount += coverage.holdingCount;
       dates.push({ asOf: fund.asOf, retrievedAt: fund.retrievedAt, priceUpdatedAt: fund.priceUpdatedAt });
@@ -294,7 +286,7 @@ function mergeOnDisk({ parts, data, catalog, config, previousManifest, receiptCo
       const envelope = readJson(path.join(outputRoot, path.basename(file.path)));
       for (const fund of envelope.funds) {
         if (!receiptRelevant(fund, requested, publicUrl)) continue;
-        const item = helpers.finalObservation(fund);
+        const item = helpers.finalObservation(fund, validation);
         for (const code of item.shareClassCodes) if (requested.has(code)) observations.set(code, { code, ...item });
       }
     }

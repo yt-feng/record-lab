@@ -5,6 +5,8 @@ const { conflictFor, normalizeConflict, normalizeFact } = require('../lib/price-
 const { priceRange } = require('../lib/fund-analysis');
 const { calendar, expectedSessions } = require('../lib/price-coverage');
 const { createPriceIndex, addPriceSources, applyPriceIndex } = require('../lib/reuse-prices');
+const { effectiveReference, normalizeReference } = require('../lib/price-range-reference');
+const referenceFixture = require('./price-reference-fixture');
 const NOW = '2026-10-27T02:00:00Z', FETCHED = '2026-10-27T01:00:00Z';
 const phase = { targetPeriodEnd: '2026-06-30', baselinePeriodEnd: '2026-03-31' };
 const identity = { market: 'CN', stockCode: '600001', currency: 'CNY', rangeStart: '2026-04-01', rangeEnd: phase.targetPeriodEnd, calendarId: calendar.id };
@@ -93,4 +95,28 @@ test('complete shared index results are identical with validation cache disabled
   // A fresh index never borrows a proof whose observation is future at its clock.
   const earlier = createPriceIndex(phase, '2026-10-27T00:00:00Z'); addPriceSources(earlier, make(1));
   assert.equal(earlier.entries.size, 0);
+});
+
+test('repeated stored references reuse validation without trusting an unchanged digest or a different clock', () => {
+  const fixture = referenceFixture.fixture();
+  const cache = createPriceValidationCache(fixture.now);
+  const range = { ...fixture.prices[1], globalPriceConflict: fixture.witness, rangeReference: fixture.reference };
+  const expected = effectiveReference(range, fixture.identity, fixture.now);
+  assert.ok(expected);
+  for (let i = 0; i < 12; i++) {
+    assert.deepEqual(effectiveReference(structuredClone(range), { ...fixture.identity }, fixture.now, cache), expected);
+  }
+  assert.equal(cache.stats().checks, 3);
+  assert.equal(cache.stats().hits, 33);
+  const invalid = structuredClone(fixture.reference);
+  invalid.facts[0].price.high += 1;
+  assert.equal(invalid.factSetDigest, fixture.reference.factSetDigest);
+  assert.equal(normalizeReference(invalid, fixture.identity, fixture.now), null);
+  assert.equal(cache.normalizeReference(invalid, fixture.identity), null);
+  assert.equal(cache.normalizeReference(fixture.reference, { ...fixture.identity, stockCode: '600002' }), null);
+  const earlier = createPriceValidationCache('2026-10-27T00:00:00Z');
+  assert.equal(earlier.normalizeReference(fixture.reference, fixture.identity), null);
+  const result = cache.normalizeReference(fixture.reference, fixture.identity);
+  result.facts[0].price.high += 1;
+  assert.deepEqual(cache.normalizeReference(fixture.reference, fixture.identity), fixture.reference);
 });

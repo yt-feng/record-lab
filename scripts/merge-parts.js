@@ -11,11 +11,13 @@ const { verifiedReportManagers, normalizeManagers, evidenceFor, managerKey, mana
 const { strategySectionCoverageFor, strategyAnalysisFor } = require('../lib/strategy-sections');
 const { retainStrategyClaims, strategyClaimsFor } = require('../lib/strategy-claims');
 const strategyClaimPatches = require('../lib/strategy-claim-patches');
-const { VERSION: PRICE_COVERAGE_VERSION, calendar, validCompletePrice, validUsableCompletePrice, validUsableCompleteQuarterPrice, retainedCoverage } = require('../lib/price-coverage');
+const { VERSION: PRICE_COVERAGE_VERSION, calendar, validCompletePrice, validUsableCompleteQuarterPrice, retainedCoverage } = require('../lib/price-coverage');
 const { normalizeConflict } = require('../lib/price-consistency');
-const { effectivePriceRange, effectiveReference, unresolvedConflict, resolutionFor } = require('../lib/price-range-reference');
+const { effectiveReference } = require('../lib/price-range-reference');
+const { createPriceValidationCache } = require('../lib/price-validation-cache');
 const { bindingFor, validPatch, canReplacePrice, key: priceKey } = require('../lib/price-patches');
 const { reuseCompletePrices } = require('../lib/reuse-prices');
+const { receiptRelevant } = require('../lib/merge-receipt');
 const { normalizePortfolioIdentity, retainPortfolioIdentity } = require('../lib/portfolio-identity');
 const { chinaDate } = require('../web/source-dates');
 
@@ -49,7 +51,7 @@ function validEnvelope(envelope, now, config) {
     && (!config.targetPeriodEnd || !envelope.targetPeriodEnd || envelope.targetPeriodEnd === config.targetPeriodEnd);
 }
 
-function recoverPrice(row, supplied, retrievedAt, now = new Date()) {
+function recoverPrice(row, supplied, retrievedAt, now = new Date(), validation) {
   if (!supplied || supplied.status !== 'observed' || supplied.priceBasis !== 'unadjusted'
     || !publicUrl(supplied.sourceUrl) || supplied.currency !== row.currency
     || supplied.rangeStart !== row.priceRange.rangeStart || supplied.rangeEnd !== row.priceRange.rangeEnd
@@ -61,7 +63,8 @@ function recoverPrice(row, supplied, retrievedAt, now = new Date()) {
     || Array.isArray(supplied.sourceUrls) && supplied.sourceUrls.some(url => !publicUrl(url))) return false;
   const fetchedAt = supplied.fetchedAt || retrievedAt;
   if (!timestamp(fetchedAt) || Date.parse(fetchedAt) > Date.parse(retrievedAt)) return false;
-  const conflict = Object.hasOwn(supplied, 'globalPriceConflict') ? normalizeConflict(supplied.globalPriceConflict,
+  const checkConflict = validation?.normalizeConflict || normalizeConflict;
+  const conflict = Object.hasOwn(supplied, 'globalPriceConflict') ? checkConflict(supplied.globalPriceConflict,
     { market: row.market, stockCode: row.stockCode, currency: row.currency, rangeStart: supplied.rangeStart,
       rangeEnd: supplied.rangeEnd, calendarId: calendar.id }, now) : null;
   if (Object.hasOwn(supplied, 'globalPriceConflict') && !conflict) return false;
@@ -73,15 +76,15 @@ function recoverPrice(row, supplied, retrievedAt, now = new Date()) {
     sourceUrls: Array.isArray(supplied.sourceUrls) ? [...new Set(supplied.sourceUrls)].slice(0, 8) : [supplied.sourceUrl],
     dataStatus: supplied.dataStatus === 'cached' ? 'cached' : 'fresh' };
   if (conflict) row.priceRange.globalPriceConflict = conflict;
-  retainRangeReference(row, supplied, now);
+  retainRangeReference(row, supplied, now, validation);
   return true;
 }
 
-function retainRangeReference(row, supplied, now) {
+function retainRangeReference(row, supplied, now, validation) {
   if (!supplied?.rangeReference) return;
   const candidate = { ...row.priceRange, rangeReference: supplied.rangeReference };
   if (effectiveReference(candidate, { market: row.market, stockCode: row.stockCode, currency: row.currency,
-    rangeStart: candidate.rangeStart, rangeEnd: candidate.rangeEnd, calendarId: calendar.id }, now)) {
+    rangeStart: candidate.rangeStart, rangeEnd: candidate.rangeEnd, calendarId: calendar.id }, now, validation)) {
     row.priceRange.rangeReference = clone(supplied.rangeReference);
   }
 }
@@ -93,7 +96,7 @@ function latestPriceTime(current, observed) {
   return currentTime === null || observedTime > currentTime ? observed : current;
 }
 
-function sanitizeFund(item, { now, config, envelope }) {
+function sanitizeFund(item, { now, config, envelope, validation }) {
   const exemption = item?.status === 'unavailable' && item?.notApplicableEvidence;
   if (!item || !CODE.test(item.code) || !['ok', 'no-equities', 'unavailable'].includes(item.status)
     || !['fresh', 'cached'].includes(item.dataStatus) || !validDate(item.asOf)
@@ -151,17 +154,19 @@ function sanitizeFund(item, { now, config, envelope }) {
     && Date.parse(item.priceUpdatedAt) <= Date.parse(envelope.priceUpdatedAt || envelope.retrievedAt)
     ? item.priceUpdatedAt : clean.retrievedAt;
   let retainedPriceTime;
+  const checkConflict = validation?.normalizeConflict || normalizeConflict;
   for (const row of clean.rows) {
     const supplied = suppliedRows.get(`${row.market}:${row.stockCode}`)?.priceRange;
-    if (recoverPrice(row, supplied, priceAt, now)) {
+    if (recoverPrice(row, supplied, priceAt, now, validation)) {
       retainedPriceTime = latestPriceTime(retainedPriceTime, row.priceRange.fetchedAt);
+      continue;
     }
-    const conflict = normalizeConflict(supplied?.globalPriceConflict,
+    const conflict = checkConflict(supplied?.globalPriceConflict,
       { market: row.market, stockCode: row.stockCode, currency: row.currency, rangeStart: row.priceRange.rangeStart,
         rangeEnd: row.priceRange.rangeEnd, calendarId: calendar.id }, now);
     // The globally witnessed key may be present on a row with no local quote.
     if (conflict) row.priceRange.globalPriceConflict = conflict;
-    retainRangeReference(row, supplied, now);
+    retainRangeReference(row, supplied, now, validation);
   }
   // A PDF refresh is not a price observation. Preserve an explicit spelling
   // only when it matches the latest quote actually retained, to microseconds.
@@ -207,25 +212,27 @@ function shouldReplace(current, candidate) {
   return true;
 }
 
-function retainPrices(candidate, old, now) {
+function retainPrices(candidate, old, now, validation) {
   if (!old?.selectedReport || !candidate.selectedReport || old.selectedReport.periodEnd !== candidate.selectedReport.periodEnd) return;
   const rows = new Map(old.rows.map(row => [`${row.market}:${row.stockCode}`, row]));
   let copiedPriceTime;
+  const checkConflict = validation?.normalizeConflict || normalizeConflict;
   for (const row of candidate.rows) {
     const prior = rows.get(`${row.market}:${row.stockCode}`)?.priceRange;
-    const conflict = normalizeConflict(prior?.globalPriceConflict,
+    const conflict = checkConflict(prior?.globalPriceConflict,
       { market: row.market, stockCode: row.stockCode, currency: row.currency, rangeStart: row.priceRange.rangeStart,
         rangeEnd: row.priceRange.rangeEnd, calendarId: calendar.id }, now);
     if (conflict) row.priceRange.globalPriceConflict = conflict;
     const complete = value => validCompletePrice(value, row.market, row.stockCode, row.priceRange.rangeStart, row.priceRange.rangeEnd);
     if (row.priceRange.status !== 'observed' || !complete(row.priceRange) && complete(prior)) {
       const bound = Date.parse(old?.priceUpdatedAt) > Date.parse(candidate.retrievedAt) ? old.priceUpdatedAt : candidate.retrievedAt;
-      if (prior && recoverPrice(row, prior, bound, now)) {
+      if (prior && recoverPrice(row, prior, bound, now, validation)) {
         row.priceRange.dataStatus = 'cached';
         copiedPriceTime = latestPriceTime(copiedPriceTime, row.priceRange.fetchedAt);
+        continue;
       }
     }
-    retainRangeReference(row, prior, now);
+    retainRangeReference(row, prior, now, validation);
   }
   if (copiedPriceTime) {
     // Preserve the original spelling of the matching clock. Do not inherit a
@@ -326,7 +333,7 @@ function retainReportEvidence(target, source, now = new Date()) {
   return changed;
 }
 
-function coverageFor(funds, directory, config, expectedCount = directory.fundCount) {
+function coverageFor(funds, directory, config, expectedCount = directory.fundCount, validation) {
   return {
     targetPeriodEnd: config.targetPeriodEnd || null, baselinePeriodEnd: config.baselinePeriodEnd || null,
     fundCount: funds.length, companyCount: new Set(funds.map(fund => fund.companyId)).size,
@@ -334,9 +341,9 @@ function coverageFor(funds, directory, config, expectedCount = directory.fundCou
     requestedFundCount: expectedCount, catalogFundCount: directory.fundCount, catalogCompanyCount: directory.companyCount,
     holdingCount: funds.reduce((sum, fund) => sum + fund.rows.filter(row => row.current).length, 0),
     priceAvailable: funds.reduce((sum, fund) => sum + fund.rows.filter(row => row.current
-      && (row.priceRange.status === 'observed' || effectiveReference(row.priceRange))).length, 0),
+      && (row.priceRange.status === 'observed' || effectiveReference(row.priceRange, undefined, undefined, validation))).length, 0),
     priceComplete: funds.reduce((sum, fund) => sum + fund.rows.filter(row => row.current && validUsableCompleteQuarterPrice(row.priceRange,
-      row.market, row.stockCode, config.targetPeriodEnd || fund.selectedReport?.periodEnd)).length, 0),
+      row.market, row.stockCode, config.targetPeriodEnd || fund.selectedReport?.periodEnd, validation)).length, 0),
     narrativeCount: funds.filter(fund => fund.narrative?.text).length,
     noEquitiesFundCount: funds.filter(fund => fund.status === 'no-equities').length,
     notApplicableFundCount: funds.filter(fund => fund.notApplicableEvidence).length,
@@ -379,7 +386,7 @@ function splitCompanyFunds(funds, makeEnvelope, limits = {}) {
   return pages;
 }
 
-function finalObservation(fund) {
+function finalObservation(fund, validation) {
   if (fund.notApplicableEvidence && !fund.selectedReport) return {
     representativeCode: fund.code, companyCode: fund.companyId, status: 'not-applicable',
     notApplicableEvidence: clone(fund.notApplicableEvidence), observedAt: fund.retrievedAt,
@@ -393,19 +400,22 @@ function finalObservation(fund) {
   if (fund.previousReport?.periodEnd === baseline && publicUrl(fund.previousReport.sourceUrl)) {
     for (const row of fund.rows) if (row.previous) stocks.set(`${row.market}:${row.stockCode}`, { stockCode: row.stockCode, market: row.market });
   }
-  const priceIdentity = row => ({ market: row.market, stockCode: row.stockCode, currency: row.currency,
-    rangeStart: start, rangeEnd: period, calendarId: calendar.id });
-  const observed = new Set(fund.rows.filter(row => stocks.has(`${row.market}:${row.stockCode}`)
-    && (effectivePriceRange(row.priceRange, priceIdentity(row)) || row.priceRange)?.status === 'observed'
-    && row.priceRange.rangeStart === start && row.priceRange.rangeEnd === period)
-    .map(row => `${row.market}:${row.stockCode}`));
-  const complete = new Set(fund.rows.filter(row => stocks.has(`${row.market}:${row.stockCode}`) && validUsableCompletePrice(row.priceRange, row.market, row.stockCode, start, period))
-    .map(row => `${row.market}:${row.stockCode}`));
-  const conflicts = new Set(fund.rows.filter(row => stocks.has(`${row.market}:${row.stockCode}`)
-    && unresolvedConflict(row.priceRange, priceIdentity(row)))
-    .map(row => `${row.market}:${row.stockCode}`));
-  const referenceResolutions = fund.rows.filter(row => stocks.has(`${row.market}:${row.stockCode}`))
-    .map(row => resolutionFor(row.priceRange, priceIdentity(row))).filter(Boolean);
+  const observed = new Set(), complete = new Set(), conflicts = new Set(), referenceResolutions = [];
+  const checkConflict = validation?.normalizeConflict || normalizeConflict;
+  for (const row of fund.rows) {
+    const key = `${row.market}:${row.stockCode}`, price = row.priceRange;
+    if (!stocks.has(key) || !price) continue;
+    const identity = { market: row.market, stockCode: row.stockCode, currency: row.currency,
+      rangeStart: start, rangeEnd: period, calendarId: calendar.id };
+    const reference = effectiveReference(price, identity, undefined, validation);
+    const hasWitness = Object.hasOwn(price, 'globalPriceConflict');
+    if ((reference || price).status === 'observed' && price.rangeStart === start && price.rangeEnd === period) observed.add(key);
+    if (validCompletePrice(reference || (!hasWitness ? price : null), row.market, row.stockCode, start, period)) complete.add(key);
+    if (reference && hasWitness) {
+      referenceResolutions.push({ market: row.market, stockCode: row.stockCode,
+        reference: clone(reference.rangeReference), rawWitness: clone(price.globalPriceConflict) });
+    } else if (checkConflict(price.globalPriceConflict, identity)) conflicts.add(key);
+  }
   const conflictingStocks = [...conflicts].sort().map(key => stocks.get(key));
   const missingStocks = [...stocks.keys()].sort().filter(key => !complete.has(key) && !conflicts.has(key)).map(key => stocks.get(key));
   const reportEvidence = { sourceUrl: fund.selectedReport.sourceUrl, periodEnd: fund.selectedReport.periodEnd,
@@ -422,10 +432,11 @@ function finalObservation(fund) {
     shareClassCodes: fund.sourcePortfolioCode && publicUrl(fund.portfolioSourceUrl) ? fund.shareClassCodes : [fund.code] };
 }
 
-function mergeReceipt(funds, codes, config, now, attempts = new Map()) {
+function mergeReceipt(funds, codes, config, now, attempts, validation) {
   const observations = new Map();
   for (const fund of funds) {
-    const item = finalObservation(fund);
+    if (!receiptRelevant(fund, codes, publicUrl)) continue;
+    const item = finalObservation(fund, validation);
     for (const code of item.shareClassCodes) if (codes.has(code)) observations.set(code, { code, ...item });
   }
   for (const [code, attempt] of attempts) {
@@ -516,10 +527,11 @@ function preserveUnrequestedPortfolioIdentity(funds, previousByCode, requestedCo
 }
 
 function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManifest = null, catalog,
-  config = {}, now = new Date(), receiptCodes = [], pageLimits, reusePrices = true, onSourceFunds = null,
+  config = {}, now = new Date(), receiptCodes = [], pageLimits, reusePrices = true, onSourceFunds = null, priceValidation,
   preservePersisted = Boolean(previousManifest) } = {}) {
   const currentTime = now instanceof Date ? now : new Date(now);
   if (!Number.isFinite(currentTime.getTime())) throw new MergeError('MERGE_FAILED');
+  const validation = priceValidation || createPriceValidationCache(currentTime);
   let directory;
   try { directory = catalogDetails(catalog); } catch { throw new MergeError('INVALID_CATALOG'); }
   if (!directory.known) throw new MergeError('INVALID_CATALOG');
@@ -553,7 +565,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
     && validEnvelope(previousManifest, currentTime, config);
   if (hasBootstrap) {
     for (const item of previousManifest.funds) {
-      const fund = sanitizeFund(item, { now: currentTime, config, envelope: previousManifest });
+      const fund = sanitizeFund(item, { now: currentTime, config, envelope: previousManifest, validation });
       if (!fund) { addError('INVALID_FUND'); continue; }
       if (!mapCompany(fund, directoryMap)) { addError('CATALOG_IDENTITY_MISMATCH'); continue; }
       if (!byCode.has(fund.code)) {
@@ -572,7 +584,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
           persistedByCode.set(item.code, clone(item));
         }
       }
-      let fund = sanitizeFund(item, { now: currentTime, config, envelope });
+      let fund = sanitizeFund(item, { now: currentTime, config, envelope, validation });
       if (!fund) { addError('INVALID_FUND'); continue; }
       // Re-normalizing a persisted observation may derive a price clock from
       // an already-observed row when the old record intentionally had no
@@ -611,23 +623,23 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
     if (!validEnvelope(envelope, currentTime, config)) { addError('INVALID_PART'); continue; }
     for (const item of envelope.funds) {
       if (item?.dataStatus !== 'fresh') continue;
-      let fund = sanitizeFund(item, { now: currentTime, config, envelope });
+      let fund = sanitizeFund(item, { now: currentTime, config, envelope, validation });
       if (!fund) { addError('INVALID_FUND'); continue; }
       if (!mapCompany(fund, directoryMap)) { addError('CATALOG_IDENTITY_MISMATCH'); continue; }
       const old = byCode.get(fund.code);
       if (!shouldReplace(old, fund)) {
         if (old && retainReportEvidence(old, fund, currentTime)) {
-          const rebuilt = sanitizeFund(old, { now: currentTime, config,
+          const rebuilt = sanitizeFund(old, { now: currentTime, config, validation,
             envelope: { asOf: old.asOf, retrievedAt: old.retrievedAt, priceUpdatedAt: old.priceUpdatedAt } });
           if (rebuilt) { byCode.set(old.code, rebuilt); acceptedFreshFundCount += 1; }
         }
         continue;
       }
       if (retainReportEvidence(fund, old, currentTime)) {
-        fund = sanitizeFund(fund, { now: currentTime, config, envelope });
+        fund = sanitizeFund(fund, { now: currentTime, config, envelope, validation });
         if (!fund) continue;
       }
-      retainPrices(fund, old, currentTime);
+      retainPrices(fund, old, currentTime, validation);
       byCode.set(fund.code, fund);
       acceptedFreshFundCount += 1;
     }
@@ -667,7 +679,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
         const row = rows.get(priceKey(update));
         if (!row || !canReplacePrice(row.priceRange, update.priceRange, row, config)) continue;
         const before = JSON.stringify(row.priceRange);
-        if (recoverPrice(row, update.priceRange, envelope.retrievedAt) && JSON.stringify(row.priceRange) !== before) {
+        if (recoverPrice(row, update.priceRange, envelope.retrievedAt, currentTime, validation) && JSON.stringify(row.priceRange) !== before) {
           fund.priceUpdatedAt = [fund.priceUpdatedAt, row.priceRange.fetchedAt].filter(timestamp).sort((a, b) => Date.parse(a) - Date.parse(b)).at(-1);
           adopted++;
         }
@@ -726,7 +738,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
     const changed = retainStrategyClaims(candidate.selectedReport, patches[0].report, { code: task.code, now: currentTime, asOf: candidate.asOf });
     if (!changed) { result.accepted = result.scanned; continue; }
     candidate.narrative = clone(candidate.selectedReport.narrative);
-    const rebuilt = sanitizeFund(candidate, { now: currentTime, config,
+    const rebuilt = sanitizeFund(candidate, { now: currentTime, config, validation,
       envelope: { asOf: fund.asOf, retrievedAt: fund.retrievedAt, priceUpdatedAt: fund.priceUpdatedAt } });
     const admitted = rebuilt && strategyClaimsFor(rebuilt.selectedReport, { code: task.code, now: currentTime, asOf: rebuilt.asOf });
     if (!admitted || admitted.source.digest !== task.analysisDigest) {
@@ -739,7 +751,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
     { phase: config, now: currentTime, recoverPrice, sourceFunds }) : {
       mutatedFunds: [], reusedPriceRowCount: 0, reusedPriceFundCount: 0, eligiblePriceKeyCount: 0,
       conflictingPriceKeyCount: 0, partialConflictRowCount: 0, conflictMarkedRowCount: 0, conflictMarkedFundCount: 0, conflictingPriceRowCount: 0 };
-  const receipt = mergeReceipt(funds, requestedCodes, config, currentTime, attempts);
+  const receipt = mergeReceipt(funds, requestedCodes, config, currentTime, attempts, validation);
   receipt.pricePatches = priceResults;
   receipt.strategyClaims = strategyResults;
   // No new observation means no fabricated new timestamp or overwritten old files.
@@ -770,9 +782,9 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
     const makeEnvelope = page => ({ schemaVersion: 1, ...observationDates(page), sourceMode: 'actions',
       targetPeriodEnd: config.targetPeriodEnd || null, baselinePeriodEnd: config.baselinePeriodEnd || null,
       company: { code: companyCode, name: companyName },
-      coverage: coverageFor(page, directory, config, expected), funds: page, errors: [] });
+      coverage: coverageFor(page, directory, config, expected, validation), funds: page, errors: [] });
     const pages = splitCompanyFunds(companyFunds, makeEnvelope, pageLimits);
-    const companyHoldingCount = coverageFor(companyFunds, directory, config, expected).holdingCount;
+    const companyHoldingCount = companyFunds.reduce((count, fund) => count + fund.rows.filter(row => row.current).length, 0);
     for (const [index, page] of pages.entries()) {
       const key = pages.length === 1 ? companyCode : `${companyCode}-part${index + 1}`;
       companySnapshots[key] = makeEnvelope(page);
@@ -798,7 +810,7 @@ function mergeSnapshots({ snapshots = [], previousCompanies = {}, previousManife
       status: expected === null ? 'directory-incomplete' : !available ? 'unavailable' : available < expected ? 'partial' : 'available' });
   }
   const dates = observationDates(funds);
-  const coverage = coverageFor(funds, directory, config);
+  const coverage = coverageFor(funds, directory, config, undefined, validation);
   coverage.catalogAvailableFundCount = directory.funds.filter(fund => availableCodes.has(fund.code)).length;
   coverage.unmatchedCompanyFundCount = buckets.get('unknown')?.length || 0;
   coverage.status = funds.length ? 'partial' : 'awaiting-data';
