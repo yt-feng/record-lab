@@ -368,7 +368,7 @@ function analyzeQuarter(manifest, loadCompany, { progress = null, writePart = ()
         const entry = prices.entries.get(priceKey);
         const candidate = entry?.reference ? { ...row.priceRange, rangeReference: entry.reference } : row.priceRange;
         // Both decisions use the same immutable candidate and generation clock.
-        const reference = effectiveReference(candidate, priceIdentity, currentTime);
+        const reference = effectiveReference(candidate, priceIdentity, currentTime, prices.validation);
         if (entry?.conflict || candidate && Object.hasOwn(candidate, 'globalPriceConflict')
           && !reference) stock._completePriceConflict = true;
         const effective = reference || (candidate && !Object.hasOwn(candidate, 'globalPriceConflict') ? candidate : null) || row.priceRange;

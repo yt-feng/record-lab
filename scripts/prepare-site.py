@@ -1,6 +1,7 @@
-"""Publish bounded gzip partitions without mirroring multi-GB raw snapshots."""
+"""Package the site with gzip data and links to committed company partitions."""
 import argparse
 import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,9 @@ ANALYSIS_PATH = re.compile(r'^\./analysis/(details-(?:portfolios-)?\d+\.json)$')
 COMPANY_FILE = re.compile(r'^[A-Za-z0-9_-]{1,64}\.json$')
 ANALYSIS_FILE = re.compile(r'^details-(?:portfolios-)?\d+\.json$')
 METADATA_FILES = ('catalog.json', 'progress.json')
+PUBLIC_REPOSITORY = 'yt-feng/record-lab'
+REPOSITORY_COMPANY = re.compile(rb'web/data/(?:periods/2026Q[23]/)?companies/[A-Za-z0-9_-]{1,64}\.json\Z')
+GIT_ID = re.compile(rb'[0-9a-f]{40}\Z')
 PUBLIC_ERRORS = frozenset({
     'ANALYSIS_REQUIRES_ACTIONS', 'INVALID_ANALYSIS_PERIOD',
     'SITE_PUBLICATION_REJECTED', 'INVALID_SITE_MANIFEST',
@@ -22,7 +26,7 @@ PUBLIC_ERRORS = frozenset({
     'INVALID_ANALYSIS_PATH', 'MISSING_ANALYSIS_PART',
     'SITE_SYMLINK', 'SITE_SOURCE_MISSING', 'SITE_OUTPUT_EXISTS',
     'SITE_OUTPUT_INSIDE_SOURCE', 'SITE_FILE_TYPE', 'SITE_SIZE_EXCEEDED', 'INVALID_SITE_PERIODS',
-    'INVALID_SITE_ACCOUNTING',
+    'INVALID_SITE_ACCOUNTING', 'INVALID_SITE_SNAPSHOT',
 })
 
 
@@ -64,7 +68,30 @@ def public_bytes(root, file):
     return raw
 
 
-def current_partitions(root, files):
+def committed_company_pages(root):
+    """Bind public company objects to the exact checkout of this Pages build."""
+    try:
+        git = ['git', '-C', str(root.resolve().parent)]
+        revision = subprocess.check_output(git + ['rev-parse', '--verify', 'HEAD^{commit}'], timeout=30).strip()
+        if not GIT_ID.fullmatch(revision): raise ValueError('INVALID_SITE_SNAPSHOT')
+        tree = subprocess.check_output(git + ['ls-tree', '-r', '-z', revision.decode(), '--',
+                                                'web/data/companies', 'web/data/periods'], timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError('INVALID_SITE_SNAPSHOT') from error
+    base = f'https://raw.githubusercontent.com/{PUBLIC_REPOSITORY}/{revision.decode()}/'
+    pages = {}
+    for entry in tree.rstrip(b'\0').split(b'\0'):
+        metadata, _, name = entry.partition(b'\t')
+        if not REPOSITORY_COMPANY.fullmatch(name): continue
+        mode, kind, oid = metadata.split()
+        if mode not in (b'100644', b'100755') or kind != b'blob' or not GIT_ID.fullmatch(oid):
+            raise ValueError('INVALID_SITE_SNAPSHOT')
+        pathname = name.decode('ascii')
+        pages[root / pathname.removeprefix('web/')] = (base + pathname, oid.decode())
+    return pages
+
+
+def current_partitions(root, files, committed_pages):
     """Validate every current manifest before excluding historical partitions.
 
     Paths are relative to each manifest's own directory. This includes both
@@ -72,7 +99,7 @@ def current_partitions(root, files):
     merely because a periods manifest also exists.
     """
     available = set(files)
-    managed, referenced, manifests = {}, set(), {}
+    managed, referenced, linked, manifests = {}, set(), set(), {}
 
     def require_part(file, value, pattern, directory, invalid, missing):
         match = pattern.fullmatch(value) if isinstance(value, str) else None
@@ -81,6 +108,14 @@ def current_partitions(root, files):
         part = file.parent / directory / name
         if part not in available: raise ValueError(missing)
         referenced.add(part)
+        if directory == 'companies' and part in committed_pages:
+            url, expected = committed_pages[part]
+            raw = public_bytes(root, part)
+            blob = hashlib.sha1(f'blob {len(raw)}\0'.encode(), usedforsecurity=False)
+            blob.update(raw)
+            if blob.hexdigest() == expected:
+                linked.add(part)
+                return url
         return value + '.gz'
 
     for file in files:
@@ -123,7 +158,7 @@ def current_partitions(root, files):
         manifests[file] = (json.dumps(body, ensure_ascii=False, separators=(',', ':')) + '\n').encode()
     historical = {file for file in files if file.parent in managed
                   and managed[file.parent].fullmatch(file.name) and file not in referenced}
-    return manifests, historical, referenced
+    return manifests, historical, referenced, linked
 
 
 def metadata_partitions(root, files):
@@ -179,7 +214,7 @@ def accounting_partitions(root, files):
     return manifests, compressed
 
 
-def prepare(source='web', output='.cache/site', max_bytes=900_000_000):
+def prepare(source='web', output='.cache/site', max_bytes=900_000_000, *, link_committed_companies=False):
     root, target = Path(source), Path(output)
     if root.is_symlink(): raise ValueError('SITE_SYMLINK')
     if not root.is_dir(): raise ValueError('SITE_SOURCE_MISSING')
@@ -191,7 +226,8 @@ def prepare(source='web', output='.cache/site', max_bytes=900_000_000):
         if not file.is_file(): continue
         if file.suffix not in {'.json', '.js', '.css', '.html'}: raise ValueError('SITE_FILE_TYPE')
         files.append(file)
-    manifests, historical, referenced = current_partitions(root, files)
+    committed_pages = committed_company_pages(root) if link_committed_companies else {}
+    manifests, historical, referenced, linked = current_partitions(root, files, committed_pages)
     metadata_manifests, compressed_metadata = metadata_partitions(root, files)
     manifests.update(metadata_manifests)
     accounting_manifests, compressed_accounting = accounting_partitions(root, files)
@@ -200,7 +236,7 @@ def prepare(source='web', output='.cache/site', max_bytes=900_000_000):
     target.mkdir(parents=True)
     count, total = 0, 0
     for file in files:
-        if file in historical: continue
+        if file in historical or file in linked: continue
         relative = file.relative_to(root)
         raw = manifests[file] if file in manifests else public_bytes(root, file)
         destination = target / relative
@@ -215,6 +251,7 @@ def prepare(source='web', output='.cache/site', max_bytes=900_000_000):
     return {'status': 'site_ready', 'files': count, 'bytes': total, 'compression': 'gzip-data-partitions',
             'compressedMetadataFiles': len(compressed_metadata),
             'compressedAccountingFiles': len(compressed_accounting),
+            'linkedCompanyFiles': len(linked),
             'selectedPartitionFiles': len(referenced), 'skippedHistoricalPartitionFiles': len(historical),
             'skippedSourceBytes': skipped_bytes}
 
@@ -228,7 +265,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         rebuilt = ensure_analyses(args.source)
-        result = {'status': 'analyses_ready', 'rebuiltPeriods': rebuilt} if args.analyses_only else prepare(args.source, args.output)
+        link_companies = (os.environ.get('GITHUB_REPOSITORY') == PUBLIC_REPOSITORY
+                          and Path(args.source).resolve() == Path('web').resolve())
+        result = {'status': 'analyses_ready', 'rebuiltPeriods': rebuilt} if args.analyses_only else prepare(
+            args.source, args.output, link_committed_companies=link_companies)
         print(json.dumps(result))
         return 0
     except Exception as error:

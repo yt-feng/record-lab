@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -136,6 +137,36 @@ class PrepareSitePartitionTests(unittest.TestCase):
         historical = [folder / 'companies/co1-rhistorical.json', folder / 'analysis/details-9999.json']
         for file in historical: write(file, {'historical': label, 'payload': 'abc0123456789' * 10000})
         return historical
+
+    def test_hosted_package_links_exact_committed_company_pages_and_keeps_changed_bytes_locally(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            root, output = repository / 'web', repository / 'site'
+            for name in ('data', 'data/periods/2026Q2', 'data/periods/2026Q3'):
+                self.scope(root / name, name)
+            git = ['git', '-C', str(repository)]
+            subprocess.run(git + ['init', '-q'], check=True)
+            subprocess.run(git + ['add', 'web'], check=True)
+            subprocess.run(git + ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@users.noreply.github.com',
+                                   'commit', '-qm', 'Public data fixture'], check=True)
+            revision = subprocess.check_output(git + ['rev-parse', 'HEAD'], text=True).strip()
+            company = 'companies/co1-current.json'
+            changed = f'data/periods/2026Q3/{company}'
+            write(root / changed, {'new': True})
+            before = tree(root)
+
+            result = site.prepare(root, output, link_committed_companies=True)
+
+            self.assertEqual(result['linkedCompanyFiles'], 2)
+            self.assertEqual(tree(root), before)
+            for name in ('data', 'data/periods/2026Q2'):
+                manifest = json.loads((output / name / 'latest.json').read_text())
+                self.assertEqual(manifest['companyFiles'][0]['path'],
+                                 f'https://raw.githubusercontent.com/yt-feng/record-lab/{revision}/web/{name}/{company}')
+                self.assertFalse((output / name / (company + '.gz')).exists())
+            manifest = json.loads((output / 'data/periods/2026Q3/latest.json').read_text())
+            self.assertEqual(manifest['companyFiles'][0]['path'], './data/companies/co1-current.json.gz')
+            self.assertEqual(gzip.decompress((output / (changed + '.gz')).read_bytes()), before[changed])
 
     def test_root_legacy_and_both_quarters_pack_only_their_current_references_without_reading_history(self):
         with tempfile.TemporaryDirectory() as directory:
