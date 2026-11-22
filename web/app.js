@@ -66,7 +66,11 @@
       modelObservedAt: candidate.sidecar.modelObservation.observation.finishedAt, model: candidate.sidecar.modelObservation.responseModel };
   }
   const MAX_DATA_BYTES = 80 * 1024 * 1024;
-  function safeCompanyPath(path) { return typeof path === 'string' && /^\.\/data\/companies\/[A-Za-z0-9_-]+\.json(?:\.gz)?$/.test(path) ? path : null; }
+  const repositoryCompanyPath = /^https:\/\/raw\.githubusercontent\.com\/yt-feng\/record-lab\/[a-f0-9]{40}\/web\/data\/(?:periods\/(20\d{2}Q[1-4])\/)?companies\/[A-Za-z0-9_-]{1,64}\.json$/;
+  function safeCompanyPath(path) {
+    return typeof path === 'string' && (/^\.\/data\/companies\/[A-Za-z0-9_-]+\.json(?:\.gz)?$/.test(path)
+      || (path.endsWith('.json') && repositoryCompanyPath.test(path))) ? path : null;
+  }
   function companyPages(manifest, code) { return (manifest?.companyFiles || []).filter(file => file.companyCode === code).slice().sort((a, b) => (a.partIndex || 1) - (b.partIndex || 1)); }
   function companyRecordSummaries(manifest, catalog = null, query = '') {
     const summaries = new Map();
@@ -138,6 +142,12 @@
       (period.compressedMetadata?.includes(file) ? '.gz' : '');
     const companyPath = safeCompanyPath(file);
     if (!companyPath) throw new Error('INVALID_PERIOD_PATH');
+    const repositoryPath = repositoryCompanyPath.exec(companyPath);
+    if (repositoryPath) {
+      const expectedScope = period.path === LEGACY_PERIOD.path ? undefined : period.id;
+      if (repositoryPath[1] !== expectedScope) throw new Error('INVALID_PERIOD_PATH');
+      return companyPath;
+    }
     return period.path + companyPath.slice('./data/'.length);
   }
   function validatePeriodDataset(data, period) {
@@ -1061,7 +1071,9 @@
       const controller = new win.AbortController(); const timer = win.setTimeout(() => controller.abort(), 20000);
       try {
         const path = periodDataPath(period, pages[pageIndex].path);
-        const response = await win.fetch(path, { cache: 'no-store', credentials: 'omit', signal: controller.signal });
+        const repositoryPage = repositoryCompanyPath.test(path);
+        const response = await win.fetch(path, { cache: repositoryPage ? 'force-cache' : 'no-store',
+          credentials: 'omit', redirect: repositoryPage ? 'error' : 'follow', signal: controller.signal });
         if (!response.ok) throw new Error('COMPANY_LOAD_FAILED');
         const raw = await responseText(response, path, win);
         const data = validatePeriodDataset(JSON.parse(raw), period);

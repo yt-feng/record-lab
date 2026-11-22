@@ -325,6 +325,24 @@ test('quarter paths are limited to the validated local period and company namesp
   }
 });
 
+test('repository company pages require an immutable commit and the selected data scope', () => {
+  const [q2, q3] = fixturePeriods().periods;
+  const repository = 'https://raw.githubusercontent.com/yt-feng/record-lab/';
+  const revision = 'a'.repeat(40);
+  const company = repository + revision + '/web/data/periods/2026Q3/companies/c1.json';
+  assert.equal(ui.safeCompanyPath(company), company);
+  assert.equal(ui.periodDataPath(q3, company), company);
+  assert.throws(() => ui.periodDataPath(q2, company), /INVALID_PERIOD_PATH/);
+  const legacy = repository + revision + '/web/data/companies/c1.json';
+  assert.equal(ui.periodDataPath(ui.selectQuarter(null), legacy), legacy);
+  assert.throws(() => ui.periodDataPath(q2, legacy), /INVALID_PERIOD_PATH/);
+  for (const path of [company.replace(revision, 'main'), company + '?x=1', company + '\n',
+    company.replace('/yt-feng/record-lab/', '/another/repository/')]) {
+    assert.equal(ui.safeCompanyPath(path), null);
+    assert.throws(() => ui.periodDataPath(q3, path), /INVALID_PERIOD_PATH/);
+  }
+});
+
 test('quarter metadata compression is explicit and limited to catalog and progress', async () => {
   const manifest = fixturePeriods(), period = manifest.periods[1];
   period.compressedMetadata = ['catalog.json', 'progress.json'];
